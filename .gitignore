@@ -1,0 +1,128 @@
+# US.T Root .gitignore
+
+# ==========================================
+# 1. Datasets and Large Files (数据与大文件)
+# ==========================================
+# Ignore all raw data directories at any level
+data/
+_DATA/
+datasets/
+preprocessed_data/
+final_annotations/
+example_data/
+example_data/downloaded*
+hamer_training_data/
+EgoTouch/
+
+# Specific archive formats
+*.tar
+*.tar.gz
+*.zip
+*.rar
+*.7z
+*.part
+final_annotation.zip
+hamer_demo_data.tar.gz*
+
+# HDF5 / Data tables / Large NumPy arrays
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.csv
+!split.json
+
+# Image and Video visualizations (visual exports)
+*.mp4
+*.gif
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.tiff
+*.webp
+
+# ==========================================
+# 2. Model Weights & Checkpoints (权重与 Checkpoints)
+# ==========================================
+# Exclude any folder named checkpoints or checkpoint anywhere in the repo
+**/checkpoints/
+**/checkpoint/
+**/ckpt/
+weights/
+lightning_logs/
+logs/
+logs*/
+results/
+outputs/
+demo_out/
+out_demo_video/
+
+# Model files
+*.ckpt
+*.pt
+*.pth
+*.pkl
+!**/README.md  # Allow documentation inside weight folders if any
+
+# MANO template files
+**/MANO_RIGHT.pkl
+**/MANO_LEFT.pkl
+preprocess/scratch/MANO_RIGHT.pkl
+preprocess/scratch/MANO_LEFT.pkl
+hot3d/mano_v1_2/
+
+# ==========================================
+# 3. Environment & Package Managers (虚拟环境与安装包缓存)
+# ==========================================
+.env
+.env.local
+.envrc
+.venv/
+venv/
+env/
+ENV/
+*.egg-info/
+.pdm-build/
+.pdm-python
+.pixi/
+build/
+dist/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+__pypackages__/
+
+# ==========================================
+# 4. Compiles, Caches & Logs (编译、缓存与日志)
+# ==========================================
+__pycache__/
+*.py[codz]
+*$py.class
+*.so
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+*.log
+worker_crash_dump_*.txt
+
+# Tool specific caches
+.idea/
+.vscode/
+.claude/
+.cursorignore
+.cursorindexingignore
+.DS_Store
+*.spec
+*.manifest
+*.lock
+wandb/
