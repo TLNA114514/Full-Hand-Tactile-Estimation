@@ -22,6 +22,7 @@ import cv2
 cv2.setNumThreads(0)
 
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
+from pytorch_lightning.loggers import WandbLogger
 import torch
 from torch.utils.data import DataLoader
 import torch.multiprocessing
@@ -46,12 +47,23 @@ class OpenTouchHAMER(HAMER):
         self.automatic_optimization = True
         
         if freeze_backbone:
-            print("Freezing early feature layers of the backbone network to prevent overfitting...")
+            print("Freezing the backbone network to prevent overfitting...")
             for param in self.backbone.parameters():
                 param.requires_grad = False
-            # Keep the last layer/head trainable
-            for param in self.mano_head.parameters():
-                param.requires_grad = True
+        else:
+            print("Unfreezing ONLY the last 2 Transformer blocks of the backbone to prevent OOM...")
+            for param in self.backbone.parameters():
+                param.requires_grad = False
+            
+            # Unfreeze only the last 2 blocks for fine-tuning
+            if hasattr(self.backbone, 'blocks'):
+                for block in self.backbone.blocks[-2:]:
+                    for param in block.parameters():
+                        param.requires_grad = True
+                
+        # Keep the last layer/head trainable
+        for param in self.mano_head.parameters():
+            param.requires_grad = True
                 
     def training_step(self, batch, batch_idx):
         output = self.forward_step(batch, train=True)
@@ -72,14 +84,45 @@ class OpenTouchHAMER(HAMER):
         pass
 
     def configure_optimizers(self):
-        # Filter parameters that require gradient descent
-        trainable_params = filter(lambda p: p.requires_grad, self.parameters())
+        # Apply layer-wise learning rates if backbone is unfrozen
+        head_params = []
+        backbone_params = []
+        for name, param in self.named_parameters():
+            if param.requires_grad:
+                if 'backbone' in name:
+                    backbone_params.append(param)
+                else:
+                    head_params.append(param)
+                    
+        # Backbone uses 10x smaller learning rate to preserve pretrained features
+        optim_groups = [
+            {'params': head_params, 'lr': self.learning_rate},
+            {'params': backbone_params, 'lr': self.learning_rate * 0.1}
+        ]
+        
         optimizer = torch.optim.AdamW(
-            trainable_params,
-            lr=self.learning_rate,
+            optim_groups,
             weight_decay=1e-4
         )
-        return optimizer
+        
+        # Calculate total stepping batches for Cosine Annealing
+        total_steps = self.trainer.estimated_stepping_batches
+        print(f"Total training steps for LR Scheduler: {total_steps}")
+        
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, 
+            T_max=total_steps,
+            eta_min=self.learning_rate * 0.01  # Decay to 1% of max LR
+        )
+        
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1
+            }
+        }
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Fine-tune Hamer on OpenTouch dataset (DDP Parallel)")
@@ -93,9 +136,10 @@ def parse_args():
     
     parser.add_argument("--lr", type=float, default=1e-5, help="Base learning rate (per GPU)")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size per GPU")
-    parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
+    parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of workers for DataLoader")
-    parser.add_argument("--no_freeze", action="store_true", help="Do not freeze Backbone layers")
+    parser.add_argument("--no_freeze", action="store_true", help="Do not freeze Backbone layers (will use 10x smaller LR for backbone)")
+    parser.add_argument("--use_wandb", action="store_true", help="Enable Weights & Biases logging")
     parser.add_argument("--quick_test", action="store_true", help="Run a quick test training on a tiny subset")
     return parser.parse_args()
 
@@ -225,17 +269,26 @@ def main():
         save_last=True
     )
     
-    lr_monitor = LearningRateMonitor(logging_interval="epoch")
+    lr_monitor = LearningRateMonitor(logging_interval="step")
     
     # Initialize Pytorch Lightning Trainer with DDP configuration for multi-GPU
     strategy = "ddp_find_unused_parameters_true" if num_gpus > 1 else "auto"
     print(f"Initializing PL Trainer | GPUs={num_gpus} ({args.gpus}) | Strategy={strategy} | Batch Size (per GPU)={args.batch_size}")
+    
+    # Setup Logger
+    if args.use_wandb:
+        print("🚀 Initializing Weights & Biases Logger...")
+        logger = WandbLogger(project="opentouch-hamer-ft", name="hamer-finetune")
+    else:
+        logger = True
     
     trainer = pl.Trainer(
         max_epochs=args.epochs,
         accelerator="gpu",
         devices=num_gpus,
         strategy=strategy,
+        precision="16-mixed",  # Enable mixed precision for 2x speedup and 50% less VRAM
+        logger=logger,
         callbacks=[checkpoint_callback, lr_monitor],
         enable_progress_bar=True,
         log_every_n_steps=10

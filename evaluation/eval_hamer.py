@@ -71,7 +71,7 @@ def mano_to_mediapipe(mano_joints):
     
     return mp_joints if is_batched else mp_joints[0]
 
-def eval_clip(model, detector, cpm, model_cfg, hdf5_path, clip_id, device, rescale_factor=2.0):
+def eval_clip(model, detector, cpm, model_cfg, hdf5_path, clip_id, device, rescale_factor=2.0, disable_tqdm=False):
     with h5py.File(hdf5_path, "r") as f:
         clip_group = f[f"data/{clip_id}"]
         rgb_bytes_seq = clip_group["rgb_images_jpeg"][()]
@@ -89,7 +89,7 @@ def eval_clip(model, detector, cpm, model_cfg, hdf5_path, clip_id, device, resca
     all_gt_verts = []
     
     # 逐帧解码与推理
-    for i in tqdm(range(num_frames), desc="Hamer 推理中"):
+    for i in tqdm(range(num_frames), desc=f"Clip {clip_id}", disable=disable_tqdm):
         # 1. 图像解码
         img_bgr = cv2.imdecode(np.frombuffer(rgb_bytes_seq[i], dtype=np.uint8), cv2.IMREAD_COLOR)
         if img_bgr is None:
@@ -275,11 +275,86 @@ def load_or_generate_splits(split_json_path, data_dir):
     print(f"✅ 默认划分已成功生成并保存至 {split_json_path}")
     return splits
 
+def eval_worker(gpu_id, clips_chunk, args_checkpoint, args_model_cfg, data_dir, hdf5_path_arg):
+    import traceback
+    try:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+        print(f"[Worker GPU {gpu_id}] 正在初始化模型... 分配了 {len(clips_chunk)} 个片段")
+        
+        if args_model_cfg is not None:
+            from hamer.configs import get_config
+            model_cfg_path = os.path.abspath(args_model_cfg)
+            model_cfg = get_config(model_cfg_path, update_cachedir=True)
+            if (model_cfg.MODEL.BACKBONE.TYPE == 'vit') and ('BBOX_SHAPE' not in model_cfg.MODEL):
+                model_cfg.defrost()
+                model_cfg.MODEL.BBOX_SHAPE = [192, 256]
+                model_cfg.freeze()
+            if 'PRETRAINED_WEIGHTS' in model_cfg.MODEL.BACKBONE:
+                model_cfg.defrost()
+                model_cfg.MODEL.BACKBONE.pop('PRETRAINED_WEIGHTS')
+                model_cfg.freeze()
+            model = HAMER.load_from_checkpoint(args_checkpoint, strict=False, cfg=model_cfg)
+        else:
+            model, model_cfg = load_hamer(args_checkpoint)
+            
+        model = model.to(device)
+        model.eval()
+        
+        from hamer.utils.utils_detectron2 import DefaultPredictor_Lazy
+        from detectron2.config import LazyConfig
+        import hamer
+        cfg_path = Path(hamer.__file__).parent/'configs'/'cascade_mask_rcnn_vitdet_h_75ep.py'
+        detectron2_cfg = LazyConfig.load(str(cfg_path))
+        detectron2_cfg.train.init_checkpoint = "https://dl.fbaipublicfiles.com/detectron2/ViTDet/COCO/cascade_mask_rcnn_vitdet_h/f328730692/model_final_f05665.pkl"
+        for i in range(3):
+            detectron2_cfg.model.roi_heads.box_predictors[i].test_score_thresh = 0.25
+        detector = DefaultPredictor_Lazy(detectron2_cfg)
+        
+        cpm = ViTPoseModel(device)
+        
+        results = []
+        
+        if data_dir is not None:
+            from collections import defaultdict
+            scene_to_clips = defaultdict(list)
+            for scene, clip in clips_chunk:
+                scene_to_clips[scene].append(clip)
+                
+            for scene_name, clip_ids in scene_to_clips.items():
+                hdf5_path = os.path.join(data_dir, f"{scene_name}.hdf5")
+                if not os.path.exists(hdf5_path):
+                    continue
+                for clip in clip_ids:
+                    try:
+                        res = eval_clip(model, detector, cpm, model_cfg, hdf5_path, clip, device, disable_tqdm=True)
+                        if res is not None:
+                            results.append(res)
+                            print(f"[Worker GPU {gpu_id}] ✅ 完成片段: {clip}")
+                    except Exception as e:
+                        print(f"[Worker GPU {gpu_id}] ⚠️ 处理 {scene_name}/{clip} 失败: {e}")
+        else:
+            for clip in clips_chunk:
+                try:
+                    res = eval_clip(model, detector, cpm, model_cfg, hdf5_path_arg, clip, device, disable_tqdm=True)
+                    if res is not None:
+                        results.append(res)
+                        print(f"[Worker GPU {gpu_id}] ✅ 完成片段: {clip}")
+                except Exception as e:
+                    print(f"[Worker GPU {gpu_id}] ⚠️ 处理 Clip {clip} 失败: {e}")
+                    
+        return results
+    except Exception as e:
+        print(f"[Worker GPU {gpu_id}] ❌ 初始化/评估时发生严重错误: {e}")
+        traceback.print_exc()
+        return []
+
 def main():
     parser = argparse.ArgumentParser(description='Hamer OpenTouch 数据集一键式评估')
     parser.add_argument('--checkpoint', type=str, default="../hamer/_DATA/hamer_ckpts/checkpoints/hamer.ckpt", help='Hamer 模型 Checkpoint 路径')
+    parser.add_argument('--model_cfg', type=str, default=None, help='模型配置文件路径 (用于微调后的模型)')
     parser.add_argument('--hdf5_path', type=str, default=None, help='OpenTouch HDF5 数据集文件路径')
-    parser.add_argument('--clips', nargs='+', default=['demo_05', 'demo_10', 'demo_15'], help='需要评估的 Clips 列表')
+    parser.add_argument('--clips', nargs='*', default=None, help='需要评估的 Clips 列表 (可与 --split 结合使用来过滤特定 Clip)')
     parser.add_argument('--gpu', type=str, default='4', help='使用的 GPU 编号')
     parser.add_argument('--split', type=str, default=None, choices=['train', 'val', 'test', 'all'], help='评估的数据集划分')
     parser.add_argument('--split_json', type=str, default=None, help='划分 JSON 文件的路径')
@@ -302,30 +377,7 @@ def main():
     hamer_root = os.path.abspath(os.path.join(eval_dir, '../hamer'))
     os.chdir(hamer_root)
     
-    # 设置 GPU 环境
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
-    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-    print(f"使用 GPU 设备: cuda:{args.gpu} 进行推理评估")
-    
-    # 下载/加载 Hamer 模型
-    model, model_cfg = load_hamer(args.checkpoint)
-    model = model.to(device)
-    model.eval()
-    
-    # 初始化内置人体检测器
-    from hamer.utils.utils_detectron2 import DefaultPredictor_Lazy
-    from detectron2.config import LazyConfig
-    import hamer
-    cfg_path = Path(hamer.__file__).parent/'configs'/'cascade_mask_rcnn_vitdet_h_75ep.py'
-    detectron2_cfg = LazyConfig.load(str(cfg_path))
-    detectron2_cfg.train.init_checkpoint = "https://dl.fbaipublicfiles.com/detectron2/ViTDet/COCO/cascade_mask_rcnn_vitdet_h/f328730692/model_final_f05665.pkl"
-    for i in range(3):
-        detectron2_cfg.model.roi_heads.box_predictors[i].test_score_thresh = 0.25
-    detector = DefaultPredictor_Lazy(detectron2_cfg)
-    
-    # 初始化关键点检测器 ViTPose
-    cpm = ViTPoseModel(device)
-    
+    gpus = [g.strip() for g in args.gpu.split(',')]
     results = []
     
     if args.split is not None:
@@ -343,43 +395,54 @@ def main():
         else:
             target_clips = splits.get(args.split, [])
             
+        # 允许用户在指定 Split 的同时，再单独提取某几个 Clip
+        if args.clips is not None and len(args.clips) > 0:
+            target_clips = [tc for tc in target_clips if tc[1] in args.clips]
+            
         if not target_clips:
-            print(f"❌ 划分 {args.split} 中没有包含任何 clip！")
+            print(f"❌ 划分 {args.split} 中没有包含任何指定的 clip！")
             sys.exit(1)
-            
-        print(f"🔔 开始评测 split: {args.split} | 共有 {len(target_clips)} 个 clips 进行评估")
-        
-        # 按 scene_name 分组优化 HDF5 打开性能
-        from collections import defaultdict
-        scene_to_clips = defaultdict(list)
-        for scene, clip in target_clips:
-            scene_to_clips[scene].append(clip)
-            
-        for scene_name, clip_ids in scene_to_clips.items():
-            hdf5_path = os.path.join(data_dir, f"{scene_name}.hdf5")
-            if not os.path.exists(hdf5_path):
-                print(f"⚠️ 找不到 HDF5 文件 {hdf5_path}，跳过该场景的评估。")
-                continue
-                
-            print(f"📂 正在评估场景: {scene_name} | Clips: {clip_ids}")
-            for clip in clip_ids:
-                try:
-                    res = eval_clip(model, detector, cpm, model_cfg, hdf5_path, clip, device)
-                    if res is not None:
-                        results.append(res)
-                except Exception as e:
-                    print(f"⚠️ 处理场景 {scene_name} 中的 Clip {clip} 时发生错误: {e}")
-                    import traceback
-                    traceback.print_exc()
     else:
-        # 原有单文件评估逻辑
-        for clip in args.clips:
-            try:
-                res = eval_clip(model, detector, cpm, model_cfg, args.hdf5_path, clip, device)
-                if res is not None:
-                    results.append(res)
-            except Exception as e:
-                print(f"⚠️ 处理 Clip {clip} 时发生错误: {e}")
+        target_clips = args.clips
+        data_dir = None
+        
+    print(f"🔔 开始评测 | 共有 {len(target_clips)} 个 clips 进行评估 | 使用 GPUs: {args.gpu}")
+    
+    if len(gpus) > 1:
+        import torch.multiprocessing as mp
+        try:
+            mp.set_start_method('spawn', force=True)
+        except RuntimeError:
+            pass
+            
+        # Split targets into len(gpus) chunks
+        import math
+        chunk_size = math.ceil(len(target_clips) / len(gpus))
+        chunks = [target_clips[i:i + chunk_size] for i in range(0, len(target_clips), chunk_size)]
+        
+        pool_args = []
+        for i, gpu_id in enumerate(gpus):
+            if i < len(chunks) and len(chunks[i]) > 0:
+                pool_args.append((
+                    gpu_id, 
+                    chunks[i], 
+                    args.checkpoint, 
+                    args.model_cfg, 
+                    data_dir, 
+                    args.hdf5_path
+                ))
+                
+        print(f"🚀 启动 {len(pool_args)} 卡并行评测进程池！")
+        with mp.Pool(len(pool_args)) as pool:
+            multi_results = pool.starmap(eval_worker, pool_args)
+            
+        for r in multi_results:
+            results.extend(r)
+    else:
+        # 单卡模式
+        gpu_id = gpus[0]
+        print(f"🚀 单卡模式启动，GPU: {gpu_id}")
+        results = eval_worker(gpu_id, target_clips, args.checkpoint, args.model_cfg, data_dir, args.hdf5_path)
                 
     if len(results) > 0:
         # 计算加权平均指标

@@ -65,7 +65,8 @@ class OpenTouchHamerDataset(Dataset):
         # Blacklist corrupted clips that cause C-level segmentation faults in OpenCV/HDF5
         BLACKLISTED_CLIPS = {
             "grocery_target_p3/demo_148",
-            "home_kitchen_p1/demo_077"
+            "home_kitchen_p1/demo_077",
+            "eat_mcdonalds/demo_31"
         }
         
         for scene, clip in self.target_clips:
@@ -94,7 +95,7 @@ class OpenTouchHamerDataset(Dataset):
         
         # Cache for h5py File handles (initialized lazily to avoid multiprocessing fork issues)
         self._h5_files = OrderedDict()
-        self.MAX_OPEN_FILES = 8
+        self.MAX_OPEN_FILES = 2
 
     def __len__(self):
         return len(self.samples)
@@ -107,9 +108,9 @@ class OpenTouchHamerDataset(Dataset):
         bbox = np.array(sample["bbox"], dtype=np.float32)
         is_right = sample["is_right"]
         
-        # 诊断段错误源：“行车记录仪”机制
-        rank = os.environ.get("RANK", "0")
-        debug_file = os.path.join(self.data_dir, f"last_sample_rank_{rank}.txt")
+        # 诊断段错误源：“行车记录仪”机制 (修复进程竞争)
+        pid = os.getpid()
+        debug_file = os.path.join(self.data_dir, f"last_sample_pid_{pid}.txt")
         with open(debug_file, "w", encoding="utf-8") as df:
             df.write(f"Scene: {scene}\nClip: {clip_id}\nFrame: {frame_idx}\nis_right: {is_right}\nbbox: {sample['bbox']}\n")
         
@@ -129,8 +130,9 @@ class OpenTouchHamerDataset(Dataset):
                     except Exception:
                         pass
                 
-                # swmr=True enables Single Writer Multiple Reader, avoiding lock contention
-                self._h5_files[scene] = h5py.File(file_path, "r", swmr=True)
+                # Opening without swmr=True because HDF5 SWMR does not support VLEN datatypes (like our JPEGs).
+                # Since HDF5_USE_FILE_LOCKING=FALSE is set, multi-process read is safe.
+                self._h5_files[scene] = h5py.File(file_path, "r")
             else:
                 # Move to the end to mark as recently used
                 self._h5_files.move_to_end(scene)
@@ -189,13 +191,23 @@ class OpenTouchHamerDataset(Dataset):
         keypoints_3d[~valid_mask, 3] = 0.0  # Invalid joint (NaN)
         
         # 3. Calculate bounding box parameters
+        # If the bounding box is physically invalid or corrupted (NaN or <=0 area), 
+        # we completely discard this frame and randomly resample another valid frame from the dataset
+        # to ensure the model only trains on 100% authentic and valid data.
+        if np.isnan(bbox).any() or len(bbox) < 4:
+            return self.__getitem__(np.random.randint(0, len(self.samples)))
+            
         center = (bbox[2:4] + bbox[0:2]) / 2.0
         center_x = center[0]
         center_y = center[1]
         
         # Hamer scale calculation logic
-        # scale_pixels = max(x2-x1, y2-y1)
         scale_pixels = np.max(bbox[2:4] - bbox[0:2])
+        
+        # Prevent OpenCV warpAffine divide-by-zero Segfault by completely skipping this frame
+        if np.isnan(scale_pixels) or scale_pixels <= 1.0:
+            return self.__getitem__(np.random.randint(0, len(self.samples)))
+            
         bbox_size = self.rescale_factor * scale_pixels
         
         # Placeholders for keys that we do not have annotations for, but Hamer expects

@@ -2,6 +2,15 @@
 set -e
 
 export PYTHONFAULTHANDLER=1
+
+# Aggressive cleanup handler to prevent ghost/zombie processes when OOM or Ctrl+C happens
+cleanup_ghosts() {
+    echo "🚨 Teardown initiated. Sweeping up any ghost/zombie Python processes..."
+    # Kill all child and grandchild processes of this shell script
+    pkill -P $$ 2>/dev/null || true
+}
+trap cleanup_ghosts EXIT INT TERM
+
 # Prevent OpenMP/MKL from spawning threads in DataLoader worker processes after fork()
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
@@ -19,16 +28,22 @@ show_help() {
     echo "Options:"
     echo "  --test        Run in verification mode (fast extraction of 1 clip and 1 epoch training on a tiny subset)"
     echo "  --gpus [IDs]  GPU indices to use, comma-separated (default: 4. Example: --gpus 4,5)"
-    echo "  --epochs [N]  Number of training epochs (default: 10)"
+    echo "  --epochs [N]  Number of training epochs (default: 30)"
     echo "  --lr [val]    Base learning rate per GPU (default: 1e-5)"
+    echo "  --wandb       Enable Weights & Biases logging for loss curves visualization"
+    echo "  --unfreeze    Unfreeze the ViT backbone for full finetuning (Uses 10x smaller LR for backbone)"
+    echo "  --skip_extract Skip Step 1 (BBox Extraction) if the JSON file already exists"
     echo "  --help        Show this help message"
 }
 
 # Defaults
 GPUS="4"
-EPOCHS="10"
+EPOCHS="30"
 LR="1e-5"
 TEST_MODE=false
+USE_WANDB=false
+UNFREEZE=false
+SKIP_EXTRACT=false
 
 while [[ "$#" -gt 0 ]]; do
     case $1 in
@@ -36,6 +51,9 @@ while [[ "$#" -gt 0 ]]; do
         --gpus) GPUS="$2"; shift 2 ;;
         --epochs) EPOCHS="$2"; shift 2 ;;
         --lr) LR="$2"; shift 2 ;;
+        --wandb) USE_WANDB=true; shift ;;
+        --unfreeze) UNFREEZE=true; shift ;;
+        --skip_extract) SKIP_EXTRACT=true; shift ;;
         --help) show_help; exit 0 ;;
         *) echo "Unknown parameter: $1"; show_help; exit 1 ;;
     esac
@@ -60,6 +78,9 @@ echo "BBox Cache File: $BBOX_JSON_FILE"
 if [ "$TEST_MODE" = false ]; then
     echo "Epochs        : $EPOCHS"
     echo "Base LR       : $LR (Linear Scaled to $((NUM_GPUS))x: $(python3 -c "print($LR * $NUM_GPUS)"))"
+    echo "W&B Logging   : $USE_WANDB"
+    echo "Unfreeze ViT  : $UNFREEZE"
+    echo "Skip Extract  : $SKIP_EXTRACT"
 fi
 echo "=========================================================="
 echo ""
@@ -77,52 +98,65 @@ if [ "$TEST_MODE" = true ]; then
 fi
 
 # Step 1: Parallel BBox extraction
-echo ">>> Step 1: Pre-extracting hand BBoxes (Offline, Multi-GPU Parallel)..."
-for i in $(seq 0 $((NUM_GPUS - 1))); do
-    GPU_ID=${GPU_LIST[$i]}
-    echo "  [Process $i/$NUM_GPUS] Starting extraction on GPU $GPU_ID (logging to extract_gpu_${GPU_ID}.log)..."
-    # Launch in the background with absolute path and output redirection
-    CUDA_VISIBLE_DEVICES="$GPU_ID" python3 "$(pwd)/extract_bboxes.py" \
-        --gpu "$GPU_ID" \
-        --gpu_idx "$i" \
-        --num_gpus "$NUM_GPUS" \
-        --output_json "$BBOX_JSON_FILE" \
-        $SAMPLE_FLAG > "extract_gpu_${GPU_ID}.log" 2>&1 &
-done
-
-# Wait for all background subprocesses to finish
-wait
-
-# Validation Check: Ensure at least one temp GPU JSON file exists before merging
-# If not, it means the extraction crashed/exited immediately!
-TEMP_FILES=(${BBOX_JSON_FILE}.gpu_*)
-if [ ! -e "${TEMP_FILES[0]}" ]; then
-    echo "❌ Error: BBox extraction failed! No temporary GPU JSON files (.gpu_*) were created."
-    echo "This usually indicates that the background extraction processes crashed."
-    echo "Displaying the logs for diagnostics:"
-    for GPU_ID in "${GPU_LIST[@]}"; do
-        LOG_FILE="extract_gpu_${GPU_ID}.log"
-        if [ -f "$LOG_FILE" ]; then
-            echo ""
-            echo "=========================================================="
-            echo "--- Log for GPU $GPU_ID ($LOG_FILE) ---"
-            cat "$LOG_FILE"
-            echo "=========================================================="
-        fi
+if [ "$SKIP_EXTRACT" = false ]; then
+    echo ">>> Step 1: Pre-extracting hand BBoxes (Offline, Multi-GPU Parallel)..."
+    for i in $(seq 0 $((NUM_GPUS - 1))); do
+        GPU_ID=${GPU_LIST[$i]}
+        echo "  [Process $i/$NUM_GPUS] Starting extraction on GPU $GPU_ID (logging to extract_gpu_${GPU_ID}.log)..."
+        # Launch in the background with absolute path and output redirection
+        CUDA_VISIBLE_DEVICES="$GPU_ID" python3 "$(pwd)/extract_bboxes.py" \
+            --gpu "$GPU_ID" \
+            --gpu_idx "$i" \
+            --num_gpus "$NUM_GPUS" \
+            --output_json "$BBOX_JSON_FILE" \
+            $SAMPLE_FLAG > "extract_gpu_${GPU_ID}.log" 2>&1 &
     done
-    exit 1
+
+    # Wait for all background subprocesses to finish
+    wait
+
+    # Validation Check: Ensure at least one temp GPU JSON file exists before merging
+    # If not, it means the extraction crashed/exited immediately!
+    TEMP_FILES=(${BBOX_JSON_FILE}.gpu_*)
+    if [ ! -e "${TEMP_FILES[0]}" ]; then
+        echo "❌ Error: BBox extraction failed! No temporary GPU JSON files (.gpu_*) were created."
+        echo "This usually indicates that the background extraction processes crashed."
+        echo "Displaying the logs for diagnostics:"
+        for GPU_ID in "${GPU_LIST[@]}"; do
+            LOG_FILE="extract_gpu_${GPU_ID}.log"
+            if [ -f "$LOG_FILE" ]; then
+                echo ""
+                echo "=========================================================="
+                echo "--- Log for GPU $GPU_ID ($LOG_FILE) ---"
+                cat "$LOG_FILE"
+                echo "=========================================================="
+            fi
+        done
+        exit 1
+    fi
+
+    # Merge the extracted JSON caches
+    echo ">>> All GPU extraction tasks completed. Merging cache files..."
+    python3 "$(pwd)/extract_bboxes.py" --output_json "$BBOX_JSON_FILE" --merge
+
+    # Clean up successful run log files to keep workspace tidy
+    rm -f extract_gpu_*.log
+else
+    echo ">>> Step 1: SKIPPED (Using existing BBox JSON Cache at $BBOX_JSON_FILE)"
 fi
-
-# Merge the extracted JSON caches
-echo ">>> All GPU extraction tasks completed. Merging cache files..."
-python3 "$(pwd)/extract_bboxes.py" --output_json "$BBOX_JSON_FILE" --merge
-
-# Clean up successful run log files to keep workspace tidy
-rm -f extract_gpu_*.log
 
 # Step 2: Fine-tuning training
 echo ""
 echo ">>> Step 2: Running Hamer Fine-tuning (Multi-GPU DDP)..."
+
+EXTRA_ARGS=""
+if [ "$USE_WANDB" = true ]; then
+    EXTRA_ARGS="$EXTRA_ARGS --use_wandb"
+fi
+if [ "$UNFREEZE" = true ]; then
+    EXTRA_ARGS="$EXTRA_ARGS --no_freeze"
+fi
+
 if [ "$TEST_MODE" = true ]; then
     python3 "$(pwd)/train.py" \
         --gpus "$GPUS" \
@@ -137,7 +171,8 @@ else
         --lr "$LR" \
         --bbox_json "$BBOX_JSON_FILE" \
         --batch_size 16 \
-        --num_workers 4
+        --num_workers 8 \
+        $EXTRA_ARGS
 fi
 
 # Step 3: Cleanup if we are in test mode
