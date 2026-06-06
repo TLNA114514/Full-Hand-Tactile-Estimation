@@ -28,12 +28,32 @@ for DIR in "${SYNC_DIRS[@]}"; do
         # 确保目标父目录存在
         mkdir -p "$(dirname "$DEST_BASE/$DIR")"
         
-        # 使用 rsync 增量同步，排除 .git 文件和缓存文件
+        # 使用 rsync 增量同步，排除 .git 文件、缓存文件、模型权重/Checkpoints 以及大文件
         rsync -av --delete \
             --exclude='.git' \
             --exclude='__pycache__' \
             --exclude='*.pyc' \
             --exclude='.DS_Store' \
+            --exclude='*checkpoint*' \
+            --exclude='*ckpt*' \
+            --exclude='*weights*' \
+            --exclude='*.ckpt' \
+            --exclude='*.pt' \
+            --exclude='*.pth' \
+            --exclude='*.pkl' \
+            --exclude='wandb/' \
+            --exclude='logs/' \
+            --exclude='lightning_logs/' \
+            --exclude='*.h5' \
+            --exclude='*.hdf5' \
+            --exclude='*.npy' \
+            --exclude='*.npz' \
+            --exclude='*.mp4' \
+            --exclude='*.png' \
+            --exclude='*.jpg' \
+            --exclude='*.jpeg' \
+            --exclude='*.gif' \
+            --max-size='10m' \
             "$SRC_BASE/$DIR/" "$DEST_BASE/$DIR/"
             
         echo "   ✅ $DIR 同步完成"
