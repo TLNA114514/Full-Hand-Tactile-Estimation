@@ -1,0 +1,332 @@
+Group: calibration
+Group: calibration/rgb
+Dataset: calibration/rgb/T_device_camera | Shape: (4, 4) | Type: float64
+Dataset: calibration/rgb/focal_length | Shape: () | Type: float64
+Dataset: calibration/rgb/image_size | Shape: (2,) | Type: int64
+Dataset: calibration/rgb/principal_point | Shape: (2,) | Type: int64
+Group: data
+Group: data/demo_00
+Dataset: data/demo_00/camera_poses | Shape: (91, 4, 4) | Type: float64
+Dataset: data/demo_00/labels | Shape: (1,) | Type: [('low_light', 'u1'), ('hand_out_of_frame', 'u1')]
+Dataset: data/demo_00/rgb_images_jpeg | Shape: (91,) | Type: object
+Dataset: data/demo_00/right_hand_landmarks | Shape: (91, 21, 3) | Type: float64
+Dataset: data/demo_00/right_palm_pos | Shape: (91, 3) | Type: float64
+Dataset: data/demo_00/right_pressure | Shape: (91, 16, 16) | Type: float32
+Dataset: data/demo_00/right_wrist_pos | Shape: (91, 3) | Type: float64
+Dataset: data/demo_00/timestamps | Shape: (91,) | Type: int64
+Group: data/demo_01
+Dataset: data/demo_01/camera_poses | Shape: (56, 4, 4) | Type: float64
+Dataset: data/demo_01/labels | Shape: (1,) | Type: [('low_light', 'u1'), ('hand_out_of_frame', 'u1')]
+Dataset: data/demo_01/rgb_images_jpeg | Shape: (56,) | Type: object
+Dataset: data/demo_01/right_hand_landmarks | Shape: (56, 21, 3) | Type: float64
+Dataset: data/demo_01/right_palm_pos | Shape: (56, 3) | Type: float64
+Dataset: data/demo_01/right_pressure | Shape: (56, 16, 16) | Type: float32
+Dataset: data/demo_01/right_wrist_pos | Shape: (56, 3) | Type: float64
+Dataset: data/demo_01/timestamps | Shape: (56,) | Type: int64
+Group: data/demo_02
+Dataset: data/demo_02/camera_poses | Shape: (59, 4, 4) | Type: float64
+Dataset: data/demo_02/labels | Shape: (1,) | Type: [('low_light', 'u1'), ('hand_out_of_frame', 'u1')]
+Dataset: data/demo_02/rgb_images_jpeg | Shape: (59,) | Type: object
+Dataset: data/demo_02/right_hand_landmarks | Shape: (59, 21, 3) | Type: float64
+Dataset: data/demo_02/right_palm_pos | Shape: (59, 3) | Type: float64
+Dataset: data/demo_02/right_pressure | Shape: (59, 16, 16) | Type: float32
+Dataset: data/demo_02/right_wrist_pos | Shape: (59, 3) | Type: float64
+Dataset: data/demo_02/timestamps | Shape: (59,) | Type: int64
+Group: data/demo_03
+Dataset: data/demo_03/camera_poses | Shape: (56, 4, 4) | Type: float64
+Dataset: data/demo_03/labels | Shape: (1,) | Type: [('low_light', 'u1'), ('hand_out_of_frame', 'u1')]
+Dataset: data/demo_03/rgb_images_jpeg | Shape: (56,) | Type: object
+Dataset: data/demo_03/right_hand_landmarks | Shape: (56, 21, 3) | Type: float64
+Dataset: data/demo_03/right_palm_pos | Shape: (56, 3) | Type: float64
+Dataset: data/demo_03/right_pressure | Shape: (56, 16, 16) | Type: float32
+Dataset: data/demo_03/right_wrist_pos | Shape: (56, 3) | Type: float64
+Dataset: data/demo_03/timestamps | Shape: (56,) | Type: int64
+Group: data/demo_04
+Dataset: data/demo_04/camera_poses | Shape: (61, 4, 4) | Type: float64
+Dataset: data/demo_04/labels | Shape: (1,) | Type: [('low_light', 'u1'), ('hand_out_of_frame', 'u1')]
+Dataset: data/demo_04/rgb_images_jpeg | Shape: (61,) | Type: object
+Dataset: data/demo_04/right_hand_landmarks | Shape: (61, 21, 3) | Type: float64
+Dataset: data/demo_04/right_palm_pos | Shape: (61, 3) | Type: float64
+Dataset: data/demo_04/right_pressure | Shape: (61, 16, 16) | Type: float32
+Dataset: data/demo_04/right_wrist_pos | Shape: (61, 3) | Type: float64
+Dataset: data/demo_04/timestamps | Shape: (61,) | Type: int64
+Group: data/demo_05
+Dataset: data/demo_05/camera_poses | Shape: (62, 4, 4) | Type: float64
+Dataset: data/demo_05/labels | Shape: (1,) | Type: [('low_light', 'u1'), ('hand_out_of_frame', 'u1')]
+Dataset: data/demo_05/rgb_images_jpeg | Shape: (62,) | Type: object
+Dataset: data/demo_05/right_hand_landmarks | Shape: (62, 21, 3) | Type: float64
+Dataset: data/demo_05/right_palm_pos | Shape: (62, 3) | Type: float64
+Dataset: data/demo_05/right_pressure | Shape: (62, 16, 16) | Type: float32
+Dataset: data/demo_05/right_wrist_pos | Shape: (62, 3) | Type: float64
+Dataset: data/demo_05/timestamps | Shape: (62,) | Type: int64
+Group: data/demo_06
+Dataset: data/demo_06/camera_poses | Shape: (53, 4, 4) | Type: float64
+Dataset: data/demo_06/labels | Shape: (1,) | Type: [('low_light', 'u1'), ('hand_out_of_frame', 'u1')]
+Dataset: data/demo_06/rgb_images_jpeg | Shape: (53,) | Type: object
+Dataset: data/demo_06/right_hand_landmarks | Shape: (53, 21, 3) | Type: float64
+Dataset: data/demo_06/right_palm_pos | Shape: (53, 3) | Type: float64
+Dataset: data/demo_06/right_pressure | Shape: (53, 16, 16) | Type: float32
+Dataset: data/demo_06/right_wrist_pos | Shape: (53, 3) | Type: float64
+Dataset: data/demo_06/timestamps | Shape: (53,) | Type: int64
+Group: data/demo_07
+Dataset: data/demo_07/camera_poses | Shape: (60, 4, 4) | Type: float64
+Dataset: data/demo_07/labels | Shape: (1,) | Type: [('low_light', 'u1'), ('hand_out_of_frame', 'u1')]
+Dataset: data/demo_07/rgb_images_jpeg | Shape: (60,) | Type: object
+Dataset: data/demo_07/right_hand_landmarks | Shape: (60, 21, 3) | Type: float64
+Dataset: data/demo_07/right_palm_pos | Shape: (60, 3) | Type: float64
+Dataset: data/demo_07/right_pressure | Shape: (60, 16, 16) | Type: float32
+Dataset: data/demo_07/right_wrist_pos | Shape: (60, 3) | Type: float64
+Dataset: data/demo_07/timestamps | Shape: (60,) | Type: int64
+Group: data/demo_08
+Dataset: data/demo_08/camera_poses | Shape: (52, 4, 4) | Type: float64
+Dataset: data/demo_08/labels | Shape: (1,) | Type: [('low_light', 'u1'), ('hand_out_of_frame', 'u1')]
+Dataset: data/demo_08/rgb_images_jpeg | Shape: (52,) | Type: object
+Dataset: data/demo_08/right_hand_landmarks | Shape: (52, 21, 3) | Type: float64
+Dataset: data/demo_08/right_palm_pos | Shape: (52, 3) | Type: float64
+Dataset: data/demo_08/right_pressure | Shape: (52, 16, 16) | Type: float32
+Dataset: data/demo_08/right_wrist_pos | Shape: (52, 3) | Type: float64
+Dataset: data/demo_08/timestamps | Shape: (52,) | Type: int64
+Group: data/demo_09
+Dataset: data/demo_09/camera_poses | Shape: (53, 4, 4) | Type: float64
+Dataset: data/demo_09/labels | Shape: (1,) | Type: [('low_light', 'u1'), ('hand_out_of_frame', 'u1')]
+Dataset: data/demo_09/rgb_images_jpeg | Shape: (53,) | Type: object
+Dataset: data/demo_09/right_hand_landmarks | Shape: (53, 21, 3) | Type: float64
+Dataset: data/demo_09/right_palm_pos | Shape: (53, 3) | Type: float64
+Dataset: data/demo_09/right_pressure | Shape: (53, 16, 16) | Type: float32
+Dataset: data/demo_09/right_wrist_pos | Shape: (53, 3) | Type: float64
+Dataset: data/demo_09/timestamps | Shape: (53,) | Type: int64
+Group: data/demo_10
+Dataset: data/demo_10/camera_poses | Shape: (93, 4, 4) | Type: float64
+Dataset: data/demo_10/labels | Shape: (1,) | Type: [('low_light', 'u1'), ('hand_out_of_frame', 'u1')]
+Dataset: data/demo_10/rgb_images_jpeg | Shape: (93,) | Type: object
+Dataset: data/demo_10/right_hand_landmarks | Shape: (93, 21, 3) | Type: float64
+Dataset: data/demo_10/right_palm_pos | Shape: (93, 3) | Type: float64
+Dataset: data/demo_10/right_pressure | Shape: (93, 16, 16) | Type: float32
+Dataset: data/demo_10/right_wrist_pos | Shape: (93, 3) | Type: float64
+Dataset: data/demo_10/timestamps | Shape: (93,) | Type: int64
+Group: data/demo_11
+Dataset: data/demo_11/camera_poses | Shape: (56, 4, 4) | Type: float64
+Dataset: data/demo_11/labels | Shape: (1,) | Type: [('low_light', 'u1'), ('hand_out_of_frame', 'u1')]
+Dataset: data/demo_11/rgb_images_jpeg | Shape: (56,) | Type: object
+Dataset: data/demo_11/right_hand_landmarks | Shape: (56, 21, 3) | Type: float64
+Dataset: data/demo_11/right_palm_pos | Shape: (56, 3) | Type: float64
+Dataset: data/demo_11/right_pressure | Shape: (56, 16, 16) | Type: float32
+Dataset: data/demo_11/right_wrist_pos | Shape: (56, 3) | Type: float64
+Dataset: data/demo_11/timestamps | Shape: (56,) | Type: int64
+Group: data/demo_12
+Dataset: data/demo_12/camera_poses | Shape: (57, 4, 4) | Type: float64
+Dataset: data/demo_12/labels | Shape: (1,) | Type: [('low_light', 'u1'), ('hand_out_of_frame', 'u1')]
+Dataset: data/demo_12/rgb_images_jpeg | Shape: (57,) | Type: object
+Dataset: data/demo_12/right_hand_landmarks | Shape: (57, 21, 3) | Type: float64
+Dataset: data/demo_12/right_palm_pos | Shape: (57, 3) | Type: float64
+Dataset: data/demo_12/right_pressure | Shape: (57, 16, 16) | Type: float32
+Dataset: data/demo_12/right_wrist_pos | Shape: (57, 3) | Type: float64
+Dataset: data/demo_12/timestamps | Shape: (57,) | Type: int64
+Group: data/demo_13
+Dataset: data/demo_13/camera_poses | Shape: (51, 4, 4) | Type: float64
+Dataset: data/demo_13/labels | Shape: (1,) | Type: [('low_light', 'u1'), ('hand_out_of_frame', 'u1')]
+Dataset: data/demo_13/rgb_images_jpeg | Shape: (51,) | Type: object
+Dataset: data/demo_13/right_hand_landmarks | Shape: (51, 21, 3) | Type: float64
+Dataset: data/demo_13/right_palm_pos | Shape: (51, 3) | Type: float64
+Dataset: data/demo_13/right_pressure | Shape: (51, 16, 16) | Type: float32
+Dataset: data/demo_13/right_wrist_pos | Shape: (51, 3) | Type: float64
+Dataset: data/demo_13/timestamps | Shape: (51,) | Type: int64
+Group: data/demo_14
+Dataset: data/demo_14/camera_poses | Shape: (80, 4, 4) | Type: float64
+Dataset: data/demo_14/labels | Shape: (1,) | Type: [('low_light', 'u1'), ('hand_out_of_frame', 'u1')]
+Dataset: data/demo_14/rgb_images_jpeg | Shape: (80,) | Type: object
+Dataset: data/demo_14/right_hand_landmarks | Shape: (80, 21, 3) | Type: float64
+Dataset: data/demo_14/right_palm_pos | Shape: (80, 3) | Type: float64
+Dataset: data/demo_14/right_pressure | Shape: (80, 16, 16) | Type: float32
+Dataset: data/demo_14/right_wrist_pos | Shape: (80, 3) | Type: float64
+Dataset: data/demo_14/timestamps | Shape: (80,) | Type: int64
+Group: data/demo_15
+Dataset: data/demo_15/camera_poses | Shape: (61, 4, 4) | Type: float64
+Dataset: data/demo_15/labels | Shape: (1,) | Type: [('low_light', 'u1'), ('hand_out_of_frame', 'u1')]
+Dataset: data/demo_15/rgb_images_jpeg | Shape: (61,) | Type: object
+Dataset: data/demo_15/right_hand_landmarks | Shape: (61, 21, 3) | Type: float64
+Dataset: data/demo_15/right_palm_pos | Shape: (61, 3) | Type: float64
+Dataset: data/demo_15/right_pressure | Shape: (61, 16, 16) | Type: float32
+Dataset: data/demo_15/right_wrist_pos | Shape: (61, 3) | Type: float64
+Dataset: data/demo_15/timestamps | Shape: (61,) | Type: int64
+Group: data/demo_16
+Dataset: data/demo_16/camera_poses | Shape: (69, 4, 4) | Type: float64
+Dataset: data/demo_16/labels | Shape: (1,) | Type: [('low_light', 'u1'), ('hand_out_of_frame', 'u1')]
+Dataset: data/demo_16/rgb_images_jpeg | Shape: (69,) | Type: object
+Dataset: data/demo_16/right_hand_landmarks | Shape: (69, 21, 3) | Type: float64
+Dataset: data/demo_16/right_palm_pos | Shape: (69, 3) | Type: float64
+Dataset: data/demo_16/right_pressure | Shape: (69, 16, 16) | Type: float32
+Dataset: data/demo_16/right_wrist_pos | Shape: (69, 3) | Type: float64
+Dataset: data/demo_16/timestamps | Shape: (69,) | Type: int64
+Group: data/demo_17
+Dataset: data/demo_17/camera_poses | Shape: (163, 4, 4) | Type: float64
+Dataset: data/demo_17/labels | Shape: (1,) | Type: [('low_light', 'u1'), ('hand_out_of_frame', 'u1')]
+Dataset: data/demo_17/rgb_images_jpeg | Shape: (163,) | Type: object
+Dataset: data/demo_17/right_hand_landmarks | Shape: (163, 21, 3) | Type: float64
+Dataset: data/demo_17/right_palm_pos | Shape: (163, 3) | Type: float64
+Dataset: data/demo_17/right_pressure | Shape: (163, 16, 16) | Type: float32
+Dataset: data/demo_17/right_wrist_pos | Shape: (163, 3) | Type: float64
+Dataset: data/demo_17/timestamps | Shape: (163,) | Type: int64
+Group: data/demo_18
+Dataset: data/demo_18/camera_poses | Shape: (52, 4, 4) | Type: float64
+Dataset: data/demo_18/labels | Shape: (1,) | Type: [('low_light', 'u1'), ('hand_out_of_frame', 'u1')]
+Dataset: data/demo_18/rgb_images_jpeg | Shape: (52,) | Type: object
+Dataset: data/demo_18/right_hand_landmarks | Shape: (52, 21, 3) | Type: float64
+Dataset: data/demo_18/right_palm_pos | Shape: (52, 3) | Type: float64
+Dataset: data/demo_18/right_pressure | Shape: (52, 16, 16) | Type: float32
+Dataset: data/demo_18/right_wrist_pos | Shape: (52, 3) | Type: float64
+Dataset: data/demo_18/timestamps | Shape: (52,) | Type: int64
+Group: data/demo_19
+Dataset: data/demo_19/camera_poses | Shape: (50, 4, 4) | Type: float64
+Dataset: data/demo_19/labels | Shape: (1,) | Type: [('low_light', 'u1'), ('hand_out_of_frame', 'u1')]
+Dataset: data/demo_19/rgb_images_jpeg | Shape: (50,) | Type: object
+Dataset: data/demo_19/right_hand_landmarks | Shape: (50, 21, 3) | Type: float64
+Dataset: data/demo_19/right_palm_pos | Shape: (50, 3) | Type: float64
+Dataset: data/demo_19/right_pressure | Shape: (50, 16, 16) | Type: float32
+Dataset: data/demo_19/right_wrist_pos | Shape: (50, 3) | Type: float64
+Dataset: data/demo_19/timestamps | Shape: (50,) | Type: int64
+Group: data/demo_20
+Dataset: data/demo_20/camera_poses | Shape: (171, 4, 4) | Type: float64
+Dataset: data/demo_20/labels | Shape: (1,) | Type: [('low_light', 'u1'), ('hand_out_of_frame', 'u1')]
+Dataset: data/demo_20/rgb_images_jpeg | Shape: (171,) | Type: object
+Dataset: data/demo_20/right_hand_landmarks | Shape: (171, 21, 3) | Type: float64
+Dataset: data/demo_20/right_palm_pos | Shape: (171, 3) | Type: float64
+Dataset: data/demo_20/right_pressure | Shape: (171, 16, 16) | Type: float32
+Dataset: data/demo_20/right_wrist_pos | Shape: (171, 3) | Type: float64
+Dataset: data/demo_20/timestamps | Shape: (171,) | Type: int64
+Group: data/demo_21
+Dataset: data/demo_21/camera_poses | Shape: (47, 4, 4) | Type: float64
+Dataset: data/demo_21/labels | Shape: (1,) | Type: [('low_light', 'u1'), ('hand_out_of_frame', 'u1')]
+Dataset: data/demo_21/rgb_images_jpeg | Shape: (47,) | Type: object
+Dataset: data/demo_21/right_hand_landmarks | Shape: (47, 21, 3) | Type: float64
+Dataset: data/demo_21/right_palm_pos | Shape: (47, 3) | Type: float64
+Dataset: data/demo_21/right_pressure | Shape: (47, 16, 16) | Type: float32
+Dataset: data/demo_21/right_wrist_pos | Shape: (47, 3) | Type: float64
+Dataset: data/demo_21/timestamps | Shape: (47,) | Type: int64
+Group: data/demo_22
+Dataset: data/demo_22/camera_poses | Shape: (154, 4, 4) | Type: float64
+Dataset: data/demo_22/labels | Shape: (1,) | Type: [('low_light', 'u1'), ('hand_out_of_frame', 'u1')]
+Dataset: data/demo_22/rgb_images_jpeg | Shape: (154,) | Type: object
+Dataset: data/demo_22/right_hand_landmarks | Shape: (154, 21, 3) | Type: float64
+Dataset: data/demo_22/right_palm_pos | Shape: (154, 3) | Type: float64
+Dataset: data/demo_22/right_pressure | Shape: (154, 16, 16) | Type: float32
+Dataset: data/demo_22/right_wrist_pos | Shape: (154, 3) | Type: float64
+Dataset: data/demo_22/timestamps | Shape: (154,) | Type: int64
+Group: data/demo_23
+Dataset: data/demo_23/camera_poses | Shape: (121, 4, 4) | Type: float64
+Dataset: data/demo_23/labels | Shape: (1,) | Type: [('low_light', 'u1'), ('hand_out_of_frame', 'u1')]
+Dataset: data/demo_23/rgb_images_jpeg | Shape: (121,) | Type: object
+Dataset: data/demo_23/right_hand_landmarks | Shape: (121, 21, 3) | Type: float64
+Dataset: data/demo_23/right_palm_pos | Shape: (121, 3) | Type: float64
+Dataset: data/demo_23/right_pressure | Shape: (121, 16, 16) | Type: float32
+Dataset: data/demo_23/right_wrist_pos | Shape: (121, 3) | Type: float64
+Dataset: data/demo_23/timestamps | Shape: (121,) | Type: int64
+Group: data/demo_24
+Dataset: data/demo_24/camera_poses | Shape: (48, 4, 4) | Type: float64
+Dataset: data/demo_24/labels | Shape: (1,) | Type: [('low_light', 'u1'), ('hand_out_of_frame', 'u1')]
+Dataset: data/demo_24/rgb_images_jpeg | Shape: (48,) | Type: object
+Dataset: data/demo_24/right_hand_landmarks | Shape: (48, 21, 3) | Type: float64
+Dataset: data/demo_24/right_palm_pos | Shape: (48, 3) | Type: float64
+Dataset: data/demo_24/right_pressure | Shape: (48, 16, 16) | Type: float32
+Dataset: data/demo_24/right_wrist_pos | Shape: (48, 3) | Type: float64
+Dataset: data/demo_24/timestamps | Shape: (48,) | Type: int64
+Group: data/demo_25
+Dataset: data/demo_25/camera_poses | Shape: (162, 4, 4) | Type: float64
+Dataset: data/demo_25/labels | Shape: (1,) | Type: [('low_light', 'u1'), ('hand_out_of_frame', 'u1')]
+Dataset: data/demo_25/rgb_images_jpeg | Shape: (162,) | Type: object
+Dataset: data/demo_25/right_hand_landmarks | Shape: (162, 21, 3) | Type: float64
+Dataset: data/demo_25/right_palm_pos | Shape: (162, 3) | Type: float64
+Dataset: data/demo_25/right_pressure | Shape: (162, 16, 16) | Type: float32
+Dataset: data/demo_25/right_wrist_pos | Shape: (162, 3) | Type: float64
+Dataset: data/demo_25/timestamps | Shape: (162,) | Type: int64
+Group: data/demo_26
+Dataset: data/demo_26/camera_poses | Shape: (99, 4, 4) | Type: float64
+Dataset: data/demo_26/labels | Shape: (1,) | Type: [('low_light', 'u1'), ('hand_out_of_frame', 'u1')]
+Dataset: data/demo_26/rgb_images_jpeg | Shape: (99,) | Type: object
+Dataset: data/demo_26/right_hand_landmarks | Shape: (99, 21, 3) | Type: float64
+Dataset: data/demo_26/right_palm_pos | Shape: (99, 3) | Type: float64
+Dataset: data/demo_26/right_pressure | Shape: (99, 16, 16) | Type: float32
+Dataset: data/demo_26/right_wrist_pos | Shape: (99, 3) | Type: float64
+Dataset: data/demo_26/timestamps | Shape: (99,) | Type: int64
+Group: data/demo_27
+Dataset: data/demo_27/camera_poses | Shape: (216, 4, 4) | Type: float64
+Dataset: data/demo_27/labels | Shape: (1,) | Type: [('low_light', 'u1'), ('hand_out_of_frame', 'u1')]
+Dataset: data/demo_27/rgb_images_jpeg | Shape: (216,) | Type: object
+Dataset: data/demo_27/right_hand_landmarks | Shape: (216, 21, 3) | Type: float64
+Dataset: data/demo_27/right_palm_pos | Shape: (216, 3) | Type: float64
+Dataset: data/demo_27/right_pressure | Shape: (216, 16, 16) | Type: float32
+Dataset: data/demo_27/right_wrist_pos | Shape: (216, 3) | Type: float64
+Dataset: data/demo_27/timestamps | Shape: (216,) | Type: int64
+Group: data/demo_28
+Dataset: data/demo_28/camera_poses | Shape: (154, 4, 4) | Type: float64
+Dataset: data/demo_28/labels | Shape: (1,) | Type: [('low_light', 'u1'), ('hand_out_of_frame', 'u1')]
+Dataset: data/demo_28/rgb_images_jpeg | Shape: (154,) | Type: object
+Dataset: data/demo_28/right_hand_landmarks | Shape: (154, 21, 3) | Type: float64
+Dataset: data/demo_28/right_palm_pos | Shape: (154, 3) | Type: float64
+Dataset: data/demo_28/right_pressure | Shape: (154, 16, 16) | Type: float32
+Dataset: data/demo_28/right_wrist_pos | Shape: (154, 3) | Type: float64
+Dataset: data/demo_28/timestamps | Shape: (154,) | Type: int64
+Group: data/demo_29
+Dataset: data/demo_29/camera_poses | Shape: (199, 4, 4) | Type: float64
+Dataset: data/demo_29/labels | Shape: (1,) | Type: [('low_light', 'u1'), ('hand_out_of_frame', 'u1')]
+Dataset: data/demo_29/rgb_images_jpeg | Shape: (199,) | Type: object
+Dataset: data/demo_29/right_hand_landmarks | Shape: (199, 21, 3) | Type: float64
+Dataset: data/demo_29/right_palm_pos | Shape: (199, 3) | Type: float64
+Dataset: data/demo_29/right_pressure | Shape: (199, 16, 16) | Type: float32
+Dataset: data/demo_29/right_wrist_pos | Shape: (199, 3) | Type: float64
+Dataset: data/demo_29/timestamps | Shape: (199,) | Type: int64
+Group: data/demo_30
+Dataset: data/demo_30/camera_poses | Shape: (142, 4, 4) | Type: float64
+Dataset: data/demo_30/labels | Shape: (1,) | Type: [('low_light', 'u1'), ('hand_out_of_frame', 'u1')]
+Dataset: data/demo_30/rgb_images_jpeg | Shape: (142,) | Type: object
+Dataset: data/demo_30/right_hand_landmarks | Shape: (142, 21, 3) | Type: float64
+Dataset: data/demo_30/right_palm_pos | Shape: (142, 3) | Type: float64
+Dataset: data/demo_30/right_pressure | Shape: (142, 16, 16) | Type: float32
+Dataset: data/demo_30/right_wrist_pos | Shape: (142, 3) | Type: float64
+Dataset: data/demo_30/timestamps | Shape: (142,) | Type: int64
+Group: data/demo_31
+Dataset: data/demo_31/camera_poses | Shape: (77, 4, 4) | Type: float64
+Dataset: data/demo_31/labels | Shape: (1,) | Type: [('low_light', 'u1'), ('hand_out_of_frame', 'u1')]
+Dataset: data/demo_31/rgb_images_jpeg | Shape: (77,) | Type: object
+Dataset: data/demo_31/right_hand_landmarks | Shape: (77, 21, 3) | Type: float64
+Dataset: data/demo_31/right_palm_pos | Shape: (77, 3) | Type: float64
+Dataset: data/demo_31/right_pressure | Shape: (77, 16, 16) | Type: float32
+Dataset: data/demo_31/right_wrist_pos | Shape: (77, 3) | Type: float64
+Dataset: data/demo_31/timestamps | Shape: (77,) | Type: int64
+Group: data/demo_32
+Dataset: data/demo_32/camera_poses | Shape: (65, 4, 4) | Type: float64
+Dataset: data/demo_32/labels | Shape: (1,) | Type: [('low_light', 'u1'), ('hand_out_of_frame', 'u1')]
+Dataset: data/demo_32/rgb_images_jpeg | Shape: (65,) | Type: object
+Dataset: data/demo_32/right_hand_landmarks | Shape: (65, 21, 3) | Type: float64
+Dataset: data/demo_32/right_palm_pos | Shape: (65, 3) | Type: float64
+Dataset: data/demo_32/right_pressure | Shape: (65, 16, 16) | Type: float32
+Dataset: data/demo_32/right_wrist_pos | Shape: (65, 3) | Type: float64
+Dataset: data/demo_32/timestamps | Shape: (65,) | Type: int64
+Group: data/demo_33
+Dataset: data/demo_33/camera_poses | Shape: (118, 4, 4) | Type: float64
+Dataset: data/demo_33/labels | Shape: (1,) | Type: [('low_light', 'u1'), ('hand_out_of_frame', 'u1')]
+Dataset: data/demo_33/rgb_images_jpeg | Shape: (118,) | Type: object
+Dataset: data/demo_33/right_hand_landmarks | Shape: (118, 21, 3) | Type: float64
+Dataset: data/demo_33/right_palm_pos | Shape: (118, 3) | Type: float64
+Dataset: data/demo_33/right_pressure | Shape: (118, 16, 16) | Type: float32
+Dataset: data/demo_33/right_wrist_pos | Shape: (118, 3) | Type: float64
+Dataset: data/demo_33/timestamps | Shape: (118,) | Type: int64
+Group: data/demo_34
+Dataset: data/demo_34/camera_poses | Shape: (48, 4, 4) | Type: float64
+Dataset: data/demo_34/labels | Shape: (1,) | Type: [('low_light', 'u1'), ('hand_out_of_frame', 'u1')]
+Dataset: data/demo_34/rgb_images_jpeg | Shape: (48,) | Type: object
+Dataset: data/demo_34/right_hand_landmarks | Shape: (48, 21, 3) | Type: float64
+Dataset: data/demo_34/right_palm_pos | Shape: (48, 3) | Type: float64
+Dataset: data/demo_34/right_pressure | Shape: (48, 16, 16) | Type: float32
+Dataset: data/demo_34/right_wrist_pos | Shape: (48, 3) | Type: float64
+Dataset: data/demo_34/timestamps | Shape: (48,) | Type: int64
+Group: data/demo_35
+Dataset: data/demo_35/camera_poses | Shape: (59, 4, 4) | Type: float64
+Dataset: data/demo_35/labels | Shape: (1,) | Type: [('low_light', 'u1'), ('hand_out_of_frame', 'u1')]
+Dataset: data/demo_35/rgb_images_jpeg | Shape: (59,) | Type: object
+Dataset: data/demo_35/right_hand_landmarks | Shape: (59, 21, 3) | Type: float64
+Dataset: data/demo_35/right_palm_pos | Shape: (59, 3) | Type: float64
+Dataset: data/demo_35/right_pressure | Shape: (59, 16, 16) | Type: float32
+Dataset: data/demo_35/right_wrist_pos | Shape: (59, 3) | Type: float64
+Dataset: data/demo_35/timestamps | Shape: (59,) | Type: int64
+Dataset: transform_slam_to_rgb | Shape: (4, 4) | Type: float64

@@ -84,7 +84,6 @@ lapx
 # 6. VCS/Git Direct Dependencies (直接来自 Git 仓库的依赖)
 # --------------------------------------------------------------------
 # 建议通过带有额外标记或按顺序手动运行，以下列出以作记录：
-detectron2 @ git+https://github.com/facebookresearch/detectron2.git
-chumpy @ git+https://github.com/mattloper/chumpy.git
-pytorch3d @ git+https://github.com/facebookresearch/pytorch3d.git@stable
+detectron2 @ git+ssh://git@github.com/facebookresearch/detectron2.git
+chumpy @ git+ssh://git@github.com/mattloper/chumpy.git
 torch-scatter==2.1.2
