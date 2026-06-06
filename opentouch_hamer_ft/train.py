@@ -2,9 +2,10 @@
 import os
 import sys
 
-# Set OSMesa environment variables at the very beginning to prevent pyrender/EGL device ID issues
-os.environ['PYOPENGL_PLATFORM'] = 'osmesa'
-os.environ['PYRENDER_PLATFORM'] = 'osmesa'
+# Set EGL environment variables at the very beginning to prevent pyrender device ID issues
+# Using EGL instead of OSMesa because EGL is natively supported by NVIDIA drivers on headless servers
+os.environ['PYOPENGL_PLATFORM'] = 'egl'
+os.environ['PYRENDER_PLATFORM'] = 'egl'
 
 # Set absolute path for sys.argv[0] so that PyTorch Lightning DDP child spawns 
 # will correctly launch this script regardless of working directory changes
@@ -129,7 +130,7 @@ def parse_args():
     parser.add_argument("--checkpoint", type=str, default=os.path.join(workspace_dir, "hamer/_DATA/hamer_ckpts/checkpoints/hamer.ckpt"), help="Path to pretrained Hamer checkpoint")
     parser.add_argument("--split_json", type=str, default=os.path.join(workspace_dir, "evaluation/opentouch_splits.json"), help="Splits JSON path")
     parser.add_argument("--bbox_json", type=str, default=os.path.join(ft_dir, "opentouch_train_val_bboxes.json"), help="BBox JSON path")
-    parser.add_argument("--data_dir", type=str, default=os.path.join(workspace_dir, "opentouch/data"), help="Data folder path")
+    parser.add_argument("--data_dir", type=str, default="/data/jiangrui/OpenTouch Data/extracted_dataset", help="Data folder path")
     
     # Multi-GPU training support
     parser.add_argument("--gpus", type=str, default="4", help="GPU indices (comma-separated, e.g. 4,5)")
@@ -140,6 +141,7 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=4, help="Number of workers for DataLoader")
     parser.add_argument("--no_freeze", action="store_true", help="Do not freeze Backbone layers (will use 10x smaller LR for backbone)")
     parser.add_argument("--use_wandb", action="store_true", help="Enable Weights & Biases logging")
+    parser.add_argument("--exp_name", type=str, default="", help="Experiment name for saving checkpoints in a specific subfolder")
     parser.add_argument("--quick_test", action="store_true", help="Run a quick test training on a tiny subset")
     return parser.parse_args()
 
@@ -187,7 +189,8 @@ def main():
         args.checkpoint,
         strict=False,
         cfg=model_cfg,
-        init_renderer=False
+        init_renderer=False,
+        map_location="cpu"
     )
     
     # Create OpenTouchHAMER model
@@ -229,14 +232,6 @@ def main():
         args.num_workers = 0
         print(f"Truncated datasets: Train={len(train_dataset)}, Val={len(val_dataset)}")
         
-    # Define a worker_init_fn to specifically capture DataLoader worker Segmentation Faults
-    def worker_init_fn(worker_id):
-        import faulthandler
-        import os
-        # The log file will be saved in the hamer root directory since os.chdir(hamer_root) was called
-        log_file = open(f"worker_crash_dump_pid{os.getpid()}.txt", "w")
-        faulthandler.enable(file=log_file)
-
     # Create DataLoaders
     # Note: PyTorch Lightning DDP automatically applies DistributedSampler, 
     # dividing datasets among active GPU worker processes.
@@ -245,8 +240,7 @@ def main():
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        pin_memory=True,
-        worker_init_fn=worker_init_fn
+        pin_memory=True
     )
     
     val_loader = DataLoader(
@@ -254,12 +248,15 @@ def main():
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        pin_memory=True,
-        worker_init_fn=worker_init_fn
+        pin_memory=True
     )
     
     # Set up checkpoints callback
-    ckpt_dir = os.path.join(ft_dir, "checkpoints_test" if args.quick_test else "checkpoints")
+    if args.quick_test:
+        ckpt_dir = os.path.join(ft_dir, "checkpoints_test")
+    else:
+        ckpt_dir = os.path.join(ft_dir, "checkpoints", args.exp_name) if args.exp_name else os.path.join(ft_dir, "checkpoints")
+        
     checkpoint_callback = ModelCheckpoint(
         dirpath=ckpt_dir,
         filename="best_ft_model",
@@ -278,7 +275,8 @@ def main():
     # Setup Logger
     if args.use_wandb:
         print("🚀 Initializing Weights & Biases Logger...")
-        logger = WandbLogger(project="opentouch-hamer-ft", name="hamer-finetune")
+        wandb_name = args.exp_name if args.exp_name else "hamer-finetune"
+        logger = WandbLogger(project="opentouch-hamer-ft", name=wandb_name)
     else:
         logger = True
     

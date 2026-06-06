@@ -12,7 +12,6 @@ ft_dir = os.path.dirname(os.path.abspath(__file__))
 workspace_dir = os.path.abspath(os.path.join(ft_dir, ".."))
 sys.path.append(os.path.join(workspace_dir, "hamer"))
 
-from hamer.datasets.utils import get_example, expand_to_aspect_ratio
 
 # Global keypoint permutation for hand flipping (MediaPipe format)
 FLIP_KEYPOINT_PERMUTATION = list(range(21))
@@ -133,19 +132,44 @@ class OpenTouchHamerDataset(Dataset):
             'betas': np.zeros(10, dtype=np.float32)
         }
         has_mano_params = {k: 0.0 for k in mano_params.keys()}
-        mano_params_is_axis_angle = {k: True for k in mano_params.keys()}
+        mano_params_is_axis_angle = {'global_orient': True, 'hand_pose': True, 'betas': False}
 
-        # Image Augmentation and cropping (same as original Hamer code)
-        augm_config = self.cfg.DATASET.CONFIG
-        img_patch, keypoints_2d, keypoints_3d, mano_params, has_mano_params, img_size = get_example(
-            img_bgr, center_x, center_y, width=bbox_size, height=bbox_size,
-            keypoints_2d=keypoints_2d, keypoints_3d=keypoints_3d,
-            mano_params=mano_params, has_mano_params=has_mano_params,
-            flip_kp_permutation=FLIP_KEYPOINT_PERMUTATION,
-            patch_width=self.img_size, patch_height=self.img_size,
-            mean=self.mean, std=self.std, do_augment=self.train,
-            is_right=(is_right == 1), augm_config=augm_config, is_bgr=True
-        )
+        # Add basic augmentation during training
+        if self.train:
+            augm_config = self.cfg.DATASETS.CONFIG
+            scale_aug = np.clip(np.random.randn(), -1.0, 1.0) * augm_config.SCALE_FACTOR + 1.0
+            tx = np.clip(np.random.randn(), -1.0, 1.0) * augm_config.TRANS_FACTOR * bbox_size
+            ty = np.clip(np.random.randn(), -1.0, 1.0) * augm_config.TRANS_FACTOR * bbox_size
+            
+            bbox_size = bbox_size * scale_aug
+            center_x += tx
+            center_y += ty
+            
+        # Crop and resize image using affine transform
+        res = self.img_size
+        t = np.zeros((2, 3), dtype=np.float32)
+        t[0, 0] = float(res) / bbox_size
+        t[1, 1] = float(res) / bbox_size
+        t[0, 2] = res * (-float(center_x) / bbox_size + 0.5)
+        t[1, 2] = res * (-float(center_y) / bbox_size + 0.5)
+        
+        # Convert BGR to RGB
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        img_patch = cv2.warpAffine(img_rgb, t, (res, res), flags=cv2.INTER_LINEAR)
+        
+        # Normalize and convert to CHW
+        img_patch = img_patch.astype(np.float32) / 255.0
+        
+        if is_right == 0:
+            # Flip left hands to right hands for Hamer
+            img_patch = cv2.flip(img_patch, 1)
+            keypoints_3d[:, 0] = -keypoints_3d[:, 0]
+            
+        # Standard mean/std normalization
+        img_patch = (img_patch - self.cfg.MODEL.IMAGE_MEAN) / self.cfg.MODEL.IMAGE_STD
+        img_patch = img_patch.transpose(2, 0, 1)
+        
+        img_size_array = np.array([img_bgr.shape[1], img_bgr.shape[0]])
         
         item = {
             'img': torch.from_numpy(img_patch).float(),
@@ -153,7 +177,7 @@ class OpenTouchHamerDataset(Dataset):
             'keypoints_2d': torch.from_numpy(keypoints_2d).float(),
             'box_center': torch.tensor([center_x, center_y]).float(),
             'box_size': torch.tensor(bbox_size).float(),
-            'img_size': torch.from_numpy(img_size).float(),
+            'img_size': torch.from_numpy(img_size_array).float(),
             'right': torch.tensor(float(is_right)).float(),
             'mano_params': {k: torch.from_numpy(v).float() for k, v in mano_params.items()},
             'has_mano_params': {k: torch.tensor(float(v)).float() for k, v in has_mano_params.items()},

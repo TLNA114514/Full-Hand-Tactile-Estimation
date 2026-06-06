@@ -18,6 +18,12 @@ export OPENBLAS_NUM_THREADS=1
 export VECLIB_MAXIMUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 
+# Disable NCCL P2P and IB to prevent socket/connection errors during multi-GPU initialization
+export NCCL_P2P_DISABLE=1
+export NCCL_IB_DISABLE=1
+# Force NCCL to use the correct network interface if there are conflicts, though usually disabling IB/P2P is enough
+# export NCCL_SOCKET_IFNAME=lo
+
 # Change directory to script folder
 cd "$(dirname "$0")"
 
@@ -44,6 +50,7 @@ TEST_MODE=false
 USE_WANDB=false
 UNFREEZE=false
 SKIP_EXTRACT=false
+EXP_NAME=""
 
 while [[ "$#" -gt 0 ]]; do
     case $1 in
@@ -54,6 +61,7 @@ while [[ "$#" -gt 0 ]]; do
         --wandb) USE_WANDB=true; shift ;;
         --unfreeze) UNFREEZE=true; shift ;;
         --skip_extract) SKIP_EXTRACT=true; shift ;;
+        --exp_name) EXP_NAME="$2"; shift 2 ;;
         --help) show_help; exit 0 ;;
         *) echo "Unknown parameter: $1"; show_help; exit 1 ;;
     esac
@@ -156,6 +164,9 @@ fi
 if [ "$UNFREEZE" = true ]; then
     EXTRA_ARGS="$EXTRA_ARGS --no_freeze"
 fi
+if [ -n "$EXP_NAME" ]; then
+    EXTRA_ARGS="$EXTRA_ARGS --exp_name $EXP_NAME"
+fi
 
 if [ "$TEST_MODE" = true ]; then
     python3 "$(pwd)/train.py" \
@@ -170,8 +181,8 @@ else
         --epochs "$EPOCHS" \
         --lr "$LR" \
         --bbox_json "$BBOX_JSON_FILE" \
-        --batch_size 16 \
-        --num_workers 8 \
+        --batch_size 32 \
+        --num_workers 32 \
         $EXTRA_ARGS
 fi
 
