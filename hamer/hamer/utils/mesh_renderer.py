@@ -1,5 +1,5 @@
 import os
-os.environ['PYRENDER_PLATFORM'] = 'osmesa'
+os.environ['PYRENDER_PLATFORM'] = 'egl'
 import torch
 from torchvision.utils import make_grid
 import numpy as np

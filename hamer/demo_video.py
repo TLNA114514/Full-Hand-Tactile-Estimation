@@ -1,6 +1,6 @@
 import os
-os.environ['PYOPENGL_PLATFORM'] = 'osmesa'
-os.environ['PYRENDER_PLATFORM'] = 'osmesa'
+os.environ['PYOPENGL_PLATFORM'] = 'egl'
+os.environ['PYRENDER_PLATFORM'] = 'egl'
 
 from pathlib import Path
 import torch

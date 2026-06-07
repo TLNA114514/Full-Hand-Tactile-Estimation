@@ -9,6 +9,7 @@ DEST_BASE="/code/users/jiangrui/full_hand_tactile_estimation"
 SYNC_DIRS=(
     "evaluation"
     "opentouch_hamer_ft"
+    " hamer_tactile_ft "
     # "未来你想同步的新文件夹A"
     # "未来你想同步的新文件夹B"
 )

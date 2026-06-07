@@ -1,8 +1,21 @@
 import sys
 import os
 import json
-os.environ['PYOPENGL_PLATFORM'] = 'osmesa'
-os.environ['PYRENDER_PLATFORM'] = 'osmesa'
+
+# ======================================================================
+# 提前解析 --gpu 参数并设置 CUDA_VISIBLE_DEVICES，必须在 import torch 之前！
+# 否则在子进程中修改 CUDA_VISIBLE_DEVICES 会导致 PyTorch CUDAContext 初始化崩溃。
+# ======================================================================
+_gpus = ""
+for i, arg in enumerate(sys.argv):
+    if arg == '--gpu' and i + 1 < len(sys.argv):
+        _gpus = sys.argv[i+1]
+        break
+if _gpus:
+    os.environ["CUDA_VISIBLE_DEVICES"] = _gpus
+
+os.environ['PYOPENGL_PLATFORM'] = 'egl'
+os.environ['PYRENDER_PLATFORM'] = 'egl'
 import argparse
 import h5py
 import cv2
@@ -18,7 +31,49 @@ sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 from hamer.configs import CACHE_DIR_HAMER
 from hamer.models import HAMER, download_models, load_hamer, DEFAULT_CHECKPOINT
 from hamer.utils import recursive_to
-from hamer.datasets.vitdet_dataset import ViTDetDataset
+class ViTDetDataset(torch.utils.data.Dataset):
+    def __init__(self, cfg, img_cv2, boxes, right, rescale_factor=2.0):
+        self.cfg = cfg
+        self.img_cv2 = img_cv2
+        self.boxes = boxes
+        self.right = right
+        self.rescale_factor = rescale_factor
+
+    def __len__(self):
+        return len(self.boxes)
+
+    def __getitem__(self, idx):
+        bbox = self.boxes[idx]
+        is_right = self.right[idx]
+        
+        center = np.array([(bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0])
+        scale_pixels = max(bbox[2] - bbox[0], bbox[3] - bbox[1])
+        bbox_size = scale_pixels * self.rescale_factor
+        
+        res = self.cfg.MODEL.IMAGE_SIZE
+        t = np.zeros((2, 3), dtype=np.float32)
+        t[0, 0] = float(res) / bbox_size
+        t[1, 1] = float(res) / bbox_size
+        t[0, 2] = res * (-float(center[0]) / bbox_size + 0.5)
+        t[1, 2] = res * (-float(center[1]) / bbox_size + 0.5)
+        
+        img_rgb = cv2.cvtColor(self.img_cv2, cv2.COLOR_BGR2RGB)
+        img_patch = cv2.warpAffine(img_rgb, t, (res, res), flags=cv2.INTER_LINEAR)
+        img_patch = img_patch.astype(np.float32) / 255.0
+        
+        if is_right == 0:
+            img_patch = cv2.flip(img_patch, 1)
+            
+        img_patch = (img_patch - self.cfg.MODEL.IMAGE_MEAN) / self.cfg.MODEL.IMAGE_STD
+        img_patch = img_patch.transpose(2, 0, 1)
+        
+        return {
+            'img': torch.from_numpy(img_patch).float(),
+            'right': torch.tensor(is_right, dtype=torch.float32),
+            'box_center': torch.from_numpy(center).float(),
+            'box_size': torch.tensor(bbox_size).float(),
+            'img_size': torch.tensor([self.img_cv2.shape[1], self.img_cv2.shape[0]], dtype=torch.float32)
+        }
 from vitpose_model import ViTPoseModel
 from eval_utils import compute_similarity_transform, compute_mpjpe, compute_pck, compute_auc, fit_mano_to_joints
 
@@ -88,30 +143,54 @@ def eval_clip(model, detector, cpm, model_cfg, hdf5_path, clip_id, device, resca
     all_pred_verts = []
     all_gt_verts = []
     
+    # Debug variables
+    stats = {
+        'total_frames': num_frames,
+        'no_img': 0,
+        'no_person': 0,
+        'no_hand_keypoints': 0,
+        'no_valid_gt': 0,
+        'valid_samples': 0
+    }
+    
     # 逐帧解码与推理
     for i in tqdm(range(num_frames), desc=f"Clip {clip_id}", disable=disable_tqdm):
         # 1. 图像解码
         img_bgr = cv2.imdecode(np.frombuffer(rgb_bytes_seq[i], dtype=np.uint8), cv2.IMREAD_COLOR)
         if img_bgr is None:
+            stats['no_img'] += 1
             continue
             
         img_rgb = img_bgr[:, :, ::-1]
         
-        # 2. 调用内置目标检测器定位人体
-        det_out = detector(img_bgr)
+        # 1. 运行 ViTDet 目标检测
+        try:
+            det_out = detector(img_bgr)
+        except Exception as e:
+            import traceback
+            print(f"ViTDet error at clip {clip_id}, img_bgr.shape: {img_bgr.shape}")
+            traceback.print_exc()
+            raise e
         det_instances = det_out['instances']
         valid_idx = (det_instances.pred_classes == 0) & (det_instances.scores > 0.5)
         pred_bboxes = det_instances.pred_boxes.tensor[valid_idx].cpu().numpy()
         pred_scores = det_instances.scores[valid_idx].cpu().numpy()
         
         if len(pred_bboxes) == 0:
+            stats['no_person'] += 1
             continue
             
         # 3. 调用 ViTPose 提取手部位置并生成检测框
-        vitposes_out = cpm.predict_pose(
-            img_rgb,
-            [np.concatenate([pred_bboxes, pred_scores[:, None]], axis=1)],
-        )
+        try:
+            vitposes_out = cpm.predict_pose(
+                img_rgb,
+                [np.concatenate([pred_bboxes, pred_scores[:, None]], axis=1)],
+            )
+        except Exception as e:
+            import traceback
+            print(f"ViTPose error at clip {clip_id}, img_rgb.shape: {img_rgb.shape}")
+            traceback.print_exc()
+            raise e
         
         bboxes = []
         is_right = []
@@ -139,6 +218,7 @@ def eval_clip(model, detector, cpm, model_cfg, hdf5_path, clip_id, device, resca
                     is_right.append(1)
                     
         if len(bboxes) == 0:
+            stats['no_hand_keypoints'] += 1
             continue
             
         boxes_arr = np.stack(bboxes)
@@ -150,8 +230,14 @@ def eval_clip(model, detector, cpm, model_cfg, hdf5_path, clip_id, device, resca
         
         for batch in dataloader:
             batch = recursive_to(batch, device)
-            with torch.no_grad():
-                out = model(batch)
+            try:
+                with torch.no_grad():
+                    out = model(batch)
+            except Exception as e:
+                import traceback
+                print(f"Hamer model error at clip {clip_id}, batch['img'].shape: {batch['img'].shape}")
+                traceback.print_exc()
+                raise e
                 
             pred_joints = out['pred_keypoints_3d'].detach().cpu().numpy()
             
@@ -172,7 +258,10 @@ def eval_clip(model, detector, cpm, model_cfg, hdf5_path, clip_id, device, resca
                     
                 # 排除缺失的关节点
                 if np.isnan(gt_j).any():
+                    stats['no_valid_gt'] += 1
                     continue
+                    
+                stats['valid_samples'] += 1
                     
                 # 【重要修复】Hamer 永远输出右手。如果是左手，必须将预测的 X 轴翻转回去！
                 if is_r == 0:
@@ -205,7 +294,7 @@ def eval_clip(model, detector, cpm, model_cfg, hdf5_path, clip_id, device, resca
                     pass
                 
     if len(all_pred_joints) == 0:
-        print(f"❌ Clip {clip_id} 中没有成功匹配的帧用于指标计算！")
+        print(f"⚠️ Clip {clip_id} 返回了空结果！统计信息: {stats}")
         return None
         
     all_pred = np.stack(all_pred_joints)
@@ -275,12 +364,14 @@ def load_or_generate_splits(split_json_path, data_dir):
     print(f"✅ 默认划分已成功生成并保存至 {split_json_path}")
     return splits
 
-def eval_worker(gpu_id, clips_chunk, args_checkpoint, args_model_cfg, data_dir, hdf5_path_arg):
+def eval_worker(local_gpu_id, clips_chunk, args_checkpoint, args_model_cfg, data_dir, hdf5_path_arg):
     import traceback
     try:
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-        device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-        print(f"[Worker GPU {gpu_id}] 正在初始化模型... 分配了 {len(clips_chunk)} 个片段")
+        device = torch.device(f'cuda:{local_gpu_id}') if torch.cuda.is_available() else torch.device('cpu')
+        if torch.cuda.is_available():
+            torch.cuda.set_device(device)
+            
+        print(f"[Worker GPU 逻辑号 {local_gpu_id}] 正在初始化模型... 分配了 {len(clips_chunk)} 个片段")
         
         if args_model_cfg is not None:
             from hamer.configs import get_config
@@ -294,7 +385,7 @@ def eval_worker(gpu_id, clips_chunk, args_checkpoint, args_model_cfg, data_dir, 
                 model_cfg.defrost()
                 model_cfg.MODEL.BACKBONE.pop('PRETRAINED_WEIGHTS')
                 model_cfg.freeze()
-            model = HAMER.load_from_checkpoint(args_checkpoint, strict=False, cfg=model_cfg)
+            model = HAMER.load_from_checkpoint(args_checkpoint, strict=False, cfg=model_cfg, map_location='cpu')
         else:
             model, model_cfg = load_hamer(args_checkpoint)
             
@@ -306,11 +397,40 @@ def eval_worker(gpu_id, clips_chunk, args_checkpoint, args_model_cfg, data_dir, 
         import hamer
         cfg_path = Path(hamer.__file__).parent/'configs'/'cascade_mask_rcnn_vitdet_h_75ep.py'
         detectron2_cfg = LazyConfig.load(str(cfg_path))
-        detectron2_cfg.train.init_checkpoint = "https://dl.fbaipublicfiles.com/detectron2/ViTDet/COCO/cascade_mask_rcnn_vitdet_h/f328730692/model_final_f05665.pkl"
+        
+        # 允许优先使用本地下载的模型，以避免网络下载过慢
+        local_vitdet_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../hamer/_DATA/model_final_f05665.pkl"))
+        if os.path.exists(local_vitdet_path):
+            detectron2_cfg.train.init_checkpoint = local_vitdet_path
+            print(f"[Worker GPU 逻辑号 {local_gpu_id}] ⚡ 使用本地 ViTDet 检测器权重: {local_vitdet_path}")
+        else:
+            detectron2_cfg.train.init_checkpoint = "https://dl.fbaipublicfiles.com/detectron2/ViTDet/COCO/cascade_mask_rcnn_vitdet_h/f328730692/model_final_f05665.pkl"
+            
         for i in range(3):
             detectron2_cfg.model.roi_heads.box_predictors[i].test_score_thresh = 0.25
         detector = DefaultPredictor_Lazy(detectron2_cfg)
         
+        # 动态将 ViTPose 仓库里的自定义 ViT 骨干网络注册到系统的 mmpose 中
+        try:
+            import importlib.util
+            vit_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../hamer/third-party/ViTPose/mmpose/models/backbones/vit.py"))
+            spec = importlib.util.spec_from_file_location("mmpose.models.backbones.vit", vit_path)
+            vit_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(vit_module)
+            
+            # 补丁：ViTPose 的模型权重（如 pos_embed 和 patch_embed）与初始化时大小可能不同
+            # 必须使用 ViTPose 官方魔改的 load_checkpoint 进行自动插值，否则 state_dict 大小不匹配！
+            import mmpose.apis.inference
+            custom_ckpt_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../hamer/third-party/ViTPose/mmcv_custom/checkpoint.py"))
+            spec_ckpt = importlib.util.spec_from_file_location("mmcv_custom.checkpoint", custom_ckpt_path)
+            custom_ckpt_module = importlib.util.module_from_spec(spec_ckpt)
+            spec_ckpt.loader.exec_module(custom_ckpt_module)
+            mmpose.apis.inference.load_checkpoint = custom_ckpt_module.load_checkpoint
+            
+            print(f"[Worker GPU 逻辑号 {local_gpu_id}] ✅ 成功将 ViT 及自定义 load_checkpoint 注册至系统 mmpose 后端！")
+        except Exception as e:
+            print(f"[Worker GPU 逻辑号 {local_gpu_id}] ⚠️ 动态注册 ViT 发生异常，可能导致后续网络构建失败: {e}")
+            
         cpm = ViTPoseModel(device)
         
         results = []
@@ -324,28 +444,29 @@ def eval_worker(gpu_id, clips_chunk, args_checkpoint, args_model_cfg, data_dir, 
             for scene_name, clip_ids in scene_to_clips.items():
                 hdf5_path = os.path.join(data_dir, f"{scene_name}.hdf5")
                 if not os.path.exists(hdf5_path):
+                    print(f"[Worker GPU 逻辑号 {local_gpu_id}] ⚠️ 找不到数据文件: {hdf5_path}，跳过场景 {scene_name}！")
                     continue
                 for clip in clip_ids:
                     try:
                         res = eval_clip(model, detector, cpm, model_cfg, hdf5_path, clip, device, disable_tqdm=True)
                         if res is not None:
                             results.append(res)
-                            print(f"[Worker GPU {gpu_id}] ✅ 完成片段: {clip}")
+                            print(f"[Worker GPU 逻辑号 {local_gpu_id}] ✅ 完成片段: {clip}")
                     except Exception as e:
-                        print(f"[Worker GPU {gpu_id}] ⚠️ 处理 {scene_name}/{clip} 失败: {e}")
+                        print(f"[Worker GPU 逻辑号 {local_gpu_id}] ⚠️ 处理 {scene_name}/{clip} 失败: {e}")
         else:
             for clip in clips_chunk:
                 try:
                     res = eval_clip(model, detector, cpm, model_cfg, hdf5_path_arg, clip, device, disable_tqdm=True)
                     if res is not None:
                         results.append(res)
-                        print(f"[Worker GPU {gpu_id}] ✅ 完成片段: {clip}")
+                        print(f"[Worker GPU 逻辑号 {local_gpu_id}] ✅ 完成片段: {clip}")
                 except Exception as e:
-                    print(f"[Worker GPU {gpu_id}] ⚠️ 处理 Clip {clip} 失败: {e}")
+                    print(f"[Worker GPU 逻辑号 {local_gpu_id}] ⚠️ 处理 Clip {clip} 失败: {e}")
                     
         return results
     except Exception as e:
-        print(f"[Worker GPU {gpu_id}] ❌ 初始化/评估时发生严重错误: {e}")
+        print(f"[Worker GPU 逻辑号 {local_gpu_id}] ❌ 初始化/评估时发生严重错误: {e}")
         traceback.print_exc()
         return []
 
@@ -353,7 +474,8 @@ def main():
     parser = argparse.ArgumentParser(description='Hamer OpenTouch 数据集一键式评估')
     parser.add_argument('--checkpoint', type=str, default="../hamer/_DATA/hamer_ckpts/checkpoints/hamer.ckpt", help='Hamer 模型 Checkpoint 路径')
     parser.add_argument('--model_cfg', type=str, default=None, help='模型配置文件路径 (用于微调后的模型)')
-    parser.add_argument('--hdf5_path', type=str, default=None, help='OpenTouch HDF5 数据集文件路径')
+    parser.add_argument('--hdf5_path', type=str, default=None, help='OpenTouch HDF5 数据集文件路径 (用于单文件模式)')
+    parser.add_argument('--data_dir', type=str, default="/data/jiangrui/OpenTouch Data/data", help='提取的 HDF5 数据集目录 (用于 --split 模式)')
     parser.add_argument('--clips', nargs='*', default=None, help='需要评估的 Clips 列表 (可与 --split 结合使用来过滤特定 Clip)')
     parser.add_argument('--gpu', type=str, default='4', help='使用的 GPU 编号')
     parser.add_argument('--split', type=str, default=None, choices=['train', 'val', 'test', 'all'], help='评估的数据集划分')
@@ -377,11 +499,24 @@ def main():
     hamer_root = os.path.abspath(os.path.join(eval_dir, '../hamer'))
     os.chdir(hamer_root)
     
+    # Ensure ViTPose configs/_base_/datasets/coco_wholebody.py exists before spawning workers
+    import urllib.request
+    base_dir = os.path.join(hamer_root, "third-party/ViTPose/configs/_base_/datasets")
+    os.makedirs(base_dir, exist_ok=True)
+    dataset_cfg_path = os.path.join(base_dir, "coco_wholebody.py")
+    if not os.path.exists(dataset_cfg_path):
+        print(f"📥 正在为你自动补全缺失的 ViTPose 配置: coco_wholebody.py ...")
+        try:
+            urllib.request.urlretrieve("https://raw.githubusercontent.com/ViTAE-Transformer/ViTPose/main/configs/_base_/datasets/coco_wholebody.py", dataset_cfg_path)
+            print(f"✅ 下载完成！")
+        except Exception as e:
+            print(f"⚠️ 下载失败: {e}，模型可能无法初始化！")
+            
     gpus = [g.strip() for g in args.gpu.split(',')]
     results = []
     
     if args.split is not None:
-        data_dir = os.path.abspath(os.path.join(eval_dir, "../opentouch/data"))
+        data_dir = os.path.abspath(args.data_dir)
         try:
             splits = load_or_generate_splits(args.split_json, data_dir)
         except Exception as se:
@@ -424,7 +559,7 @@ def main():
         for i, gpu_id in enumerate(gpus):
             if i < len(chunks) and len(chunks[i]) > 0:
                 pool_args.append((
-                    gpu_id, 
+                    i, 
                     chunks[i], 
                     args.checkpoint, 
                     args.model_cfg, 
@@ -442,7 +577,7 @@ def main():
         # 单卡模式
         gpu_id = gpus[0]
         print(f"🚀 单卡模式启动，GPU: {gpu_id}")
-        results = eval_worker(gpu_id, target_clips, args.checkpoint, args.model_cfg, data_dir, args.hdf5_path)
+        results = eval_worker(0, target_clips, args.checkpoint, args.model_cfg, data_dir, args.hdf5_path)
                 
     if len(results) > 0:
         # 计算加权平均指标
