@@ -39,10 +39,16 @@ from hamer.models.hamer import HAMER
 from dataset import OpenTouchHamerDataset
 
 class OpenTouchHAMER(HAMER):
-    def __init__(self, cfg, learning_rate=1e-5, freeze_backbone=True):
+    def __init__(self, cfg, learning_rate=1e-5, freeze_backbone=True, teacher_model=None):
         # Initialize without loading rendering to save GPU memory and headless execution
         super().__init__(cfg, init_renderer=False)
         self.learning_rate = learning_rate
+        
+        self.teacher_model = teacher_model
+        if self.teacher_model is not None:
+            self.teacher_model.eval()
+            for param in self.teacher_model.parameters():
+                param.requires_grad = False
         
         # Override automatic optimization back to standard lightning
         self.automatic_optimization = True
@@ -65,6 +71,27 @@ class OpenTouchHAMER(HAMER):
         # Keep the last layer/head trainable
         for param in self.mano_head.parameters():
             param.requires_grad = True
+            
+    def forward_step(self, batch, train=False):
+        # 先让当前正在训练的 Student 模型输出
+        output = super().forward_step(batch, train=train)
+        
+        # 策略 3: 使用 Teacher 模型的相机预测直接覆盖 Student 的输出
+        if self.teacher_model is not None:
+            with torch.no_grad():
+                teacher_output = self.teacher_model.forward_step(batch, train=False)
+            output['pred_cam'] = teacher_output['pred_cam']
+            if 'pred_cam_list' in teacher_output:
+                output['pred_cam_list'] = teacher_output['pred_cam_list']
+                
+        return output
+        
+    def on_save_checkpoint(self, checkpoint):
+        # 移除 teacher_model 权重以节省 Checkpoint 的存储空间
+        if 'state_dict' in checkpoint:
+            keys_to_remove = [k for k in checkpoint['state_dict'].keys() if k.startswith('teacher_model.')]
+            for k in keys_to_remove:
+                del checkpoint['state_dict'][k]
                 
     def training_step(self, batch, batch_idx):
         output = self.forward_step(batch, train=True)
@@ -193,11 +220,21 @@ def main():
         map_location="cpu"
     )
     
+    print("Loading a separate Teacher model to preserve original camera parameters...")
+    teacher_model = HAMER.load_from_checkpoint(
+        args.checkpoint,
+        strict=False,
+        cfg=model_cfg,
+        init_renderer=False,
+        map_location="cpu"
+    )
+    
     # Create OpenTouchHAMER model
     model = OpenTouchHAMER(
         cfg=model_cfg,
         learning_rate=lr_scaled,
-        freeze_backbone=not args.no_freeze
+        freeze_backbone=not args.no_freeze,
+        teacher_model=teacher_model
     )
     
     # Transfer weights from pretrained model

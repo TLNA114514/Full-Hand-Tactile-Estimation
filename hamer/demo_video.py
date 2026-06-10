@@ -125,7 +125,7 @@ def main():
     args = parser.parse_args()
 
     # Download and load checkpoints
-    download_models(CACHE_DIR_HAMER)
+    # download_models(CACHE_DIR_HAMER)
     model, model_cfg = load_hamer(args.checkpoint)
 
     # Setup HaMeR model
@@ -140,7 +140,11 @@ def main():
         import hamer
         cfg_path = Path(hamer.__file__).parent/'configs'/'cascade_mask_rcnn_vitdet_h_75ep.py'
         detectron2_cfg = LazyConfig.load(str(cfg_path))
-        detectron2_cfg.train.init_checkpoint = "https://dl.fbaipublicfiles.com/detectron2/ViTDet/COCO/cascade_mask_rcnn_vitdet_h/f328730692/model_final_f05665.pkl"
+        local_vitdet_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '_DATA', 'model_final_f05665.pkl'))
+        if os.path.exists(local_vitdet_path):
+            detectron2_cfg.train.init_checkpoint = local_vitdet_path
+        else:
+            detectron2_cfg.train.init_checkpoint = "https://dl.fbaipublicfiles.com/detectron2/ViTDet/COCO/cascade_mask_rcnn_vitdet_h/f328730692/model_final_f05665.pkl"
         for i in range(3):
             detectron2_cfg.model.roi_heads.box_predictors[i].test_score_thresh = 0.25
         detector = DefaultPredictor_Lazy(detectron2_cfg)

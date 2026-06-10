@@ -11,11 +11,12 @@ class HAMER_Tactile(HAMER):
         # Since the backbone output channels (e.g. 1024 or 1280) are passed as `b c h w`,
         # we will use AdaptiveAvgPool2d and then LazyLinear to handle any backbone feature dimension.
         self.tactile_head = nn.Sequential(
-            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.AdaptiveAvgPool2d((4, 4)),
             nn.Flatten(),
-            nn.LazyLinear(512),
+            nn.LazyLinear(1024),
             nn.ReLU(),
-            nn.Linear(512, 256)
+            nn.Linear(1024, 256),
+            nn.Sigmoid()
         )
         
         # Ensure we don't automatically optimize as we want to control freezing
@@ -59,7 +60,13 @@ class HAMER_Tactile(HAMER):
         # We use Smooth L1 Loss for tactile signal regression
         tactile_loss_fn = nn.SmoothL1Loss(reduction='none')
         
-        loss_tactile = tactile_loss_fn(pred_tactile, gt_tactile)
+        loss_tactile_base = tactile_loss_fn(pred_tactile, gt_tactile)
+        
+        # Asymmetric penalty: heavily penalize false positives in non-contact areas
+        weight = torch.ones_like(gt_tactile)
+        weight[gt_tactile < 0.05] = 2.0
+        
+        loss_tactile = loss_tactile_base * weight
         
         # Mask out samples that don't have tactile data
         # has_tactile shape is (B,) while loss_tactile shape is (B, 256)

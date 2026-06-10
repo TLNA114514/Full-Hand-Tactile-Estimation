@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
 
 # Define paths
 WORKSPACE_DIR="$(dirname "$SCRIPT_DIR")"
-CHECKPOINT="$WORKSPACE_DIR/opentouch_hamer_ft/checkpoints/regression_only/best_ft_model.ckpt"
+CHECKPOINT="$WORKSPACE_DIR/opentouch_hamer_ft/checkpoints/regression_60/best_ft_model.ckpt"
 
 # Change to the script's directory
 cd "$SCRIPT_DIR"
@@ -25,7 +25,7 @@ python train.py \
     --gpus "4" \
     --lr 1e-4 \
     --batch_size 16 \
-    --epochs 30 \
+    --epochs 60 \
     --exp_name "tactile_ft" \
     --use_wandb \
     "$@"

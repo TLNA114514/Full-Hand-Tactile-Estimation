@@ -11,8 +11,24 @@ from mmpose.apis import inference_top_down_pose_model, init_pose_model, process_
 os.environ["PYOPENGL_PLATFORM"] = "egl"
 
 # project root directory
-ROOT_DIR = "./"
+ROOT_DIR = os.path.abspath(os.path.dirname(__file__))
 VIT_DIR = os.path.join(ROOT_DIR, "third-party/ViTPose")
+
+try:
+    import importlib.util
+    import mmpose.apis.inference
+    vit_path = os.path.join(VIT_DIR, "mmpose/models/backbones/vit.py")
+    spec = importlib.util.spec_from_file_location("mmpose.models.backbones.vit", vit_path)
+    vit_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(vit_module)
+
+    custom_ckpt_path = os.path.join(VIT_DIR, "mmcv_custom/checkpoint.py")
+    spec_ckpt = importlib.util.spec_from_file_location("mmcv_custom.checkpoint", custom_ckpt_path)
+    custom_ckpt_module = importlib.util.module_from_spec(spec_ckpt)
+    spec_ckpt.loader.exec_module(custom_ckpt_module)
+    mmpose.apis.inference.load_checkpoint = custom_ckpt_module.load_checkpoint
+except Exception as e:
+    print(f"Warning: Failed to dynamically register ViTPose custom modules: {e}")
 
 class ViTPoseModel(object):
     MODEL_DICT = {

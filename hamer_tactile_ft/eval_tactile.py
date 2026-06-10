@@ -37,7 +37,7 @@ from eval_hamer import ViTDetDataset, load_or_generate_splits
 from vitpose_model import ViTPoseModel
 from hamer.utils import recursive_to
 
-def eval_clip(model, detector, cpm, model_cfg, hdf5_path, clip_id, device, rescale_factor=2.0, disable_tqdm=False):
+def eval_clip(model, detector, cpm, model_cfg, hdf5_path, clip_id, device, contact_thr=0.05, rescale_factor=2.0, disable_tqdm=False):
     with h5py.File(hdf5_path, "r") as f:
         clip_group = f[f"data/{clip_id}"]
         rgb_bytes_seq = clip_group["rgb_images_jpeg"][()]
@@ -136,6 +136,8 @@ def eval_clip(model, detector, cpm, model_cfg, hdf5_path, clip_id, device, resca
                 with torch.no_grad():
                     out = model.forward_step(batch, train=False)
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 continue
                 
             pred_tactile = out['pred_tactile'].detach().cpu().numpy() # [N, 256]
@@ -185,20 +187,55 @@ def eval_clip(model, detector, cpm, model_cfg, hdf5_path, clip_id, device, resca
     
     avg_pcc = np.mean(pcc_list) if len(pcc_list) > 0 else 0.0
     
+    # --- New Metrics: Temporal Accuracy, Contact IoU, Volumetric IoU ---
+    pred_bin = all_pred > contact_thr
+    gt_bin = all_gt > contact_thr
+    
+    # Temporal Accuracy
+    pred_frame_contact = np.any(pred_bin, axis=1)
+    gt_frame_contact = np.any(gt_bin, axis=1)
+    temporal_acc = np.mean(pred_frame_contact == gt_frame_contact)
+    
+    # Contact IoU
+    intersection = np.sum(pred_bin & gt_bin, axis=1)
+    union = np.sum(pred_bin | gt_bin, axis=1)
+    contact_iou_per_frame = np.zeros(len(union), dtype=np.float32)
+    zero_union_mask = (union == 0)
+    contact_iou_per_frame[zero_union_mask] = 1.0 # Both correctly predict no contact
+    non_zero_mask = ~zero_union_mask
+    contact_iou_per_frame[non_zero_mask] = intersection[non_zero_mask] / union[non_zero_mask]
+    contact_iou = np.mean(contact_iou_per_frame)
+    
+    # Volumetric IoU
+    vol_intersection = np.sum(np.minimum(all_pred, all_gt), axis=1)
+    vol_union = np.sum(np.maximum(all_pred, all_gt), axis=1)
+    vol_iou_per_frame = np.zeros(len(vol_union), dtype=np.float32)
+    vol_zero_union_mask = (vol_union == 0)
+    vol_iou_per_frame[vol_zero_union_mask] = 1.0
+    vol_non_zero_mask = ~vol_zero_union_mask
+    vol_iou_per_frame[vol_non_zero_mask] = vol_intersection[vol_non_zero_mask] / vol_union[vol_non_zero_mask]
+    volumetric_iou = np.mean(vol_iou_per_frame)
+    
     print(f"--- {clip_id} 评估结果 ---")
     print(f"有效评估帧数: {len(all_pred)}")
     print(f"MAE  (归一化 [0,1]): {mae:.4f}")
     print(f"RMSE (归一化 [0,1]): {rmse:.4f}")
     print(f"Pearson Correlation: {avg_pcc:.4f}")
+    print(f"Temporal Accuracy: {temporal_acc:.4f}")
+    print(f"Contact IoU: {contact_iou:.4f}")
+    print(f"Volumetric IoU: {volumetric_iou:.4f}")
     
     return {
         "mae": mae,
         "rmse": rmse,
         "pcc": avg_pcc,
+        "temporal_acc": temporal_acc,
+        "contact_iou": contact_iou,
+        "volumetric_iou": volumetric_iou,
         "count": len(all_pred)
     }
 
-def eval_worker(local_gpu_id, clips_chunk, args_checkpoint, data_dir, hdf5_path_arg):
+def eval_worker(local_gpu_id, clips_chunk, args_checkpoint, data_dir, hdf5_path_arg, contact_thr=0.05):
     import traceback
     try:
         device = torch.device(f'cuda:{local_gpu_id}') if torch.cuda.is_available() else torch.device('cpu')
@@ -275,7 +312,7 @@ def eval_worker(local_gpu_id, clips_chunk, args_checkpoint, data_dir, hdf5_path_
                     continue
                 for clip in clip_ids:
                     try:
-                        res = eval_clip(model, detector, cpm, model_cfg, hdf5_path, clip, device, disable_tqdm=True)
+                        res = eval_clip(model, detector, cpm, model_cfg, hdf5_path, clip, device, contact_thr=contact_thr, disable_tqdm=True)
                         if res is not None:
                             results.append(res)
                     except Exception as e:
@@ -283,7 +320,7 @@ def eval_worker(local_gpu_id, clips_chunk, args_checkpoint, data_dir, hdf5_path_
         else:
             for clip in clips_chunk:
                 try:
-                    res = eval_clip(model, detector, cpm, model_cfg, hdf5_path_arg, clip, device, disable_tqdm=True)
+                    res = eval_clip(model, detector, cpm, model_cfg, hdf5_path_arg, clip, device, contact_thr=contact_thr, disable_tqdm=True)
                     if res is not None:
                         results.append(res)
                 except Exception as e:
@@ -302,6 +339,7 @@ def main():
     parser.add_argument('--gpu', type=str, default='4')
     parser.add_argument('--split', type=str, default='test', choices=['train', 'val', 'test', 'all'])
     parser.add_argument('--split_json', type=str, default=os.path.join(eval_dir, "opentouch_splits.json"))
+    parser.add_argument('--contact_thr', type=float, default=0.00, help='Threshold for defining contact (0-1)')
     args = parser.parse_args()
     
     os.chdir(hamer_dir)
@@ -339,7 +377,7 @@ def main():
         pool_args = []
         for i, gpu_id in enumerate(gpus):
             if i < len(chunks) and len(chunks[i]) > 0:
-                pool_args.append((i, chunks[i], args.checkpoint, args.data_dir, args.hdf5_path))
+                pool_args.append((i, chunks[i], args.checkpoint, args.data_dir, args.hdf5_path, args.contact_thr))
                 
         with mp.Pool(len(pool_args)) as pool:
             multi_results = pool.starmap(eval_worker, pool_args)
@@ -347,13 +385,16 @@ def main():
         for r in multi_results:
             results.extend(r)
     else:
-        results = eval_worker(0, target_clips, args.checkpoint, args.data_dir, args.hdf5_path)
+        results = eval_worker(0, target_clips, args.checkpoint, args.data_dir, args.hdf5_path, args.contact_thr)
                 
     if len(results) > 0:
         total_frames = sum([r["count"] for r in results])
         avg_mae = sum([r["mae"] * r["count"] for r in results]) / total_frames
         avg_rmse = sum([r["rmse"] * r["count"] for r in results]) / total_frames
         avg_pcc = sum([r["pcc"] * r["count"] for r in results]) / total_frames
+        avg_temp_acc = sum([r["temporal_acc"] * r["count"] for r in results]) / total_frames
+        avg_cont_iou = sum([r["contact_iou"] * r["count"] for r in results]) / total_frames
+        avg_vol_iou = sum([r["volumetric_iou"] * r["count"] for r in results]) / total_frames
         
         report_lines = [
             f"🎉 Tactile Regression 最终加权评估结果 🎉",
@@ -363,6 +404,9 @@ def main():
             f" 整体 MAE      : {avg_mae:.4f} (归一化区间 [0,1])",
             f" 整体 RMSE     : {avg_rmse:.4f} (归一化区间 [0,1])",
             f" 整体 PCC      : {avg_pcc:.4f} (皮尔逊相关系数)",
+            f" Temporal Acc  : {avg_temp_acc:.4f} (Contact Thr = {args.contact_thr})",
+            f" Contact IoU   : {avg_cont_iou:.4f} (Contact Thr = {args.contact_thr})",
+            f" Volumetric IoU: {avg_vol_iou:.4f} (无需 Thr)",
             "="*55
         ]
         report_text = "\n".join(report_lines)
