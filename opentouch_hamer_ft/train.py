@@ -2,10 +2,14 @@
 import os
 import sys
 
-# Set EGL environment variables at the very beginning to prevent pyrender device ID issues
-# Using EGL instead of OSMesa because EGL is natively supported by NVIDIA drivers on headless servers
-os.environ['PYOPENGL_PLATFORM'] = 'egl'
-os.environ['PYRENDER_PLATFORM'] = 'egl'
+import argparse
+
+_parser = argparse.ArgumentParser(add_help=False)
+_parser.add_argument('--render_platform', type=str, default='egl', choices=['egl', 'osmesa'], help='Rendering platform (egl or osmesa)')
+_args, _ = _parser.parse_known_args()
+
+os.environ['PYOPENGL_PLATFORM'] = _args.render_platform
+os.environ['PYRENDER_PLATFORM'] = _args.render_platform
 
 # Set absolute path for sys.argv[0] so that PyTorch Lightning DDP child spawns 
 # will correctly launch this script regardless of working directory changes
@@ -170,6 +174,7 @@ def parse_args():
     parser.add_argument("--use_wandb", action="store_true", help="Enable Weights & Biases logging")
     parser.add_argument("--exp_name", type=str, default="", help="Experiment name for saving checkpoints in a specific subfolder")
     parser.add_argument("--quick_test", action="store_true", help="Run a quick test training on a tiny subset")
+    parser.add_argument("--render_platform", type=str, default="egl", choices=["egl", "osmesa"], help="Rendering platform (egl or osmesa)")
     return parser.parse_args()
 
 def main():

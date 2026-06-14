@@ -1,9 +1,14 @@
 #!/usr/bin/env python
 import os
 import sys
+import argparse
 
-os.environ['PYOPENGL_PLATFORM'] = 'egl'
-os.environ['PYRENDER_PLATFORM'] = 'egl'
+_parser = argparse.ArgumentParser(add_help=False)
+_parser.add_argument('--render_platform', type=str, default='egl', choices=['egl', 'osmesa'], help='Rendering platform (egl or osmesa)')
+_args, _ = _parser.parse_known_args()
+
+os.environ['PYOPENGL_PLATFORM'] = _args.render_platform
+os.environ['PYRENDER_PLATFORM'] = _args.render_platform
 
 sys.argv[0] = os.path.abspath(__file__)
 
@@ -74,10 +79,10 @@ class OpenTouchHAMER_TactileWrapper(HAMER_Tactile):
         valid_samples = has_tactile.sum()
         if valid_samples > 0:
             abs_err = torch.abs(pred_tactile - gt_tactile)
-            mae = (abs_err * has_tactile.unsqueeze(1)).sum() / (valid_samples * 256.0)
+            mae = (abs_err * has_tactile.unsqueeze(1)).sum() / (valid_samples * 778.0)
             
             sq_err = (pred_tactile - gt_tactile) ** 2
-            rmse = torch.sqrt((sq_err * has_tactile.unsqueeze(1)).sum() / (valid_samples * 256.0))
+            rmse = torch.sqrt((sq_err * has_tactile.unsqueeze(1)).sum() / (valid_samples * 778.0))
             
             self.log('val/mae', mae, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
             self.log('val/rmse', rmse, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
@@ -134,6 +139,7 @@ def parse_args():
     parser.add_argument("--use_wandb", action="store_true", help="Enable Weights & Biases logging")
     parser.add_argument("--exp_name", type=str, default="tactile_ft", help="Experiment name")
     parser.add_argument("--quick_test", action="store_true", help="Run a quick test training")
+    parser.add_argument("--render_platform", type=str, default="egl", choices=["egl", "osmesa"], help="Rendering platform (egl or osmesa)")
     return parser.parse_args()
 
 def main():

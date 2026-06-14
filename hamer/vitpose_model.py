@@ -8,7 +8,10 @@ import torch.nn as nn
 
 from mmpose.apis import inference_top_down_pose_model, init_pose_model, process_mmdet_results, vis_pose_result
 
-os.environ["PYOPENGL_PLATFORM"] = "egl"
+if "PYOPENGL_PLATFORM" not in os.environ:
+    os.environ["PYOPENGL_PLATFORM"] = "egl"
+if "PYRENDER_PLATFORM" not in os.environ:
+    os.environ["PYRENDER_PLATFORM"] = "egl"
 
 # project root directory
 ROOT_DIR = os.path.abspath(os.path.dirname(__file__))

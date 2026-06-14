@@ -1,6 +1,12 @@
 import os
-os.environ['PYOPENGL_PLATFORM'] = 'egl'
-os.environ['PYRENDER_PLATFORM'] = 'egl'
+import argparse
+
+_parser = argparse.ArgumentParser(add_help=False)
+_parser.add_argument('--render_platform', type=str, default='egl', choices=['egl', 'osmesa'], help='Rendering platform (egl or osmesa)')
+_args, _ = _parser.parse_known_args()
+
+os.environ['PYOPENGL_PLATFORM'] = _args.render_platform
+os.environ['PYRENDER_PLATFORM'] = _args.render_platform
 
 from pathlib import Path
 import torch
@@ -121,6 +127,7 @@ def main():
     # Hand selection arguments
     parser.add_argument('--hand', type=str, default='both', choices=['left', 'right', 'both'], help='Which hand to render (left, right, both)')
     parser.add_argument('--single_hand', dest='single_hand', action='store_true', default=False, help='If set, keep at most one detected hand per frame')
+    parser.add_argument('--render_platform', type=str, default='egl', choices=['egl', 'osmesa'], help='Rendering platform (egl or osmesa)')
 
     args = parser.parse_args()
 

@@ -18,8 +18,14 @@ for i, arg in enumerate(sys.argv):
 if _gpus:
     os.environ["CUDA_VISIBLE_DEVICES"] = _gpus
 
-os.environ['PYOPENGL_PLATFORM'] = 'egl'
-os.environ['PYRENDER_PLATFORM'] = 'egl'
+import argparse
+
+_parser = argparse.ArgumentParser(add_help=False)
+_parser.add_argument('--render_platform', type=str, default='egl', choices=['egl', 'osmesa'], help='Rendering platform (egl or osmesa)')
+_args, _ = _parser.parse_known_args()
+
+os.environ['PYOPENGL_PLATFORM'] = _args.render_platform
+os.environ['PYRENDER_PLATFORM'] = _args.render_platform
 
 # Add paths
 eval_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../evaluation'))
@@ -340,6 +346,7 @@ def main():
     parser.add_argument('--split', type=str, default='test', choices=['train', 'val', 'test', 'all'])
     parser.add_argument('--split_json', type=str, default=os.path.join(eval_dir, "opentouch_splits.json"))
     parser.add_argument('--contact_thr', type=float, default=0.00, help='Threshold for defining contact (0-1)')
+    parser.add_argument('--render_platform', type=str, default='egl', choices=['egl', 'osmesa'], help='Rendering platform (egl or osmesa)')
     args = parser.parse_args()
     
     os.chdir(hamer_dir)

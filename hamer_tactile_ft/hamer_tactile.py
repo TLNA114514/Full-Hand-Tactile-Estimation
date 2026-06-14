@@ -15,7 +15,7 @@ class HAMER_Tactile(HAMER):
             nn.Flatten(),
             nn.LazyLinear(1024),
             nn.ReLU(),
-            nn.Linear(1024, 256),
+            nn.Linear(1024, 778),
             nn.Sigmoid()
         )
         
@@ -69,7 +69,7 @@ class HAMER_Tactile(HAMER):
         loss_tactile = loss_tactile_base * weight
         
         # Mask out samples that don't have tactile data
-        # has_tactile shape is (B,) while loss_tactile shape is (B, 256)
+        # has_tactile shape is (B,) while loss_tactile shape is (B, 778)
         has_tactile_expanded = has_tactile.unsqueeze(1).expand_as(loss_tactile)
         
         loss_tactile_masked = loss_tactile * has_tactile_expanded
@@ -77,7 +77,7 @@ class HAMER_Tactile(HAMER):
         # Average over valid samples
         valid_samples = has_tactile.sum()
         if valid_samples > 0:
-            loss_tactile_mean = loss_tactile_masked.sum() / (valid_samples * 256.0)
+            loss_tactile_mean = loss_tactile_masked.sum() / (valid_samples * 778.0)
         else:
             loss_tactile_mean = torch.tensor(0.0, device=pred_tactile.device, requires_grad=True)
             

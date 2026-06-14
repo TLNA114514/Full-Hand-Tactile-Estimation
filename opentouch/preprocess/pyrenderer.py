@@ -4,7 +4,10 @@ import numpy as np
 import trimesh
 import pyrender
 import os
-os.environ["PYOPENGL_PLATFORM"] = "egl"
+if "PYOPENGL_PLATFORM" not in os.environ:
+    os.environ["PYOPENGL_PLATFORM"] = "egl"
+if "PYRENDER_PLATFORM" not in os.environ:
+    os.environ["PYRENDER_PLATFORM"] = "egl"
 from scipy import sparse
 from scipy.sparse import csr_matrix
 

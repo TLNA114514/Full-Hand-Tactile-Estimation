@@ -20,8 +20,12 @@ for i, arg in enumerate(sys.argv):
 if _gpus:
     os.environ["CUDA_VISIBLE_DEVICES"] = _gpus
 
-os.environ['PYOPENGL_PLATFORM'] = 'egl'
-os.environ['PYRENDER_PLATFORM'] = 'egl'
+_parser = argparse.ArgumentParser(add_help=False)
+_parser.add_argument('--render_platform', type=str, default='egl', choices=['egl', 'osmesa'], help='Rendering platform (egl or osmesa)')
+_args, _ = _parser.parse_known_args()
+
+os.environ['PYOPENGL_PLATFORM'] = _args.render_platform
+os.environ['PYRENDER_PLATFORM'] = _args.render_platform
 
 # Setup sys.path relative to workspace
 ft_dir = os.path.dirname(os.path.abspath(__file__))
@@ -498,6 +502,7 @@ def main():
     parser.add_argument("--out_dir", type=str, default="./demo_output", help="Output directory")
     parser.add_argument("--gpu", type=str, default="4", help="GPU index")
     parser.add_argument("--hand", type=str, choices=["left", "right"], default="right", help="Hand side")
+    parser.add_argument("--render_platform", type=str, default="egl", choices=["egl", "osmesa"], help="Rendering platform (egl or osmesa)")
     args = parser.parse_args()
 
     if torch.cuda.is_available():

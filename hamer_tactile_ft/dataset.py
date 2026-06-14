@@ -4,6 +4,7 @@ import json
 import cv2
 import numpy as np
 import torch
+import glob
 from torch.utils.data import Dataset
 from yacs.config import CfgNode
 
@@ -12,11 +13,8 @@ ft_dir = os.path.dirname(os.path.abspath(__file__))
 workspace_dir = os.path.abspath(os.path.join(ft_dir, ".."))
 sys.path.append(os.path.join(workspace_dir, "hamer"))
 
-
 # Global keypoint permutation for hand flipping (MediaPipe format)
 FLIP_KEYPOINT_PERMUTATION = list(range(21))
-
-import glob
 
 class OpenTouchTactileDataset(Dataset):
     def __init__(self, cfg: CfgNode, split: str = "train", 
@@ -36,6 +34,9 @@ class OpenTouchTactileDataset(Dataset):
             self.data_dir = "/data/jiangrui/OpenTouch Data/extracted_dataset"
         else:
             self.data_dir = data_dir
+            
+        print(f"[{split}] Computing W_sum for continuous pressure normalization...")
+        self.W_sum = self._compute_W_sum()
         
         split_path = os.path.join(self.data_dir, self.split)
         
@@ -45,13 +46,73 @@ class OpenTouchTactileDataset(Dataset):
         
         print(f"[{split}] Loaded {len(self.samples)} sample folders from {split_path}")
 
+    def _compute_W_sum(self):
+        import trimesh
+        # 1. Load MANO mesh
+        mesh_path = os.path.join(workspace_dir, "opentouch", "preprocess", "scratch", "mano_right_neutral.obj")
+        mesh = trimesh.load(mesh_path, process=False)
+        mano_vertices = np.asarray(mesh.vertices, dtype=np.float32)
+
+        # 2. Load palm faces/vertices
+        palm_faces_path = os.path.join(workspace_dir, "opentouch", "preprocess", "scratch", "auto_calibrated_palm_faces.json")
+        with open(palm_faces_path, "r") as f:
+            palm_data = json.load(f)
+            
+        palm_vertices_set = set()
+        for triplet in palm_data["group_positive"]["face_triplets"]:
+            for vid in triplet:
+                if vid <= 777:
+                    palm_vertices_set.add(vid)
+        palm_vertices = list(palm_vertices_set)
+        
+        # 3. Load layout
+        layout_path = os.path.join(workspace_dir, "opentouch", "preprocess", "scratch", "handLayoutNewest_meshid_lowres.json")
+        if not os.path.exists(layout_path):
+            layout_path = os.path.join(workspace_dir, "opentouch", "preprocess", "scratch", "handLayoutNewest_meshid.json")
+            
+        with open(layout_path, "r") as f:
+            layout_data = json.load(f)
+        layout = layout_data["positions"]
+        erased_nodes = set(layout_data.get("erasedNodes", []))
+
+        valid_nodes = {}
+        for nid, info in layout.items():
+            if nid in erased_nodes:
+                continue
+            vids = info.get("mano_vid", [])
+            vids = [v for v in vids if v <= 777]
+            if len(vids) > 0:
+                center = np.mean(mano_vertices[vids], axis=0)
+                valid_nodes[nid] = center
+
+        n_verts = mano_vertices.shape[0] 
+        vert_weights_sum = np.zeros(n_verts, dtype=np.float32)
+        sigma = 0.005
+        two_sig2 = 2.0 * (sigma * sigma)
+        
+        centers = []
+        for nid, center in valid_nodes.items():
+            r, c = map(int, nid.split('-'))
+            if r < 16 and c < 16:
+                centers.append(center)
+                
+        if len(centers) > 0:
+            centers = np.array(centers, dtype=np.float32) # (K, 3)
+            palm_coords = mano_vertices[palm_vertices] # (P, 3)
+            diff = palm_coords[:, np.newaxis, :] - centers[np.newaxis, :, :] # (P, K, 3)
+            dist2 = np.sum(diff**2, axis=2) # (P, K)
+            weights = np.exp(-dist2 / two_sig2) # (P, K)
+            weights_sum_P = np.sum(weights, axis=1) # (P,)
+            vert_weights_sum[palm_vertices] = weights_sum_P
+            
+        return vert_weights_sum
+
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
         sample_dir = self.samples[idx]
 
-        
         img_path = os.path.join(sample_dir, "image.jpg")
         meta_path = os.path.join(sample_dir, "meta.json")
         
@@ -74,18 +135,17 @@ class OpenTouchTactileDataset(Dataset):
         landmarks_cam = np.array(meta["keypoints_3d_cam"], dtype=np.float32)
         valid_mask = np.array(meta["valid_mask"], dtype=bool)
         
-        # Extract tactile pressure signal (16x16 matrix)
-        tactile_key = "right_pressure" if is_right else "left_pressure"
-        tactile_signal = np.zeros(256, dtype=np.float32)
+        # Extract tactile pressure signal (continuous 778-D vector)
+        tactile_key = "right_pressure_continuous" if is_right else "left_pressure_continuous"
+        tactile_signal = np.zeros(778, dtype=np.float32)
         has_tactile = 0.0
         if "original_hdf5_data" in meta and tactile_key in meta["original_hdf5_data"]:
             pressure_data = meta["original_hdf5_data"][tactile_key]
             if pressure_data is not None:
-                # Flatten the 16x16 array to 256-d
-                raw_signal = np.array(pressure_data, dtype=np.float32).flatten()
-                # Pseudo-normalization: 3072 is zero-pressure baseline. Value drops as pressure increases.
-                # Formula maps 3072 -> 0.0, and 0.0 -> 1.0. We use clip just in case of outliers.
-                tactile_signal = np.clip((3072.0 - raw_signal) / 3072.0, 0.0, 1.0)
+                raw_signal = np.array(pressure_data, dtype=np.float32)
+                # Apply reverse normalization: target = W_sum - (raw_signal / 3072.0)
+                tactile_signal = self.W_sum - (raw_signal / 3072.0)
+                tactile_signal = np.clip(tactile_signal, 0.0, 1.0)
                 has_tactile = 1.0
 
         # 4. Format 3D keypoints for Hamer (N, 4)
@@ -147,9 +207,11 @@ class OpenTouchTactileDataset(Dataset):
             # Flip left hands to right hands for Hamer
             img_patch = cv2.flip(img_patch, 1)
             keypoints_3d[:, 0] = -keypoints_3d[:, 0]
-            # Note: For tactile signal on left hands, we ideally might need to flip the pressure map
-            # left-to-right to match the right-hand visual features, depending on sensor symmetry. 
-            # For now, we pass it flattened directly.
+            # Left continuous pressure is passed as is, since it's defined on the MANO vertices space.
+            # But wait: if MANO vertices are physically on the right hand, is left_pressure_continuous correctly mapped to right hand vertices?
+            # add_continuous_pressure.py uses mano_right_neutral.obj to diffuse BOTH right_pressure and left_pressure!
+            # So the left_pressure_continuous is ALREADY computed on the right hand topology!
+            # This is brilliant! We don't need to do anything to flip it.
             
         # Standard mean/std normalization
         img_patch = (img_patch - self.cfg.MODEL.IMAGE_MEAN) / self.cfg.MODEL.IMAGE_STD
