@@ -192,7 +192,7 @@ class OpenTouchHAMER_TactileWrapper(HAMER_Tactile):
 def parse_args():
     parser = argparse.ArgumentParser(description="Fine-tune Hamer Tactile Head")
     # Default to the fine-tuned checkpoint!
-    parser.add_argument("--checkpoint", type=str, default=os.path.join(workspace_dir, "opentouch_hamer_ft/checkpoints/regression_only/best_ft_model.ckpt"), help="Path to fine-tuned Hamer checkpoint")
+    parser.add_argument("--checkpoint", type=str, default=os.path.join(workspace_dir, "opentouch_hamer_ft/checkpoints/regression_wocam_60/best_ft_model.ckpt"), help="Path to fine-tuned Hamer checkpoint")
     parser.add_argument("--data_dir", type=str, default="/data/jiangrui/OpenTouch Data/extracted_dataset", help="Data folder path")
     
     parser.add_argument("--gpus", type=str, default="4", help="GPU indices (comma-separated, e.g. 4,5)")

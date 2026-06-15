@@ -3,6 +3,23 @@ import torch.nn as nn
 from typing import Dict
 from hamer.models.hamer import HAMER
 
+import torch.nn.functional as F
+
+class ResidualBlock(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.fc1 = nn.Linear(dim, dim)
+        self.norm1 = nn.LayerNorm(dim)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(dim, dim)
+        self.norm2 = nn.LayerNorm(dim)
+        
+    def forward(self, x):
+        res = x
+        x = self.act(self.norm1(self.fc1(x)))
+        x = self.norm2(self.fc2(x))
+        return self.act(x + res)
+
 class HAMER_Tactile(HAMER):
     def __init__(self, cfg, init_renderer=False):
         super().__init__(cfg, init_renderer=init_renderer)
@@ -14,9 +31,11 @@ class HAMER_Tactile(HAMER):
             nn.AdaptiveAvgPool2d((4, 4)),
             nn.Flatten(),
             nn.LazyLinear(1024),
-            nn.ReLU(),
-            nn.Linear(1024, 778),
-            nn.Sigmoid()
+            nn.LayerNorm(1024),
+            nn.GELU(),
+            ResidualBlock(1024),
+            ResidualBlock(1024),
+            nn.Linear(1024, 778)
         )
         
         # Ensure we don't automatically optimize as we want to control freezing
@@ -40,8 +59,9 @@ class HAMER_Tactile(HAMER):
         with torch.set_grad_enabled(self.backbone.training and train):
             conditioning_feats = self.backbone(x[:, :, :, 32:-32])
             
-        pred_tactile = self.tactile_head(conditioning_feats)
-        output['pred_tactile'] = pred_tactile
+        pred_logits = self.tactile_head(conditioning_feats)
+        output['pred_logits'] = pred_logits
+        output['pred_tactile'] = torch.sigmoid(pred_logits)
         
         return output
 
@@ -55,12 +75,15 @@ class HAMER_Tactile(HAMER):
         # Compute tactile loss
         gt_tactile = batch['tactile_signal']
         has_tactile = batch['has_tactile']  # (B,) boolean or float
-        pred_tactile = output['pred_tactile']
+        pred_logits = output['pred_logits']
         
-        # We use Smooth L1 Loss for tactile signal regression
-        tactile_loss_fn = nn.SmoothL1Loss(reduction='none')
+        # Use Continuous BCEWithLogitsLoss to completely avoid Sigmoid saturation!
+        loss_tactile_base = F.binary_cross_entropy_with_logits(pred_logits, gt_tactile, reduction='none')
         
-        loss_tactile_base = tactile_loss_fn(pred_tactile, gt_tactile)
+        # Asymmetric penalty: heavily penalize false negatives (missed contacts)
+        weight = torch.ones_like(gt_tactile)
+        weight[gt_tactile > 0.05] = 10.0
+        loss_tactile_base = loss_tactile_base * weight
         
         # Mask out non-palm vertices using palm_mask
         palm_mask = batch['palm_mask'] # (B, 778)
