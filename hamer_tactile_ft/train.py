@@ -137,14 +137,16 @@ class OpenTouchHAMER_TactileWrapper(HAMER_Tactile):
         pred_tactile = output['pred_tactile']
         gt_tactile = batch['tactile_signal']
         has_tactile = batch['has_tactile']
+        palm_mask = batch['palm_mask']
         
         valid_samples = has_tactile.sum()
-        if valid_samples > 0:
-            abs_err = torch.abs(pred_tactile - gt_tactile)
-            mae = (abs_err * has_tactile.unsqueeze(1)).sum() / (valid_samples * 778.0)
+        num_palm_vertices = palm_mask[0].sum() if palm_mask.shape[0] > 0 else 0
+        if valid_samples > 0 and num_palm_vertices > 0:
+            abs_err = torch.abs(pred_tactile - gt_tactile) * palm_mask
+            mae = (abs_err * has_tactile.unsqueeze(1)).sum() / (valid_samples * num_palm_vertices)
             
-            sq_err = (pred_tactile - gt_tactile) ** 2
-            rmse = torch.sqrt((sq_err * has_tactile.unsqueeze(1)).sum() / (valid_samples * 778.0))
+            sq_err = ((pred_tactile - gt_tactile) ** 2) * palm_mask
+            rmse = torch.sqrt((sq_err * has_tactile.unsqueeze(1)).sum() / (valid_samples * num_palm_vertices))
             
             self.log('val/mae', mae, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
             self.log('val/rmse', rmse, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)

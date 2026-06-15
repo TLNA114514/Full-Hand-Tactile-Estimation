@@ -62,11 +62,9 @@ class HAMER_Tactile(HAMER):
         
         loss_tactile_base = tactile_loss_fn(pred_tactile, gt_tactile)
         
-        # Asymmetric penalty: heavily penalize false positives in non-contact areas
-        weight = torch.ones_like(gt_tactile)
-        weight[gt_tactile < 0.05] = 2.0
-        
-        loss_tactile = loss_tactile_base * weight
+        # Mask out non-palm vertices using palm_mask
+        palm_mask = batch['palm_mask'] # (B, 778)
+        loss_tactile = loss_tactile_base * palm_mask
         
         # Mask out samples that don't have tactile data
         # has_tactile shape is (B,) while loss_tactile shape is (B, 778)
@@ -74,10 +72,11 @@ class HAMER_Tactile(HAMER):
         
         loss_tactile_masked = loss_tactile * has_tactile_expanded
         
-        # Average over valid samples
+        # Average over valid samples and palm vertices
         valid_samples = has_tactile.sum()
-        if valid_samples > 0:
-            loss_tactile_mean = loss_tactile_masked.sum() / (valid_samples * 778.0)
+        num_palm_vertices = palm_mask[0].sum() if palm_mask.shape[0] > 0 else 0
+        if valid_samples > 0 and num_palm_vertices > 0:
+            loss_tactile_mean = loss_tactile_masked.sum() / (valid_samples * num_palm_vertices)
         else:
             loss_tactile_mean = torch.tensor(0.0, device=pred_tactile.device, requires_grad=True)
             

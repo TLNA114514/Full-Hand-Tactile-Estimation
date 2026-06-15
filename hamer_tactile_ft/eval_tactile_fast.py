@@ -140,6 +140,7 @@ def main():
     
     all_pred_tactile = []
     all_gt_tactile = []
+    palm_mask = None
     
     print("🔔 开始极速评估推理...")
     for batch in tqdm(dataloader, desc="Evaluating Batches"):
@@ -149,6 +150,9 @@ def main():
         valid_tactile_mask = batch['has_tactile'].cpu().numpy() > 0.5
         if not np.any(valid_tactile_mask):
             continue
+            
+        if palm_mask is None:
+            palm_mask = batch['palm_mask'][0].detach().cpu().numpy() > 0.5
             
         try:
             with torch.no_grad():
@@ -174,6 +178,10 @@ def main():
     all_gt = np.stack(all_gt_tactile)     # [N, 778]
     
     print("\n🧮 推理完成，正在计算指标...")
+    
+    if palm_mask is not None:
+        all_pred = all_pred[:, palm_mask] # [N, num_palm_vertices]
+        all_gt = all_gt[:, palm_mask]     # [N, num_palm_vertices]
     
     mae = np.mean(np.abs(all_pred - all_gt))
     rmse = np.sqrt(np.mean((all_pred - all_gt) ** 2))

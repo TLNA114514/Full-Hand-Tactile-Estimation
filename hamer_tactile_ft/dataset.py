@@ -36,7 +36,7 @@ class OpenTouchTactileDataset(Dataset):
             self.data_dir = data_dir
             
         print(f"[{split}] Computing W_sum for continuous pressure normalization...")
-        self.W_sum = self._compute_W_sum()
+        self.W_sum, self.palm_mask = self._compute_W_sum()
         
         split_path = os.path.join(self.data_dir, self.split)
         
@@ -105,7 +105,10 @@ class OpenTouchTactileDataset(Dataset):
             weights_sum_P = np.sum(weights, axis=1) # (P,)
             vert_weights_sum[palm_vertices] = weights_sum_P
             
-        return vert_weights_sum
+        palm_mask = np.zeros(n_verts, dtype=np.float32)
+        palm_mask[palm_vertices] = 1.0
+            
+        return vert_weights_sum, palm_mask
 
     def __len__(self):
         return len(self.samples)
@@ -143,8 +146,8 @@ class OpenTouchTactileDataset(Dataset):
             pressure_data = meta["original_hdf5_data"][tactile_key]
             if pressure_data is not None:
                 raw_signal = np.array(pressure_data, dtype=np.float32)
-                # Apply reverse normalization: target = W_sum - (raw_signal / 3072.0)
-                tactile_signal = self.W_sum - (raw_signal / 3072.0)
+                # Apply true percentage normalization: target = (W_sum - (raw_signal / 3072.0)) / (W_sum + 1e-8)
+                tactile_signal = (self.W_sum - (raw_signal / 3072.0)) / (self.W_sum + 1e-8)
                 tactile_signal = np.clip(tactile_signal, 0.0, 1.0)
                 has_tactile = 1.0
 
@@ -225,6 +228,7 @@ class OpenTouchTactileDataset(Dataset):
             'keypoints_2d': torch.from_numpy(keypoints_2d).float(),
             'tactile_signal': torch.from_numpy(tactile_signal).float(),
             'has_tactile': torch.tensor(has_tactile).float(),
+            'palm_mask': torch.from_numpy(self.palm_mask).float(),
             'box_center': torch.tensor([center_x, center_y]).float(),
             'box_size': torch.tensor(bbox_size).float(),
             'img_size': torch.from_numpy(img_size_array).float(),
