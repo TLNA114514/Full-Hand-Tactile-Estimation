@@ -29,12 +29,22 @@ class HAMER_Tactile(HAMER):
         # Since the backbone output channels (e.g. 1024 or 1280) are passed as `b c h w`,
         # we will use AdaptiveAvgPool2d and then LazyLinear to handle any backbone feature dimension.
         self.tactile_head = nn.Sequential(
-            nn.AdaptiveAvgPool2d((4, 4)),
+            # 1. 优雅的通道降维：保留原始空间分辨率的同时，大幅缩减厚度
+            nn.LazyConv2d(out_channels=256, kernel_size=3, padding=1),
+            nn.GELU(),
+            
+            # 2. 释放空间分辨率：从 4x4 (16个网格) 提升至 8x8 (64个网格)，清晰度暴增 4 倍！
+            nn.AdaptiveAvgPool2d((8, 8)),
             nn.Flatten(),
+            
+            # 3. 强力丢弃，对抗大参数量记忆
+            nn.Dropout(p=0.5),
+            
+            # 4. 后接我们之前部署好的抗过拟合残差集群
             nn.LazyLinear(1024),
             nn.LayerNorm(1024),
             nn.GELU(),
-            nn.Dropout(0.3),
+            nn.Dropout(p=0.3),
             ResidualBlock(1024),
             ResidualBlock(1024),
             nn.Linear(1024, 778)
