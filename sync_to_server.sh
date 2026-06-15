@@ -40,12 +40,22 @@ fi
 if [ "$SYNC_METHOD" = "rsync" ]; then
     echo "🔄 正在使用 rsync 进行增量同步 (保持两端文件完全一致)..."
     
-    # 使用 rsync 增量同步，不限制大小和类型，确保两端文件完全一致
-    # （默认排除了本地 Git 数据库目录 .git/，如也需要同步，可将该行删除或注释）
+    # 使用 rsync 增量同步，不限制文件大小，但排除了 checkpoint 和训练日志相关目录
+    # 这样可以豁免对远端服务器训练生成的权重、日志的 --delete 操作，防止远端训练结果被清空
     rsync -avz --delete \
         -e "ssh -p $PORT -i $KEY_PATH -o StrictHostKeyChecking=no" \
         --exclude='.git/' \
         --exclude='.DS_Store' \
+        --exclude='*checkpoint*' \
+        --exclude='*ckpt*' \
+        --exclude='*weights*' \
+        --exclude='*.ckpt' \
+        --exclude='*.pt' \
+        --exclude='*.pth' \
+        --exclude='*.pkl' \
+        --exclude='wandb/' \
+        --exclude='logs/' \
+        --exclude='lightning_logs/' \
         "$SRC_DIR/" "$REMOTE_USER@$REMOTE_HOST:$REMOTE_DIR/Full-Hand-Tactile-Estimation/"
 
     SYNC_STATUS=$?

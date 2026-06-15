@@ -35,8 +35,8 @@ class OpenTouchTactileDataset(Dataset):
         else:
             self.data_dir = data_dir
             
-        print(f"[{split}] Computing W_sum for continuous pressure normalization...")
-        self.W_sum, self.palm_mask = self._compute_W_sum()
+        print(f"[{split}] Loading palm mask for evaluation and loss masking...")
+        self.palm_mask = self._load_palm_mask()
         
         split_path = os.path.join(self.data_dir, self.split)
         
@@ -46,14 +46,8 @@ class OpenTouchTactileDataset(Dataset):
         
         print(f"[{split}] Loaded {len(self.samples)} sample folders from {split_path}")
 
-    def _compute_W_sum(self):
-        import trimesh
-        # 1. Load MANO mesh
-        mesh_path = os.path.join(workspace_dir, "opentouch", "preprocess", "scratch", "mano_right_neutral.obj")
-        mesh = trimesh.load(mesh_path, process=False)
-        mano_vertices = np.asarray(mesh.vertices, dtype=np.float32)
-
-        # 2. Load palm faces/vertices
+    def _load_palm_mask(self):
+        # Load palm faces/vertices
         palm_faces_path = os.path.join(workspace_dir, "opentouch", "preprocess", "scratch", "auto_calibrated_palm_faces.json")
         with open(palm_faces_path, "r") as f:
             palm_data = json.load(f)
@@ -65,50 +59,10 @@ class OpenTouchTactileDataset(Dataset):
                     palm_vertices_set.add(vid)
         palm_vertices = list(palm_vertices_set)
         
-        # 3. Load layout
-        layout_path = os.path.join(workspace_dir, "opentouch", "preprocess", "scratch", "handLayoutNewest_meshid_lowres.json")
-        if not os.path.exists(layout_path):
-            layout_path = os.path.join(workspace_dir, "opentouch", "preprocess", "scratch", "handLayoutNewest_meshid.json")
-            
-        with open(layout_path, "r") as f:
-            layout_data = json.load(f)
-        layout = layout_data["positions"]
-        erased_nodes = set(layout_data.get("erasedNodes", []))
-
-        valid_nodes = {}
-        for nid, info in layout.items():
-            if nid in erased_nodes:
-                continue
-            vids = info.get("mano_vid", [])
-            vids = [v for v in vids if v <= 777]
-            if len(vids) > 0:
-                center = np.mean(mano_vertices[vids], axis=0)
-                valid_nodes[nid] = center
-
-        n_verts = mano_vertices.shape[0] 
-        vert_weights_sum = np.zeros(n_verts, dtype=np.float32)
-        sigma = 0.005
-        two_sig2 = 2.0 * (sigma * sigma)
-        
-        centers = []
-        for nid, center in valid_nodes.items():
-            r, c = map(int, nid.split('-'))
-            if r < 16 and c < 16:
-                centers.append(center)
-                
-        if len(centers) > 0:
-            centers = np.array(centers, dtype=np.float32) # (K, 3)
-            palm_coords = mano_vertices[palm_vertices] # (P, 3)
-            diff = palm_coords[:, np.newaxis, :] - centers[np.newaxis, :, :] # (P, K, 3)
-            dist2 = np.sum(diff**2, axis=2) # (P, K)
-            weights = np.exp(-dist2 / two_sig2) # (P, K)
-            weights_sum_P = np.sum(weights, axis=1) # (P,)
-            vert_weights_sum[palm_vertices] = weights_sum_P
-            
-        palm_mask = np.zeros(n_verts, dtype=np.float32)
+        palm_mask = np.zeros(778, dtype=np.float32)
         palm_mask[palm_vertices] = 1.0
             
-        return vert_weights_sum, palm_mask
+        return palm_mask
 
     def __len__(self):
         return len(self.samples)
@@ -145,10 +99,9 @@ class OpenTouchTactileDataset(Dataset):
         if "original_hdf5_data" in meta and tactile_key in meta["original_hdf5_data"]:
             pressure_data = meta["original_hdf5_data"][tactile_key]
             if pressure_data is not None:
+                # The data is ALREADY perfectly normalized to 0.0 ~ 1.0 in the JSON thanks to add_continuous_pressure_fixed.py!
                 raw_signal = np.array(pressure_data, dtype=np.float32)
-                # Apply true percentage normalization: target = (W_sum - (raw_signal / 3072.0)) / (W_sum + 1e-8)
-                tactile_signal = (self.W_sum - (raw_signal / 3072.0)) / (self.W_sum + 1e-8)
-                tactile_signal = np.clip(tactile_signal, 0.0, 1.0)
+                tactile_signal = np.clip(raw_signal, 0.0, 1.0)
                 has_tactile = 1.0
 
         # 4. Format 3D keypoints for Hamer (N, 4)
