@@ -11,12 +11,13 @@ class ResidualBlock(nn.Module):
         self.fc1 = nn.Linear(dim, dim)
         self.norm1 = nn.LayerNorm(dim)
         self.act = nn.GELU()
+        self.drop = nn.Dropout(0.3)
         self.fc2 = nn.Linear(dim, dim)
         self.norm2 = nn.LayerNorm(dim)
         
     def forward(self, x):
         res = x
-        x = self.act(self.norm1(self.fc1(x)))
+        x = self.drop(self.act(self.norm1(self.fc1(x))))
         x = self.norm2(self.fc2(x))
         return self.act(x + res)
 
@@ -33,6 +34,7 @@ class HAMER_Tactile(HAMER):
             nn.LazyLinear(1024),
             nn.LayerNorm(1024),
             nn.GELU(),
+            nn.Dropout(0.3),
             ResidualBlock(1024),
             ResidualBlock(1024),
             nn.Linear(1024, 778)
@@ -80,9 +82,10 @@ class HAMER_Tactile(HAMER):
         # Use Continuous BCEWithLogitsLoss to completely avoid Sigmoid saturation!
         loss_tactile_base = F.binary_cross_entropy_with_logits(pred_logits, gt_tactile, reduction='none')
         
-        # Asymmetric penalty: heavily penalize false negatives (missed contacts)
+        # Asymmetric penalty: 2x background suppression, 6x positive contact amplification
         weight = torch.ones_like(gt_tactile)
-        weight[gt_tactile > 0.05] = 10.0
+        weight[gt_tactile <= 0.05] = 2.0
+        weight[gt_tactile > 0.05] = 6.0
         loss_tactile_base = loss_tactile_base * weight
         
         # Mask out non-palm vertices using palm_mask

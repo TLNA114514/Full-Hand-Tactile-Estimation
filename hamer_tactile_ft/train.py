@@ -160,15 +160,24 @@ class OpenTouchHAMER_TactileWrapper(HAMER_Tactile):
         pass
 
     def configure_optimizers(self):
-        tactile_params = []
+        # Separate parameters into decay and no_decay groups
+        decay_params = []
+        no_decay_params = []
         for name, param in self.named_parameters():
             if param.requires_grad:
-                tactile_params.append(param)
+                if any(nd in name for nd in ["bias", "norm", "LayerNorm"]):
+                    no_decay_params.append(param)
+                else:
+                    decay_params.append(param)
+                    
+        optim_groups = [
+            {"params": decay_params, "weight_decay": 1e-4},
+            {"params": no_decay_params, "weight_decay": 0.0}
+        ]
                     
         optimizer = torch.optim.AdamW(
-            tactile_params,
-            lr=self.learning_rate,
-            weight_decay=1e-4
+            optim_groups,
+            lr=self.learning_rate
         )
         
         total_steps = self.trainer.estimated_stepping_batches
