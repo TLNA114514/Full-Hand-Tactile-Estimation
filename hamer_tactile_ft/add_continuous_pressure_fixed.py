@@ -188,39 +188,48 @@ def process_h5_file(filepath, deps_low, deps_sub):
     except Exception as e:
         print(f"Error processing {filepath}: {e}")
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+def process_single_meta(mf, deps_low, deps_sub):
+    try:
+        with open(mf, "r") as f:
+            data = json.load(f)
+            
+        hdf5_data = data.get("original_hdf5_data", {})
+        modified = False
+        
+        for key in ["right_pressure", "left_pressure"]:
+            if key in hdf5_data:
+                pressure = np.array(hdf5_data[key])
+                
+                if pressure.ndim == 2:
+                    p = pressure[np.newaxis, ...] # (1, 16, 16)
+                    c_low = process_sequence_gpu(p, deps_low)[0]
+                    c_sub = process_sequence_gpu(p, deps_sub)[0]
+                    hdf5_data[f"{key}_continuous"] = c_low.tolist()
+                    hdf5_data[f"{key}_continuous_subdiv"] = c_sub.tolist()
+                    modified = True
+                elif pressure.ndim == 3:
+                    c_low = process_sequence_gpu(pressure, deps_low)
+                    c_sub = process_sequence_gpu(pressure, deps_sub)
+                    hdf5_data[f"{key}_continuous"] = c_low.tolist()
+                    hdf5_data[f"{key}_continuous_subdiv"] = c_sub.tolist()
+                    modified = True
+                
+        if modified:
+            with open(mf, "w") as f:
+                json.dump(data, f)
+    except Exception as e:
+        print(f"Error processing {mf}: {e}")
+
 def process_extracted_dataset(dataset_dir, deps_low, deps_sub):
     meta_files = glob.glob(os.path.join(dataset_dir, "*", "*", "meta.json"))
-    for mf in tqdm(meta_files, desc="Processing extracted dataset"):
-        try:
-            with open(mf, "r") as f:
-                data = json.load(f)
-                
-            hdf5_data = data.get("original_hdf5_data", {})
-            modified = False
-            
-            for key in ["right_pressure", "left_pressure"]:
-                if key in hdf5_data:
-                    pressure = np.array(hdf5_data[key])
-                    
-                    if pressure.ndim == 2:
-                        p = pressure[np.newaxis, ...] # (1, 16, 16)
-                        c_low = process_sequence_gpu(p, deps_low)[0]
-                        c_sub = process_sequence_gpu(p, deps_sub)[0]
-                        hdf5_data[f"{key}_continuous"] = c_low.tolist()
-                        hdf5_data[f"{key}_continuous_subdiv"] = c_sub.tolist()
-                        modified = True
-                    elif pressure.ndim == 3:
-                        c_low = process_sequence_gpu(pressure, deps_low)
-                        c_sub = process_sequence_gpu(pressure, deps_sub)
-                        hdf5_data[f"{key}_continuous"] = c_low.tolist()
-                        hdf5_data[f"{key}_continuous_subdiv"] = c_sub.tolist()
-                        modified = True
-                    
-            if modified:
-                with open(mf, "w") as f:
-                    json.dump(data, f)
-        except Exception as e:
-            print(f"Error processing {mf}: {e}")
+    
+    # 采用多线程并行处理海量小文件，极大打破单线程 I/O 瓶颈
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        futures = [executor.submit(process_single_meta, mf, deps_low, deps_sub) for mf in meta_files]
+        for _ in tqdm(as_completed(futures), total=len(meta_files), desc="Processing meta.json (Multi-threaded)"):
+            pass
 
 def load_all_deps():
     deps_low = DepContainer()
