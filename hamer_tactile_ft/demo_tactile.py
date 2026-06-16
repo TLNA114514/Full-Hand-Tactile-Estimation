@@ -172,13 +172,13 @@ def _gaussian_smooth_vertex_signal(vals, nbrs, dists, sigma=0.005, iters=2):
     for _ in range(iters):
         new = out.copy()
         for i, (N, D) in enumerate(zip(nbrs, dists)):
-            acc = out[i]
-            w_sum = 1.0
+            max_val = out[i]
             for j, dij in zip(N, D):
                 w = np.exp(-(dij * dij) / two_sig2)
-                acc += w * out[j]
-                w_sum += w
-            new[i] = acc / max(w_sum, 1e-8)
+                v_decay = w * out[j]
+                if v_decay > max_val:
+                    max_val = v_decay
+            new[i] = max_val
         out = new
     return out
 
