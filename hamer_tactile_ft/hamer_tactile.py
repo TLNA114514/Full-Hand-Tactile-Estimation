@@ -92,10 +92,9 @@ class HAMER_Tactile(HAMER):
         # Use Continuous BCEWithLogitsLoss to completely avoid Sigmoid saturation!
         loss_tactile_base = F.binary_cross_entropy_with_logits(pred_logits, gt_tactile, reduction='none')
         
-        # Asymmetric penalty: 2x background suppression, 6x positive contact amplification
+        # Asymmetric penalty: 2x background suppression to clean up noise, no forced positive amplification
         weight = torch.ones_like(gt_tactile)
         weight[gt_tactile <= 0.05] = 2.0
-        weight[gt_tactile > 0.05] = 6.0
         loss_tactile_base = loss_tactile_base * weight
         
         # Mask out non-palm vertices using palm_mask
