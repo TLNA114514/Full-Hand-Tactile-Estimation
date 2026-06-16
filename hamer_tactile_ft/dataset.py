@@ -53,7 +53,7 @@ class OpenTouchTactileDataset(Dataset):
             palm_data = json.load(f)
             
         palm_vertices_set = set()
-        for triplet in palm_data["group_positive"]["face_triplets"]:
+        for triplet in palm_data["group_negative"]["face_triplets"]:
             for vid in triplet:
                 if vid <= 777:
                     palm_vertices_set.add(vid)

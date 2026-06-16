@@ -74,14 +74,14 @@ def load_mesh_and_compute_dist(res_type):
     if res_type == "low_res":
         with open(palm_faces_path, "r") as f:
             palm_data = json.load(f)
-        for triplet in palm_data["group_positive"]["face_triplets"]:
+        for triplet in palm_data["group_negative"]["face_triplets"]:
             for vid in triplet:
                 if vid < V_total:
                     palm_vertices_set.add(vid)
     else:
         with open(palm_faces_path, "r") as f:
             palm_data = json.load(f)
-        for fid in palm_data["group_positive"]["face_indices"]:
+        for fid in palm_data["group_negative"]["face_indices"]:
             if fid < len(mano_faces):
                 for vid in mano_faces[fid]:
                     if vid < V_total:
