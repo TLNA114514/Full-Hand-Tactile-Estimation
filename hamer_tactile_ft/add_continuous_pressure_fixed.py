@@ -4,11 +4,15 @@ import glob
 import numpy as np
 import h5py
 import trimesh
+import torch
 from tqdm import tqdm
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import shortest_path
 
-def load_mesh_and_compute_dist(res_type):
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"[{device.type.upper()}] PyTorch 硬件加速已就绪" + ("!" if device.type == "cuda" else " (回退到 CPU 模式)"))
+
+def load_mesh_and_compute_dist(res_type, sigma=0.005):
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
     if res_type == "low_res":
         obj_path = os.path.join(base_dir, "opentouch/preprocess/scratch/mano_right_neutral.obj")
@@ -69,6 +73,10 @@ def load_mesh_and_compute_dist(res_type):
         D_k = np.min(D_vids + jump_dists[:, np.newaxis], axis=0)
         dist_matrix[k, :] = D_k
 
+    # Calculate Weights ahead of time
+    two_sig2 = 2.0 * (sigma * sigma)
+    weights = np.exp(-(dist_matrix**2) / two_sig2)
+
     # Load palm vertices
     palm_vertices_set = set()
     if res_type == "low_res":
@@ -88,34 +96,58 @@ def load_mesh_and_compute_dist(res_type):
                         palm_vertices_set.add(vid)
     palm_vertices = list(palm_vertices_set)
 
-    return mano_vertices, palm_vertices, valid_nodes, dist_matrix, node_keys
-
-def compute_continuous_pressure(pressure16, valid_nodes, mano_vertices, palm_vertices, dist_matrix, node_keys, sigma=0.005):
-    p_norm_matrix = np.clip((3072.0 - pressure16) / 3072.0, 0.0, 1.0)
-    
-    active_pressures = []
-    for nid in node_keys:
-        r, c = map(int, nid.split('-'))
-        if r < pressure16.shape[0] and c < pressure16.shape[1]:
-            active_pressures.append(p_norm_matrix[r, c])
-        else:
-            active_pressures.append(0.0)
-            
-    active_pressures = np.array(active_pressures, dtype=np.float32)
-    two_sig2 = 2.0 * (sigma * sigma)
-    
-    weights = np.exp(-(dist_matrix**2) / two_sig2) # (K, V)
-    palm_vals = np.max(weights * active_pressures[:, np.newaxis], axis=0) # (V,)
-    
-    vert_vals = np.zeros(mano_vertices.shape[0], dtype=np.float32)
-    vert_vals[palm_vertices] = palm_vals[palm_vertices]
-    
-    return np.clip(vert_vals, 0.0, 1.0)
+    return mano_vertices, palm_vertices, dist_matrix, node_keys, weights
 
 class DepContainer:
     pass
 
-def process_h5_file(filepath, deps_low, deps_sub, sigma=0.005):
+def prepare_gpu_deps(deps):
+    rows, cols = [], []
+    valid_k = []
+    for k, nid in enumerate(deps.node_keys):
+        r, c = map(int, nid.split('-'))
+        if r < 16 and c < 16:
+            rows.append(r)
+            cols.append(c)
+            valid_k.append(k)
+            
+    deps.valid_rows = torch.tensor(rows, dtype=torch.long, device=device)
+    deps.valid_cols = torch.tensor(cols, dtype=torch.long, device=device)
+    deps.weights_tensor = torch.tensor(deps.weights[valid_k], dtype=torch.float32, device=device)
+    deps.palm_vertices_tensor = torch.tensor(deps.palm_vertices, dtype=torch.long, device=device)
+    deps.V_total = deps.mano_vertices.shape[0]
+
+def process_sequence_gpu(p_numpy, deps):
+    T = p_numpy.shape[0]
+    V = deps.V_total
+    if T == 0:
+        return np.zeros((0, V), dtype=np.float32)
+        
+    with torch.no_grad():
+        p_tensor = torch.tensor(p_numpy, dtype=torch.float32, device=device)
+        p_norm = torch.clamp((3072.0 - p_tensor) / 3072.0, 0.0, 1.0)
+        
+        active = p_norm[:, deps.valid_rows, deps.valid_cols] # (T, K_valid)
+        
+        # Batch over T to prevent massive memory spikes
+        B = 2000
+        out = torch.zeros((T, V), dtype=torch.float32, device=device)
+        
+        for i in range(0, T, B):
+            active_b = active[i:i+B].unsqueeze(2) # (B, K_valid, 1)
+            w_b = deps.weights_tensor.unsqueeze(0) # (1, K_valid, V)
+            
+            # Broadcast multiply and take max over sensors (dim 1)
+            palm_vals, _ = torch.max(active_b * w_b, dim=1) # (B, V)
+            
+            # Mask out non-palm vertices
+            masked = torch.zeros_like(palm_vals)
+            masked[:, deps.palm_vertices_tensor] = palm_vals[:, deps.palm_vertices_tensor]
+            out[i:i+B] = torch.clamp(masked, 0.0, 1.0)
+            
+        return out.cpu().numpy()
+
+def process_h5_file(filepath, deps_low, deps_sub):
     try:
         with h5py.File(filepath, "r+") as f:
             if "data" not in f:
@@ -139,16 +171,8 @@ def process_h5_file(filepath, deps_low, deps_sub, sigma=0.005):
                     key = f"{side}_pressure"
                     if key in demo:
                         p = demo[key][:]
-                        p_cont_low = []
-                        p_cont_sub = []
-                        for i in range(p.shape[0]):
-                            c_low = compute_continuous_pressure(p[i], deps_low.valid_nodes, deps_low.mano_vertices, deps_low.palm_vertices, deps_low.dist_matrix, deps_low.node_keys, sigma)
-                            c_sub = compute_continuous_pressure(p[i], deps_sub.valid_nodes, deps_sub.mano_vertices, deps_sub.palm_vertices, deps_sub.dist_matrix, deps_sub.node_keys, sigma)
-                            p_cont_low.append(c_low)
-                            p_cont_sub.append(c_sub)
-                            
-                        p_cont_low = np.array(p_cont_low, dtype=np.float32)
-                        p_cont_sub = np.array(p_cont_sub, dtype=np.float32)
+                        p_cont_low = process_sequence_gpu(p, deps_low)
+                        p_cont_sub = process_sequence_gpu(p, deps_sub)
                         
                         cont_key = f"{key}_continuous"
                         sub_key = f"{key}_continuous_subdiv"
@@ -164,7 +188,7 @@ def process_h5_file(filepath, deps_low, deps_sub, sigma=0.005):
     except Exception as e:
         print(f"Error processing {filepath}: {e}")
 
-def process_extracted_dataset(dataset_dir, deps_low, deps_sub, sigma=0.005):
+def process_extracted_dataset(dataset_dir, deps_low, deps_sub):
     meta_files = glob.glob(os.path.join(dataset_dir, "*", "*", "meta.json"))
     for mf in tqdm(meta_files, desc="Processing extracted dataset"):
         try:
@@ -173,27 +197,23 @@ def process_extracted_dataset(dataset_dir, deps_low, deps_sub, sigma=0.005):
                 
             hdf5_data = data.get("original_hdf5_data", {})
             modified = False
-            has_pressure = False
             
             for key in ["right_pressure", "left_pressure"]:
                 if key in hdf5_data:
-                    has_pressure = True
                     pressure = np.array(hdf5_data[key])
                     
                     if pressure.ndim == 2:
-                        c_low = compute_continuous_pressure(pressure, deps_low.valid_nodes, deps_low.mano_vertices, deps_low.palm_vertices, deps_low.dist_matrix, deps_low.node_keys, sigma)
-                        c_sub = compute_continuous_pressure(pressure, deps_sub.valid_nodes, deps_sub.mano_vertices, deps_sub.palm_vertices, deps_sub.dist_matrix, deps_sub.node_keys, sigma)
+                        p = pressure[np.newaxis, ...] # (1, 16, 16)
+                        c_low = process_sequence_gpu(p, deps_low)[0]
+                        c_sub = process_sequence_gpu(p, deps_sub)[0]
                         hdf5_data[f"{key}_continuous"] = c_low.tolist()
                         hdf5_data[f"{key}_continuous_subdiv"] = c_sub.tolist()
                         modified = True
                     elif pressure.ndim == 3:
-                        c_low_list = []
-                        c_sub_list = []
-                        for p in pressure:
-                            c_low_list.append(compute_continuous_pressure(p, deps_low.valid_nodes, deps_low.mano_vertices, deps_low.palm_vertices, deps_low.dist_matrix, deps_low.node_keys, sigma).tolist())
-                            c_sub_list.append(compute_continuous_pressure(p, deps_sub.valid_nodes, deps_sub.mano_vertices, deps_sub.palm_vertices, deps_sub.dist_matrix, deps_sub.node_keys, sigma).tolist())
-                        hdf5_data[f"{key}_continuous"] = c_low_list
-                        hdf5_data[f"{key}_continuous_subdiv"] = c_sub_list
+                        c_low = process_sequence_gpu(pressure, deps_low)
+                        c_sub = process_sequence_gpu(pressure, deps_sub)
+                        hdf5_data[f"{key}_continuous"] = c_low.tolist()
+                        hdf5_data[f"{key}_continuous_subdiv"] = c_sub.tolist()
                         modified = True
                     
             if modified:
@@ -206,19 +226,22 @@ def load_all_deps():
     deps_low = DepContainer()
     deps_sub = DepContainer()
     
-    print("⏳ [Low_Res] 正在预计算 Dijkstra 距离矩阵...")
-    (deps_low.mano_vertices, deps_low.palm_vertices, deps_low.valid_nodes, 
-     deps_low.dist_matrix, deps_low.node_keys) = load_mesh_and_compute_dist("low_res")
+    print("⏳ [Low_Res] 正在预计算 Dijkstra 距离矩阵与权重场...")
+    (deps_low.mano_vertices, deps_low.palm_vertices, 
+     deps_low.dist_matrix, deps_low.node_keys, deps_low.weights) = load_mesh_and_compute_dist("low_res")
      
-    print("⏳ [Subdiv] 正在预计算 Dijkstra 距离矩阵...")
-    (deps_sub.mano_vertices, deps_sub.palm_vertices, deps_sub.valid_nodes, 
-     deps_sub.dist_matrix, deps_sub.node_keys) = load_mesh_and_compute_dist("subdiv")
+    print("⏳ [Subdiv] 正在预计算 Dijkstra 距离矩阵与权重场...")
+    (deps_sub.mano_vertices, deps_sub.palm_vertices,
+     deps_sub.dist_matrix, deps_sub.node_keys, deps_sub.weights) = load_mesh_and_compute_dist("subdiv")
      
-    print("✅ 双分辨率图拓扑准备完毕！")
+    prepare_gpu_deps(deps_low)
+    prepare_gpu_deps(deps_sub)
+    
+    print("✅ 双分辨率图拓扑及 GPU 张量预备完毕！")
     return deps_low, deps_sub
 
 def main():
-    print("🚀 启动完美双轨道(Low_Res & Subdiv)数据注入流...")
+    print("🚀 启动完美双轨道数据注入流 (PyTorch GPU 加速版)...")
     deps_low, deps_sub = load_all_deps()
     
     # 1. /data/jiangrui/OpenTouch Data/data/
@@ -226,12 +249,12 @@ def main():
     h5_files = glob.glob(os.path.join(h5_dir, "*.h5")) + glob.glob(os.path.join(h5_dir, "*.hdf5"))
     if len(h5_files) > 0:
         for h5f in tqdm(h5_files, desc="Processing HDF5 data files"):
-            process_h5_file(h5f, deps_low, deps_sub, sigma=0.005)
+            process_h5_file(h5f, deps_low, deps_sub)
             
     # 2. /data/jiangrui/OpenTouch Data/extracted_dataset/
     ext_dir = "/data/jiangrui/OpenTouch Data/extracted_dataset/"
     if os.path.exists(ext_dir):
-        process_extracted_dataset(ext_dir, deps_low, deps_sub, sigma=0.005)
+        process_extracted_dataset(ext_dir, deps_low, deps_sub)
 
 if __name__ == "__main__":
     main()
