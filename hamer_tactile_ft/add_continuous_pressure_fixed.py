@@ -217,8 +217,10 @@ def process_single_meta(mf, deps_low, deps_sub):
                     modified = True
                 
         if modified:
-            with open(mf, "w") as f:
+            tmp_mf = mf + ".tmp"
+            with open(tmp_mf, "w") as f:
                 json.dump(data, f)
+            os.replace(tmp_mf, mf)
     except Exception as e:
         print(f"Error processing {mf}: {e}")
 

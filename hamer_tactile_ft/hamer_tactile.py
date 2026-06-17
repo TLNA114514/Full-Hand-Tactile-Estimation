@@ -90,14 +90,8 @@ class HAMER_Tactile(HAMER):
         pred_logits = output['pred_logits']
         pred_tactile = output['pred_tactile']
         
-        # BCE-Stabilized Regression (BSR) Loss
-        # 1. Main Objective: SmoothL1 directly aligns with RMSE, completely eliminating extreme confidence penalties
-        loss_main = F.smooth_l1_loss(pred_tactile, gt_tactile, reduction='none')
-        # 2. Gradient Highway: A 10% BCE loss ensures gradients never vanish at the edges of Sigmoid
-        loss_highway = F.binary_cross_entropy_with_logits(pred_logits, gt_tactile, reduction='none')
-        
-        # Combine them with absolute mathematical fairness (no asymmetric weighting to prevent expected value shifts)
-        loss_tactile_base = loss_main + 0.1 * loss_highway
+        # SmoothL1 directly aligns with RMSE
+        loss_tactile_base = F.smooth_l1_loss(pred_tactile, gt_tactile, reduction='none')
         
         # Mask out non-palm vertices using palm_mask
         palm_mask = batch['palm_mask'] # (B, 778)
