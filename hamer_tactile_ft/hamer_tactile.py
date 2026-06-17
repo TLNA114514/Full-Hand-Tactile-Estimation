@@ -21,33 +21,52 @@ class ResidualBlock(nn.Module):
         x = self.norm2(self.fc2(x))
         return self.act(x + res)
 
+class AnatomicalSpatialPooling(nn.Module):
+    def __init__(self, channels=256):
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool2d((5, 5))
+        # Mask: shape (1, 1, 5, 5)
+        mask = torch.ones((1, 1, 5, 5), dtype=torch.bool)
+        # Mask out the bottom-left two and bottom-right two, leaving the wrist at the bottom-center
+        mask[0, 0, 4, 0] = False
+        mask[0, 0, 4, 1] = False
+        mask[0, 0, 4, 3] = False
+        mask[0, 0, 4, 4] = False
+        self.register_buffer('mask', mask)
+        
+    def forward(self, x):
+        x = self.pool(x) # (B, C, 5, 5)
+        B, C, H, W = x.shape
+        x_view = x.view(B, C, H * W)
+        mask_flat = self.mask.view(-1) # (25,)
+        # x_view[:, :, mask_flat] perfectly extracts the 21 valid columns, resulting in (B, C, 21)
+        valid_regions = x_view[:, :, mask_flat]
+        # Flatten to (B, C * 21)
+        x_flat = valid_regions.reshape(B, C * 21)
+        return x_flat
+
 class HAMER_Tactile(HAMER):
     def __init__(self, cfg, init_renderer=False):
         super().__init__(cfg, init_renderer=init_renderer)
         
-        # We define a tactile head. 
-        # Since the backbone output channels (e.g. 1024 or 1280) are passed as `b c h w`,
-        # we will use AdaptiveAvgPool2d and then LazyLinear to handle any backbone feature dimension.
+        # 仿生手部解剖学瓶颈架构 (Anatomical Spatial Bottleneck)
         self.tactile_head = nn.Sequential(
-            # 1. 优雅的通道降维：保留原始空间分辨率的同时，大幅缩减厚度
-            nn.LazyConv2d(out_channels=256, kernel_size=3, padding=1),
+            # 1. 剧烈降维 (Channel Squeeze)
+            nn.LazyConv2d(out_channels=256, kernel_size=1),
             nn.GELU(),
             
-            # 2. 释放空间分辨率：从 4x4 (16个网格) 提升至 8x8 (64个网格)，清晰度暴增 4 倍！
-            nn.AdaptiveAvgPool2d((8, 8)),
-            nn.Flatten(),
-            
-            # 3. 强力丢弃，对抗大参数量记忆
+            # 2. 解剖学空间池化 (Anatomical Masking)
+            AnatomicalSpatialPooling(channels=256),
             nn.Dropout(p=0.5),
             
-            # 4. 后接我们之前部署好的抗过拟合残差集群
-            nn.LazyLinear(1024),
-            nn.LayerNorm(1024),
+            # 3. 轻量化残差解码器 (Lightweight Residual Decoder)
+            # 256 channels * 21 regions = 5376 dimensions
+            nn.Linear(5376, 512),
+            nn.LayerNorm(512),
             nn.GELU(),
             nn.Dropout(p=0.3),
-            ResidualBlock(1024),
-            ResidualBlock(1024),
-            nn.Linear(1024, 778)
+            ResidualBlock(512),
+            nn.Linear(512, 778)
         )
         
         # Ensure we don't automatically optimize as we want to control freezing
@@ -90,8 +109,14 @@ class HAMER_Tactile(HAMER):
         pred_logits = output['pred_logits']
         pred_tactile = output['pred_tactile']
         
-        # SmoothL1 directly aligns with RMSE
-        loss_tactile_base = F.smooth_l1_loss(pred_tactile, gt_tactile, reduction='none')
+        # BCE-Stabilized Regression (BSR) Loss
+        # 1. Main Objective: SmoothL1 directly aligns with RMSE, completely eliminating extreme confidence penalties
+        loss_main = F.smooth_l1_loss(pred_tactile, gt_tactile, reduction='none')
+        # 2. Gradient Highway: A 10% BCE loss ensures gradients never vanish at the edges of Sigmoid
+        loss_highway = F.binary_cross_entropy_with_logits(pred_logits, gt_tactile, reduction='none')
+        
+        # Combine them with absolute mathematical fairness (no asymmetric weighting to prevent expected value shifts)
+        loss_tactile_base = loss_main + 0.1 * loss_highway
         
         # Mask out non-palm vertices using palm_mask
         palm_mask = batch['palm_mask'] # (B, 778)
