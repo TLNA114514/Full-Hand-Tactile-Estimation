@@ -57,6 +57,7 @@ results/
 outputs/
 demo_out/
 out_demo_video/
+hamer_tactile_ft/full_bboxes_cache
 
 # Model files
 *.ckpt
