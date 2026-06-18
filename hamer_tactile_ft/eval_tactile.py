@@ -1,7 +1,5 @@
 import sys
 import os
-# Force OSMesa to prevent silent EGL segfaults on headless servers
-os.environ['PYOPENGL_PLATFORM'] = 'osmesa'
 import json
 import argparse
 import h5py
