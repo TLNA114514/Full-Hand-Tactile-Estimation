@@ -71,8 +71,10 @@ fi
 # ------------------ 4. 结果处理 ------------------
 echo "=========================================="
 if [ $SYNC_STATUS -eq 0 ]; then
-    echo "🎉 同步成功！代码已部署至远程服务器："
-    echo "👉 路径: $REMOTE_USER@$REMOTE_HOST:$REMOTE_DIR/Full-Hand-Tactile-Estimation/"
+    echo "🎉 同步成功！正在远端服务器上触发自动路径适配..."
+    ssh -p "$PORT" -i "$KEY_PATH" -o StrictHostKeyChecking=no "$REMOTE_USER@$REMOTE_HOST" "cd $REMOTE_DIR/Full-Hand-Tactile-Estimation && python3 auto_adapt_paths.py"
+    
+    echo "👉 路径已全部自动修改并部署至: $REMOTE_USER@$REMOTE_HOST:$REMOTE_DIR/Full-Hand-Tactile-Estimation/"
 else
     echo "❌ 同步失败，请检查网络连接、端口或 SSH 密钥配置。"
 fi
