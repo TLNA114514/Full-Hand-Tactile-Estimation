@@ -66,7 +66,7 @@ def initialize_models(device):
     return detector, cpm
 
 
-def extract_worker(gpu_id, clips_chunk, cache_dir):
+def extract_worker(gpu_id, clips_chunk, cache_dir, data_dir):
     """单卡子进程：负责对自己被分配到的 clips_chunk 提取 Bbox (含 null 回退) 并将结果刷入 cache_dir"""
     try:
         device = torch.device(f'cuda:{gpu_id}')
@@ -75,8 +75,6 @@ def extract_worker(gpu_id, clips_chunk, cache_dir):
             
         print(f"[Worker GPU {gpu_id}] 初始化模型... 分配了 {len(clips_chunk)} 个 clip。")
         detector, cpm = initialize_models(device)
-        
-        data_dir = "/data/jiangrui/OpenTouch Data/data"
         
         # 按照 split 和 scene 进行分组，减少切换 HDF5 的开销
         from collections import defaultdict
@@ -169,7 +167,7 @@ def extract_worker(gpu_id, clips_chunk, cache_dir):
         traceback.print_exc()
 
 
-def extract_full_bboxes_multigpu(logical_gpus):
+def extract_full_bboxes_multigpu(logical_gpus, data_dir):
     """主进程：分配 train/val/test 任务，等待结束，然后合并大 JSON"""
     splits_json_path = os.path.join(base_dir, "evaluation/opentouch_splits.json")
     output_bbox_json = os.path.join(base_dir, "hamer_tactile_ft/opentouch_all_bboxes.json")
@@ -199,7 +197,7 @@ def extract_full_bboxes_multigpu(logical_gpus):
     pool_args = []
     for i, gpu_id in enumerate(logical_gpus):
         if i < len(chunks) and len(chunks[i]) > 0:
-            pool_args.append((int(gpu_id), chunks[i], cache_dir))
+            pool_args.append((int(gpu_id), chunks[i], cache_dir, data_dir))
             
     if num_gpus > 1:
         print(f"🚀 启动 {len(pool_args)} 卡并行提框进程池！")
@@ -236,11 +234,9 @@ def extract_full_bboxes_multigpu(logical_gpus):
     return output_bbox_json
 
 
-def extract_full_to_disk(bbox_json_path):
+def extract_full_to_disk(bbox_json_path, data_dir, output_dir):
     """第二阶段：读取全量大 JSON，从 HDF5 中解包图像和 meta，并记录 Registry"""
     print("\n📦 开始将全量数据集图片及 meta.json 写入磁盘，并生成 Registry...")
-    data_dir = "/data/jiangrui/OpenTouch Data/data"
-    output_dir = "/data/jiangrui/OpenTouch Data/full_dataset"
     registry_path = os.path.join(base_dir, "hamer_tactile_ft/dataset_frames_registry.json")
     
     with open(bbox_json_path, 'r') as f:
@@ -409,6 +405,8 @@ def extract_full_to_disk(bbox_json_path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Extract full dataset with multi-GPU and fallback null bboxes")
     parser.add_argument('--gpu', type=str, default='0', help='使用的 GPU 编号 (例: 0,1,2,3)')
+    parser.add_argument('--data_dir', type=str, default='/data/jiangrui/OpenTouch Data/data', help='原始 HDF5 数据目录')
+    parser.add_argument('--output_dir', type=str, default='/data/jiangrui/OpenTouch Data/full_dataset', help='输出的全量数据集目录')
     args = parser.parse_args()
     
     os.chdir(base_dir)
@@ -416,6 +414,6 @@ if __name__ == "__main__":
     gpu_list = args.gpu.split(',') if args.gpu else ['0']
     logical_gpus = list(range(len(gpu_list)))
     
-    bbox_path = extract_full_bboxes_multigpu(logical_gpus)
+    bbox_path = extract_full_bboxes_multigpu(logical_gpus, args.data_dir)
     if bbox_path:
-        extract_full_to_disk(bbox_path)
+        extract_full_to_disk(bbox_path, args.data_dir, args.output_dir)
