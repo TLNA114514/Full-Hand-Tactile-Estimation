@@ -1,18 +1,39 @@
-#!/usr/bin/env python3
 import sys
 import os
-import io
-import json
+
+# 1. First, forcefully set the environment for PyOpenGL and pyrender
+os.environ['PYOPENGL_PLATFORM'] = 'egl'
+os.environ['PYRENDER_PLATFORM'] = 'egl'
+
+# 2. Monkey-patch PyOpenGL's string/bytes bug before anything else
+import OpenGL
+import OpenGL.extensions
+import OpenGL._bytes
+
+_orig_call = OpenGL.extensions.ExtensionQuerier.__call__
+def _patched_call(self, specifier):
+    spec = OpenGL._bytes.as_8_bit(specifier)
+    if isinstance(spec, bytes):
+        if isinstance(self.prefix, str):
+            self.prefix = self.prefix.encode('utf-8')
+        if isinstance(self.version_prefix, str):
+            self.version_prefix = self.version_prefix.encode('utf-8')
+    return _orig_call(self, specifier)
+OpenGL.extensions.ExtensionQuerier.__call__ = _patched_call
+
+# 3. Force PyOpenGL to load its EGL platform BEFORE cv2 can mess up the shared libraries!
+import OpenGL.GL
+import OpenGL.EGL
+import pyrender
+
 import argparse
-import h5py
+import sys
+import copy
 import cv2
 import numpy as np
 import torch
-torch.set_float32_matmul_precision('high')
-from pathlib import Path
-from tqdm import tqdm
-
-# Parse GPU early to prevent EGL/CUDA conflicts
+import trimesh
+# Parse GPU early
 _gpus = ""
 for i, arg in enumerate(sys.argv):
     if arg == '--gpu' and i + 1 < len(sys.argv):
@@ -20,74 +41,14 @@ for i, arg in enumerate(sys.argv):
         break
 if _gpus:
     os.environ["CUDA_VISIBLE_DEVICES"] = _gpus
+    os.environ["EGL_DEVICE_ID"] = _gpus.split(',')[0]
 
-# ==========================================================================================
-# 🛑 核心黑魔法：源码感知 + 全局空间硬核注入补丁（地表最强终结版，完美解决一切 NameError）
-# ==========================================================================================
-_parser = argparse.ArgumentParser(add_help=False)
-_parser.add_argument('--render_platform', type=str, default='egl', choices=['egl', 'osmesa'], help='Rendering platform (egl or osmesa)')
-_args, _ = _parser.parse_known_args()
-
-os.environ['PYOPENGL_PLATFORM'] = _args.render_platform
-os.environ['PYRENDER_PLATFORM'] = _args.render_platform
-
-try:
-    import types
-    import builtins
-    import re
-    import sys
-
-    # 1. 定义一个全能通配符类：既是数字0，又是可任意调用的函数，还支持无限切片和属性延伸
-    class UltimateMagicMock(int):
-        def __call__(self, *args, **kwargs): return self
-        def __getattr__(self, name): return self
-        def __getitem__(self, item): return self
-        def __iter__(self): return iter([])
-
-    class PerfectMockModule(types.ModuleType):
-        def __getattr__(self, name):
-            if name.startswith('__'): raise AttributeError(name)
-            return UltimateMagicMock(0)
-
-    mock_obj = PerfectMockModule('OpenGL.GL')
-
-    # 2. 拦截系统的底层 __import__ 行为
-    orig_import = builtins.__import__
-    def custom_import(name, globals=None, locals=None, fromlist=(), level=0):
-        # 只要发现有任何文件在尝试染指 OpenGL/EGL/OSMesa
-        if name.startswith('OpenGL') or name in ['EGL', 'OSMesa']:
-            if globals is not None and '__file__' in globals:
-                try:
-                    # 【硬核注入】读取当前正在执行 import 的文件（如 texture.py）的源码
-                    with open(globals['__file__'], 'r', encoding='utf-8', errors='ignore') as f:
-                        content = f.read()
-                    
-                    # 抓取该文件里写的所有 OpenGL 相关的函数和常量（如 GL_TEXTURE_2D, glGenTextures 等）
-                    tokens = re.findall(r'\b([gG][lL][A-Za-z0-9_]+|[eE][gG][lL][A-Za-z0-9_]+|OSMesa[A-Za-z0-9_]+)\b', content)
-                    
-                    # 直接强行把这些变量塞进该文件的全局命名空间，彻底断绝 NameError 的可能
-                    for token in tokens:
-                        if token not in globals:
-                            globals[token] = UltimateMagicMock(0)
-                except Exception:
-                    pass
-            return mock_obj
-        return orig_import(name, globals, locals, fromlist, level)
-    
-    # 替换系统全局导入函数
-    builtins.__import__ = custom_import
-
-    # 3. 固化系统路由备份
-    sys.modules['EGL'] = mock_obj
-    sys.modules['OSMesa'] = mock_obj
-    sys.modules['OpenGL'] = mock_obj
-    sys.modules['OpenGL.GL'] = mock_obj
-    sys.modules['OpenGL.GL.shaders'] = mock_obj
-    
-    print("\n====== [Success] Hardcore Global Token Injector Activated! ======\n")
-except Exception as e:
-    print(f"Bypass failed: {e}")
-# ==========================================================================================
+import cv2
+import numpy as np
+import torch
+torch.set_float32_matmul_precision('high')
+from pathlib import Path
+from tqdm import tqdm
 
 # Setup sys.path relative to workspace
 ft_dir = os.path.dirname(os.path.abspath(__file__))
@@ -102,28 +63,71 @@ sys.path.append(ft_dir)
 sys.path.append(preprocess_dir)
 
 # Import necessary dependencies
-from train import OpenTouchHAMER_TactileWrapper
-from eval_hamer import ViTDetDataset
 from vitpose_model import ViTPoseModel
 from hamer.utils import recursive_to
 from hamer.configs import get_config
 from hamer.utils.utils_detectron2 import DefaultPredictor_Lazy
 from detectron2.config import LazyConfig
 import hamer
+from hamer_tactile import HAMER_Tactile
+
+class OpenTouchHAMER_TactileWrapper(HAMER_Tactile):
+    def __init__(self, cfg, learning_rate=1e-4):
+        super().__init__(cfg, init_renderer=False)
+
+class ViTDetDataset(torch.utils.data.Dataset):
+    def __init__(self, cfg, img_cv2, boxes, right, rescale_factor=2.0):
+        self.cfg = cfg
+        self.img_cv2 = img_cv2
+        self.boxes = boxes
+        self.right = right
+        self.rescale_factor = rescale_factor
+
+    def __len__(self):
+        return len(self.boxes)
+
+    def __getitem__(self, idx):
+        bbox = self.boxes[idx]
+        is_right = self.right[idx]
+        
+        center = np.array([(bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0])
+        scale_pixels = max(bbox[2] - bbox[0], bbox[3] - bbox[1])
+        bbox_size = scale_pixels * self.rescale_factor
+        
+        res = self.cfg.MODEL.IMAGE_SIZE
+        t = np.zeros((2, 3), dtype=np.float32)
+        t[0, 0] = float(res) / bbox_size
+        t[1, 1] = float(res) / bbox_size
+        t[0, 2] = res * (-float(center[0]) / bbox_size + 0.5)
+        t[1, 2] = res * (-float(center[1]) / bbox_size + 0.5)
+        
+        img_rgb = cv2.cvtColor(self.img_cv2, cv2.COLOR_BGR2RGB)
+        img_patch = cv2.warpAffine(img_rgb, t, (res, res), flags=cv2.INTER_LINEAR)
+        img_patch = img_patch.astype(np.float32) / 255.0
+        
+        if is_right == 0:
+            img_patch = cv2.flip(img_patch, 1)
+            
+        img_patch = (img_patch - self.cfg.MODEL.IMAGE_MEAN) / self.cfg.MODEL.IMAGE_STD
+        img_patch = img_patch.transpose(2, 0, 1)
+        
+        return {
+            'img': torch.from_numpy(img_patch).float(),
+            'right': torch.tensor(is_right, dtype=torch.float32),
+            'box_center': torch.from_numpy(center).float(),
+            'box_size': torch.tensor(bbox_size).float(),
+            'img_size': torch.tensor([self.img_cv2.shape[1], self.img_cv2.shape[0]], dtype=torch.float32)
+        }
+
 
 # Import preprocess module helpers
-from load_data import (
-    export_rgb_frames,
-    export_pose_mano,
-    export_tactile_mano,
-)
 from pyrenderer import ManoRenderer
 import trimesh
 from generate_video import generate_video_from_images
 from concat_videos import concat_videos
 
 # ==============================================================================
-# Local definitions of helpers from load_data.py to avoid nested function ImportError
+# Helpers
 # ==============================================================================
 
 def _find_first_existing(cands):
@@ -131,121 +135,6 @@ def _find_first_existing(cands):
         if p and os.path.exists(p):
             return p
     return None
-
-
-def _load_layout_json():
-    layout_json = _find_first_existing([
-        "handLayoutNewest_meshid.json",
-        os.path.join(preprocess_dir, "data", "handLayoutNewest_meshid.json"),
-        os.path.join(preprocess_dir, "scratch", "handLayoutNewest_meshid.json"),
-        os.path.join(preprocess_dir, "handLayoutNewest_meshid.json"),
-        os.path.join(workspace_dir, "data", "handLayoutNewest_meshid.json"),
-    ])
-    if layout_json is None:
-        raise FileNotFoundError("Missing handLayoutNewest_meshid.json")
-    with open(layout_json, "r") as f:
-        d = json.load(f)
-    return d["positions"], set(d.get("erasedNodes", []))
-
-
-def _build_vertex_graph(verts, faces):
-    V = len(verts)
-    nbrs = [[] for _ in range(V)]
-    dists = [[] for _ in range(V)]
-    edges = set()
-    for a, b, c in faces.astype(np.int64):
-        edges.update({(min(a, b), max(a, b)), (min(b, c), max(b, c)), (min(c, a), max(c, a))})
-    for i, j in edges:
-        dij = np.linalg.norm(verts[i] - verts[j])
-        nbrs[i].append(j)
-        dists[i].append(dij)
-        nbrs[j].append(i)
-        dists[j].append(dij)
-    return nbrs, dists
-
-
-def _gaussian_smooth_vertex_signal(vals, nbrs, dists, sigma=0.005, iters=2):
-    if sigma <= 0 or iters <= 0: 
-        return vals
-    two_sig2 = 2.0 * (sigma * sigma)
-    out = vals.astype(np.float32).copy()
-    for _ in range(iters):
-        new = out.copy()
-        for i, (N, D) in enumerate(zip(nbrs, dists)):
-            max_val = out[i]
-            for j, dij in zip(N, D):
-                w = np.exp(-(dij * dij) / two_sig2)
-                v_decay = w * out[j]
-                if v_decay > max_val:
-                    max_val = v_decay
-            new[i] = max_val
-        out = new
-    return out
-
-
-def _render_pressure_mano(mano_vertices, mano_faces, renderer, pressure16, layout, erased_nodes, vmin, vmax, nbrs, dists):
-    from collections import defaultdict
-    from matplotlib import cm
-    # normalize pressure → [0,1]
-    norm = ((pressure16 - vmin) / max(vmax - vmin, 1e-6)).clip(0, 1)
-    valid_nodes = {
-        nid: {"mano_vid": layout[nid].get("mano_vid", [])}
-        for nid in layout.keys() if nid not in erased_nodes
-    }
-    vert_to_vals = defaultdict(list)
-    for nid, info in valid_nodes.items():
-        r, c = map(int, nid.split('-'))
-        val = float(norm[r, c])
-        for vid in info["mano_vid"]:
-            vert_to_vals[vid].append(val)
-
-    n_verts = mano_vertices.shape[0]
-    vert_vals = np.zeros(n_verts, dtype=np.float32)
-    if vert_to_vals:
-        for vid, arr in vert_to_vals.items():
-            vert_vals[vid] = float(np.mean(arr))
-        known_mask = np.zeros(n_verts, bool)
-        known_mask[list(vert_to_vals.keys())] = True
-        vert_max = float(vert_vals[known_mask].max())
-        vert_vals[~known_mask] = vert_max
-
-    # connectivity smoothing
-    vert_vals = _gaussian_smooth_vertex_signal(vert_vals, nbrs, dists, sigma=0.005, iters=2)
-
-    # invert + min-max normalize
-    mn, mx = float(vert_vals.min()), float(vert_vals.max())
-    if mx > mn:
-        vert_vals = 1.0 - (vert_vals - mn) / (mx - mn)
-    else:
-        vert_vals[:] = 1.0
-
-    colormap_fn = lambda x: np.array(cm.gnuplot2(x))
-    vertex_colors = colormap_fn(vert_vals)  # RGBA float in [0,1]
-    img_rgb = renderer.render(vertex_colors=vertex_colors, colormap_fn=colormap_fn, smooth=True)
-    return img_rgb[:, :, ::-1], vertex_colors
-
-
-def _prepare_tactile_frame(sample, attrs):
-    import math
-    arr = np.asarray(sample)
-    arr = np.squeeze(arr)
-
-    if arr.ndim == 2:
-        return arr.astype(np.float32)
-
-    if arr.ndim == 1:
-        grid_shape = attrs.get("grid_shape") if attrs else None
-        if grid_shape:
-            rows, cols = map(int, grid_shape)
-            return arr.reshape(rows, cols).astype(np.float32)
-
-        length = arr.shape[0]
-        root = int(math.sqrt(length))
-        if root * root == length:
-            return arr.reshape(root, root).astype(np.float32)
-
-        return arr.reshape(1, length).astype(np.float32)
-
 
 def _resolve_file(filename):
     for candidate in [
@@ -478,6 +367,7 @@ def render_pose_sequence(joints_seq, output_dir, demo_id, target_size=(1280, 960
     
     # Create renderer
     background_color = (249, 235, 142)  # Cream color matching GT Pose background
+    os.environ['PYOPENGL_PLATFORM'] = 'egl'
     rctx = RenderOnce(faces=faces, image_size=target_size, bg_rgb=background_color)
     
     os.makedirs(output_dir, exist_ok=True)
@@ -510,27 +400,33 @@ def render_pose_sequence(joints_seq, output_dir, demo_id, target_size=(1280, 960
     print("Pose rendering completed.")
 
 
-def render_tactile_sequence(pressure_seq, output_dir, demo_id, vmin, vmax, target_size=(1280, 960), temporal_alpha=0.4):
+def render_tactile_778_sequence(pressure_seq, output_dir, demo_id, target_size=(1280, 960), temporal_alpha=0.4):
+    from matplotlib import cm
     width, height = target_size
-    layout, erased_nodes = _load_layout_json()
     
-    # Find subdivisions OBJ
+    # Find low-res OBJ (778 vertices)
     obj_path = _find_first_existing([
-        "mano_right_neutral_subdiv.obj",
-        os.path.join(preprocess_dir, "data", "mano_right_neutral_subdiv.obj"),
-        os.path.join(preprocess_dir, "scratch", "mano_right_neutral_subdiv.obj"),
-        os.path.join(preprocess_dir, "mano_right_neutral_subdiv.obj"),
-        os.path.join(workspace_dir, "data", "mano_right_neutral_subdiv.obj"),
+        "mano_right_neutral.obj",
+        os.path.join(preprocess_dir, "data", "mano_right_neutral.obj"),
+        os.path.join(preprocess_dir, "scratch", "mano_right_neutral.obj"),
+        os.path.join(preprocess_dir, "mano_right_neutral.obj"),
+        os.path.join(workspace_dir, "data", "mano_right_neutral.obj"),
     ])
     if obj_path is None:
-        raise FileNotFoundError("Missing mano_right_neutral_subdiv.obj")
+        raise FileNotFoundError("Missing mano_right_neutral.obj")
         
     mesh = trimesh.load(obj_path, process=False)
     mano_vertices = np.asarray(mesh.vertices, dtype=np.float32)
     mano_faces    = np.asarray(mesh.faces, dtype=np.int32)
 
-    nbrs, dists = _build_vertex_graph(mano_vertices, mano_faces)
-    
+    # Monkey patch pyrender to force a dark background for tactile rendering to match GT style
+    import pyrender
+    orig_scene_init = pyrender.Scene.__init__
+    def new_scene_init(self, *args, **kwargs):
+        kwargs['bg_color'] = [30, 30, 30, 0] # Dark grey background
+        orig_scene_init(self, *args, **kwargs)
+    pyrender.Scene.__init__ = new_scene_init
+
     os.environ['PYOPENGL_PLATFORM'] = 'egl'
     renderer = ManoRenderer(image_size=(width, height),
                             focal_length=8000.0 * (width / 1280.0),
@@ -540,15 +436,18 @@ def render_tactile_sequence(pressure_seq, output_dir, demo_id, vmin, vmax, targe
     os.makedirs(output_dir, exist_ok=True)
     prev = None
     
-    print(f"Rendering tactile sequence to {output_dir}...")
+    print(f"Rendering 778-dim tactile sequence to {output_dir}...")
+    colormap_fn = lambda x: np.array(cm.gnuplot2(x))
+
     for idx, grid in enumerate(pressure_seq):
         if temporal_alpha and prev is not None:
             grid = temporal_alpha * grid + (1.0 - temporal_alpha) * prev
         prev = grid
 
-        img_bgr, vcolors = _render_pressure_mano(
-            mano_vertices, mano_faces, renderer, grid, layout, erased_nodes, vmin, vmax, nbrs, dists
-        )
+        # grid is assumed to be (778,) and in range [0, 1] where 1 is highest pressure
+        # Map to color: 1.0 - value so that highest pressure maps to 0 in colormap (which is usually brightest in gnuplot2)
+        color_new = np.clip(1.0 - grid, 0.0, 1.0)
+        img_bgr = renderer.render(vertex_colors=colormap_fn(color_new), colormap_fn=colormap_fn, smooth=True)
         
         # Contrast adjustment matching the original code
         alpha = 1.2
@@ -556,14 +455,15 @@ def render_tactile_sequence(pressure_seq, output_dir, demo_id, vmin, vmax, targe
         img_adj = cv2.convertScaleAbs(img_bgr, alpha=alpha, beta=beta)
         cv2.imwrite(os.path.join(output_dir, f"{demo_id}_{idx:05d}.png"), img_adj)
         
+    # Restore pyrender init
+    pyrender.Scene.__init__ = orig_scene_init
     print("Tactile rendering completed.")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Demo pipeline to build comparative predicted vs GT videos.")
+    parser = argparse.ArgumentParser(description="Demo pipeline to build predicted video from raw video input.")
     parser.add_argument("--checkpoint", type=str, required=True, help="Trained tactile checkpoint path")
-    parser.add_argument("--hdf5_path", type=str, required=True, help="HDF5 file path")
-    parser.add_argument("--clip_id", type=str, required=True, help="Clip ID within the HDF5 file")
+    parser.add_argument("--video_path", type=str, required=True, help="Input video path")
     parser.add_argument("--out_dir", type=str, default="./demo_output", help="Output directory")
     parser.add_argument("--gpu", type=str, default="4", help="GPU index")
     parser.add_argument("--hand", type=str, choices=["left", "right"], default="right", help="Hand side")
@@ -577,99 +477,60 @@ def main():
     else:
         device = torch.device('cpu')
 
-    clip_id = args.clip_id
+    video_path = Path(args.video_path)
+    demo_id = video_path.stem
     hand_side = args.hand
     is_right_hand = 1 if hand_side == "right" else 0
 
     # Ensure output folders
-    out_path = Path(args.out_dir) / clip_id
+    out_path = Path(args.out_dir) / demo_id
     rgb_dir = out_path / "rgb"
-    gt_pose_dir = out_path / "gt_pose"
     pred_pose_dir = out_path / "pred_pose"
-    gt_touch_dir = out_path / "gt_touch"
     pred_touch_dir = out_path / "pred_touch"
 
-    target_size = (1280, 960)
+    # Step 1: Read Video Frames
+    print(f"\n>>> [1/5] Extracting RGB frames from {video_path}...")
+    os.makedirs(rgb_dir, exist_ok=True)
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise ValueError(f"Failed to open video: {video_path}")
+        
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps == 0 or np.isnan(fps):
+        fps = 30.0
 
-    # Step 1: Export RGB images
-    print("\n>>> [1/7] Exporting RGB frames...")
-    export_rgb_frames(
-        file_path=args.hdf5_path,
-        demo_id=clip_id,
-        output_dir=str(rgb_dir),
-        target_size=target_size,
-        channel_order="bgr",
-    )
+    orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    target_size = (orig_w, orig_h)
 
-    # Step 2: Export GT pose and GT tactile heatmaps
-    print("\n>>> [2/7] Exporting GT hand pose...")
-    export_pose_mano(
-        file_path=args.hdf5_path,
-        demo_id=clip_id,
-        output_dir=str(gt_pose_dir),
-        dataset_names=(f"{hand_side}_hand_landmarks",),
-        target_size=target_size,
-    )
+    rgb_frames_bgr = []
+    idx = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        # Resize to target size for consistency
+        frame_resized = cv2.resize(frame, target_size)
+        rgb_frames_bgr.append(frame_resized)
+        cv2.imwrite(str(rgb_dir / f"{demo_id}_{idx:05d}.png"), frame_resized)
+        idx += 1
+    cap.release()
+    num_frames = len(rgb_frames_bgr)
+    print(f"Extracted {num_frames} frames.")
 
-    print("\n>>> [3/7] Exporting GT tactile heatmaps...")
-    export_tactile_mano(
-        file_path=args.hdf5_path,
-        demo_id=clip_id,
-        output_dir=str(gt_touch_dir),
-        dataset_names=(f"{hand_side}_pressure",),
-        target_size=target_size,
-    )
+    if num_frames == 0:
+        print("Error: No frames could be read from the video.")
+        return
 
-    # Compute global vmin and vmax from HDF5 raw pressure signals
-    from load_data import _resolve_demo_name, _require_data_group
-    with h5py.File(args.hdf5_path, "r") as src:
-        dpath = f"data/{clip_id}/{hand_side}_pressure"
-        if dpath not in src:
-            resolved = _resolve_demo_name(_require_data_group(src, args.hdf5_path), clip_id)
-            dpath = f"data/{resolved}/{hand_side}_pressure"
-        dset = src[dpath]
-        gt_pressure_seq = []
-        for sample in dset:
-            grid = _prepare_tactile_frame(sample, dset.attrs).astype(np.float32)
-            if grid.shape != (16, 16):
-                grid = cv2.resize(grid, (16, 16), interpolation=cv2.INTER_AREA).astype(np.float32)
-            gt_pressure_seq.append(grid)
-
-    layout, erased_nodes = _load_layout_json()
-    stack = np.stack(gt_pressure_seq, 0) if gt_pressure_seq else np.zeros((0, 16, 16), np.float32)
-    valid_mask = np.zeros((16, 16), dtype=bool)
-    for nid in layout.keys():
-        if nid in erased_nodes: continue
-        r, c = map(int, nid.split('-'))
-        valid_mask[r, c] = True
-
-    if stack.size:
-        vmin = float(stack[:, valid_mask].min())
-        vmax = float(stack[:, valid_mask].max())
-    else:
-        vmin, vmax = 0.0, 1.0
-
-    # Step 3: Run model inference
-    print("\n>>> [4/7] Loading models & running inference on clip...")
+    # Step 2: Run model inference
+    print("\n>>> [2/5] Loading models & running inference on video frames...")
     model, detector, cpm, model_cfg = load_models(args.checkpoint, device)
 
-    # Read RGB image sequence from HDF5
-    with h5py.File(args.hdf5_path, "r") as f:
-        clip_group = f[f"data/{clip_id}"]
-        rgb_bytes_seq = clip_group["rgb_images_jpeg"][()]
-        
-    num_frames = len(rgb_bytes_seq)
-    
     pred_joints_list = []
     pred_tactile_list = []
 
     for idx in tqdm(range(num_frames), desc="Running Inference"):
-        img_bgr = cv2.imdecode(np.frombuffer(rgb_bytes_seq[idx], dtype=np.uint8), cv2.IMREAD_COLOR)
-        if img_bgr is None:
-            pred_joints_list.append(None)
-            pred_tactile_list.append(None)
-            continue
-            
+        img_bgr = rgb_frames_bgr[idx]
         img_rgb = img_bgr[:, :, ::-1]
         
         # Run ViTDet detection
@@ -762,7 +623,7 @@ def main():
     if first_valid_idx is None:
         print(">>> Warning: No hand detected in any frame of the video!")
         pred_joints_seq = np.zeros((num_frames, 21, 3), dtype=np.float32)
-        pred_tactile_seq = np.zeros((num_frames, 256), dtype=np.float32)
+        pred_tactile_seq = np.zeros((num_frames, 778), dtype=np.float32) # Default to 778 dims
     else:
         for idx in range(first_valid_idx):
             pred_joints_list[idx] = pred_joints_list[first_valid_idx]
@@ -777,78 +638,67 @@ def main():
             else:
                 curr_joints = pred_joints_list[idx]
                 curr_tactile = pred_tactile_list[idx]
-                
         pred_joints_seq = np.stack(pred_joints_list, axis=0)
         pred_tactile_seq = np.stack(pred_tactile_list, axis=0)
 
-    # Step 4: Render Predicted Pose using custom RenderOnce matching export_pose_mano
-    print("\n>>> [5/7] Rendering Predicted Hand Pose...")
+    # -------------------------------------------------------------
+    # Post-process the tactile predictions to remove artifacts
+    # 1. Mask out non-palm vertices (which were never penalized during training)
+    import json
+    palm_faces_path = os.path.join(workspace_dir, "opentouch", "preprocess", "scratch", "auto_calibrated_palm_faces.json")
+    with open(palm_faces_path, "r") as f:
+        palm_data = json.load(f)
+        
+    palm_vertices_set = set()
+    for triplet in palm_data["group_negative"]["face_triplets"]:
+        for vid in triplet:
+            if vid <= 777:
+                palm_vertices_set.add(vid)
+    palm_mask = np.zeros(778, dtype=np.float32)
+    palm_mask[list(palm_vertices_set)] = 1.0
+    
+    pred_tactile_seq = pred_tactile_seq * palm_mask
+    # -------------------------------------------------------------
+
+    print("\n>>> [3/5] Rendering Predicted Hand Pose...")
     render_pose_sequence(
         joints_seq=pred_joints_seq,
         output_dir=str(pred_pose_dir),
-        demo_id=clip_id,
+        demo_id=demo_id,
         target_size=target_size,
         side=hand_side,
         use_cuda=(device.type == 'cuda'),
     )
 
-    # Step 5: Render Predicted Tactile using custom render_tactile_sequence matching export_tactile_mano
-    print("\n>>> [6/7] Rendering Predicted Tactile Heatmap...")
-    pred_pressure_seq = []
-    for pred_frame in pred_tactile_seq:
-        grid_pred = pred_frame.reshape(16, 16)
-        pressure_raw = np.clip(3072.0 - grid_pred * 3072.0, 0.0, 3072.0)
-        pred_pressure_seq.append(pressure_raw)
-        
-    render_tactile_sequence(
-        pressure_seq=pred_pressure_seq,
+    # Step 4: Render Predicted Tactile (778-dim MANO basis)
+    print("\n>>> [4/5] Rendering Predicted Tactile Heatmap (778-dim)...")
+    render_tactile_778_sequence(
+        pressure_seq=pred_tactile_seq,
         output_dir=str(pred_touch_dir),
-        demo_id=clip_id,
-        vmin=vmin,
-        vmax=vmax,
+        demo_id=demo_id,
         target_size=target_size,
     )
 
-    # Step 6: Create sub-videos & stack them
-    print("\n>>> [7/7] Compiling sub-videos and stitching final visualization...")
+    # Step 5: Create sub-videos & stack them
+    print("\n>>> [5/5] Compiling sub-videos and stitching final visualization...")
     
     # Locate paths
     rgb_mp4 = out_path / "rgb.mp4"
-    gt_pose_mp4 = out_path / "gt_pose.mp4"
     pred_pose_mp4 = out_path / "pred_pose.mp4"
-    gt_touch_mp4 = out_path / "gt_touch.mp4"
     pred_touch_mp4 = out_path / "pred_touch.mp4"
     
     # Generate MP4s from image directories
-    generate_video_from_images(clip_id, str(rgb_dir), str(rgb_mp4), fps=30)
-    generate_video_from_images(clip_id, str(gt_pose_dir / f"{hand_side}_hand_landmarks"), str(gt_pose_mp4), fps=30)
-    generate_video_from_images(clip_id, str(pred_pose_dir), str(pred_pose_mp4), fps=30)
-    generate_video_from_images(clip_id, str(gt_touch_dir / f"{hand_side}_pressure"), str(gt_touch_mp4), fps=30)
-    generate_video_from_images(clip_id, str(pred_touch_dir), str(pred_touch_mp4), fps=30)
+    generate_video_from_images(demo_id, str(rgb_dir), str(rgb_mp4), fps=fps)
+    generate_video_from_images(demo_id, str(pred_pose_dir), str(pred_pose_mp4), fps=fps)
+    generate_video_from_images(demo_id, str(pred_touch_dir), str(pred_touch_mp4), fps=fps)
     
-    # Vertical concat Middle Column
-    middle_column_mp4 = out_path / "middle_column.mp4"
-    concat_videos(
-        videos=[gt_pose_mp4, pred_pose_mp4],
-        output=middle_column_mp4,
-        layout="vertical",
-    )
-    
-    # Vertical concat Right Column
-    right_column_mp4 = out_path / "right_column.mp4"
-    concat_videos(
-        videos=[gt_touch_mp4, pred_touch_mp4],
-        output=right_column_mp4,
-        layout="vertical",
-    )
-    
-    # Horizontal concat Left, Middle, Right columns
+    # Horizontal concat RGB, Pred Pose, Pred Tactile
     final_output_mp4 = out_path / "combined.mp4"
     concat_videos(
-        videos=[rgb_mp4, middle_column_mp4, right_column_mp4],
+        videos=[rgb_mp4, pred_pose_mp4, pred_touch_mp4],
         output=final_output_mp4,
         layout="horizontal",
-        scale_height=1920,  # 2 * 960
+        scale_height=target_size[1],  
     )
     
     print(f"\n>>> Visualization compilation complete! Saved to: {final_output_mp4}")

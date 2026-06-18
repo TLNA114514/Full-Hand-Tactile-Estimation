@@ -195,6 +195,8 @@ class Renderer:
             image = image + torch.tensor(self.cfg.MODEL.IMAGE_MEAN, device=image.device).reshape(3,1,1)
             image = image.permute(1, 2, 0).cpu().numpy()
 
+        import os
+        os.environ['PYOPENGL_PLATFORM'] = 'egl'
         renderer = pyrender.OffscreenRenderer(viewport_width=image.shape[1],
                                               viewport_height=image.shape[0],
                                               point_size=1.0)
@@ -344,6 +346,8 @@ class Renderer:
             is_right=None,
         ):
 
+        import os
+        os.environ['PYOPENGL_PLATFORM'] = 'egl'
         renderer = pyrender.OffscreenRenderer(viewport_width=render_res[0],
                                               viewport_height=render_res[1],
                                               point_size=1.0)
