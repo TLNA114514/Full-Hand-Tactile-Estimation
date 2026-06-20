@@ -57,7 +57,7 @@ def process_opentouch(h5_path):
                 return counts_all, counts_active, metrics_list
             for demo_name in f['data']:
                 demo = f['data'][demo_name]
-                for key in ["left_pressure_continuous", "right_pressure_continuous"]:
+                for key in ["left_pressure_continuous_subdiv", "right_pressure_continuous_subdiv"]:
                     if key in demo:
                         # 形状通常为 [T, N] (例如 OpenTouch 预处理好的 1D 数据) 或者 [T, H, W]
                         vals = demo[key][:]
