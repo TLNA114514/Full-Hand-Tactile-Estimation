@@ -1,0 +1,103 @@
+# Touch Anything Base Configuration
+
+# Model
+model:
+  name: "TouchAnything"
+  task: "pose_prediction"  # pose_prediction / tactile_prediction
+  
+  vision_encoder:
+    type: "dinov2"
+    model_name: "dinov2_vits14"  # dinov2_vits14 / dinov2_vitb14 / dinov2_vitl14
+    pretrained_path: "models/dinov2/dinov2_vits14_pretrain.pth"
+    freeze: true
+    patch_size: 14
+    embed_dim: 384  # vits: 384, vitb: 768, vitl: 1024
+  
+  temporal_transformer:
+    num_layers: 3
+    num_heads: 8
+    hidden_dim: 512
+    mlp_ratio: 4.0
+    dropout: 0.1
+    window_size: 16  # Temporal window size in frames
+  
+  pose_decoder:
+    type: "joint_query"  # mlp / attention / joint_query
+    hidden_dims: [512, 256, 128]  # used by mlp and attention types
+    output_dim: 144  # 48 joints * 3 coords (24 joints per hand, hands_only)
+    dropout: 0.1
+    num_query_layers: 2  # used by joint_query type
+    num_query_heads: 8   # used by joint_query and attention types
+
+# Data
+data:
+  dataset: "egodex_v2"  # Use fixed version with camera frame
+  data_root: "datasets/egodex/test/test"
+  train_split: 0.8
+  val_split: 0.1
+  test_split: 0.1
+  use_camera_frame: true  # Convert to camera coordinate frame
+  joint_set: "hands_only"  # hands_only (48 joints) or hands_arms (56 joints)
+  
+  # Preprocessing
+  image_size: [224, 224]  # Input image size
+  normalize_mean: [0.485, 0.456, 0.406]
+  normalize_std: [0.229, 0.224, 0.225]
+  
+  # Temporal
+  clip_length: 16  # Number of frames per clip
+  frame_interval: 1  # Frame interval
+  
+  # Augmentation
+  use_augmentation: false
+  random_crop: false
+  random_flip: false  # Horizontal flipping is usually not recommended for egocentric videos
+  color_jitter: 0.2
+
+# Training
+training:
+  batch_size: 8
+  num_workers: 4
+  num_epochs: 100
+  
+  # Optimizer
+  optimizer:
+    type: "adamw"
+    lr: 1.0e-4
+    weight_decay: 0.05
+    betas: [0.9, 0.999]
+  
+  # Scheduler
+  scheduler:
+    type: "cosine"
+    warmup_epochs: 5
+    min_lr: 1.0e-6
+  
+  # Loss
+  loss:
+    pose_loss_weight: 1.0
+    use_confidence_weighting: true  # Use confidence weighting
+  
+  # Checkpointing
+  save_interval: 5  # Save once every 5 epochs
+  keep_last_n: 3  # Keep the most recent 3 checkpoints
+  
+  # Logging
+  log_interval: 10  # Log once every 10 batches
+  val_interval: 1  # Validate once every epoch
+
+# Evaluation
+evaluation:
+  metrics:
+    - "mpjpe"  # Mean Per Joint Position Error
+    - "pa_mpjpe"  # Procrustes Aligned MPJPE
+    - "pck"  # Percentage of Correct Keypoints
+  pck_threshold: 0.05  # 5cm
+
+# System
+system:
+  seed: 42
+  device: "cuda"
+  gpu_ids: [0]  # GPU list, e.g. [0,1,2,3] uses 4 GPUs
+  mixed_precision: true  # Enable mixed-precision training
+  cudnn_benchmark: true

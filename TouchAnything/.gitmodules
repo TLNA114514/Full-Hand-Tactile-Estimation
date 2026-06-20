@@ -1,0 +1,12 @@
+[submodule "third_party/hamer"]
+	path = third_party/hamer
+	url = https://github.com/FeiyangHong/hamer_for_touchanything.git
+	branch = touchanything
+[submodule "third_party/chumpy"]
+	path = third_party/chumpy
+	url = https://github.com/mattloper/chumpy.git
+	branch = master
+[submodule "third_party/EasyMocap"]
+	path = third_party/EasyMocap
+	url = https://github.com/zju3dv/EasyMocap.git
+	branch = master

@@ -1,0 +1,802 @@
+{
+  "version": 1,
+  "description": "Hand joint positions in tactile grid coordinates",
+  "coordinate_space": "display_grid_21x21",
+  "grid_size": 21,
+  "left": [
+    {
+      "key": "7,1",
+      "row": 7,
+      "col": 1,
+      "sensor": 222
+    },
+    {
+      "key": "7,2",
+      "row": 7,
+      "col": 2,
+      "sensor": 221
+    },
+    {
+      "key": "7,3",
+      "row": 7,
+      "col": 3,
+      "sensor": 220
+    },
+    {
+      "key": "8,1",
+      "row": 8,
+      "col": 1,
+      "sensor": 222
+    },
+    {
+      "key": "8,2",
+      "row": 8,
+      "col": 2,
+      "sensor": 221
+    },
+    {
+      "key": "8,3",
+      "row": 8,
+      "col": 3,
+      "sensor": 220
+    },
+    {
+      "key": "9,1",
+      "row": 9,
+      "col": 1,
+      "sensor": 222
+    },
+    {
+      "key": "9,2",
+      "row": 9,
+      "col": 2,
+      "sensor": 221
+    },
+    {
+      "key": "9,3",
+      "row": 9,
+      "col": 3,
+      "sensor": 220
+    },
+    {
+      "key": "10,1",
+      "row": 10,
+      "col": 1,
+      "sensor": 222
+    },
+    {
+      "key": "10,2",
+      "row": 10,
+      "col": 2,
+      "sensor": 221
+    },
+    {
+      "key": "10,3",
+      "row": 10,
+      "col": 3,
+      "sensor": 220
+    },
+    {
+      "key": "11,1",
+      "row": 11,
+      "col": 1,
+      "sensor": 222
+    },
+    {
+      "key": "11,2",
+      "row": 11,
+      "col": 2,
+      "sensor": 221
+    },
+    {
+      "key": "11,3",
+      "row": 11,
+      "col": 3,
+      "sensor": 220
+    },
+    {
+      "key": "7,5",
+      "row": 7,
+      "col": 5,
+      "sensor": 219
+    },
+    {
+      "key": "7,6",
+      "row": 7,
+      "col": 6,
+      "sensor": 218
+    },
+    {
+      "key": "7,7",
+      "row": 7,
+      "col": 7,
+      "sensor": 217
+    },
+    {
+      "key": "8,5",
+      "row": 8,
+      "col": 5,
+      "sensor": 219
+    },
+    {
+      "key": "8,6",
+      "row": 8,
+      "col": 6,
+      "sensor": 218
+    },
+    {
+      "key": "8,7",
+      "row": 8,
+      "col": 7,
+      "sensor": 217
+    },
+    {
+      "key": "9,5",
+      "row": 9,
+      "col": 5,
+      "sensor": 219
+    },
+    {
+      "key": "9,6",
+      "row": 9,
+      "col": 6,
+      "sensor": 218
+    },
+    {
+      "key": "9,7",
+      "row": 9,
+      "col": 7,
+      "sensor": 217
+    },
+    {
+      "key": "10,5",
+      "row": 10,
+      "col": 5,
+      "sensor": 219
+    },
+    {
+      "key": "10,6",
+      "row": 10,
+      "col": 6,
+      "sensor": 218
+    },
+    {
+      "key": "10,7",
+      "row": 10,
+      "col": 7,
+      "sensor": 217
+    },
+    {
+      "key": "11,5",
+      "row": 11,
+      "col": 5,
+      "sensor": 219
+    },
+    {
+      "key": "11,6",
+      "row": 11,
+      "col": 6,
+      "sensor": 218
+    },
+    {
+      "key": "11,7",
+      "row": 11,
+      "col": 7,
+      "sensor": 217
+    },
+    {
+      "key": "7,9",
+      "row": 7,
+      "col": 9,
+      "sensor": 216
+    },
+    {
+      "key": "7,10",
+      "row": 7,
+      "col": 10,
+      "sensor": 215
+    },
+    {
+      "key": "7,11",
+      "row": 7,
+      "col": 11,
+      "sensor": 214
+    },
+    {
+      "key": "8,9",
+      "row": 8,
+      "col": 9,
+      "sensor": 216
+    },
+    {
+      "key": "8,10",
+      "row": 8,
+      "col": 10,
+      "sensor": 215
+    },
+    {
+      "key": "8,11",
+      "row": 8,
+      "col": 11,
+      "sensor": 214
+    },
+    {
+      "key": "9,9",
+      "row": 9,
+      "col": 9,
+      "sensor": 216
+    },
+    {
+      "key": "9,10",
+      "row": 9,
+      "col": 10,
+      "sensor": 215
+    },
+    {
+      "key": "9,11",
+      "row": 9,
+      "col": 11,
+      "sensor": 214
+    },
+    {
+      "key": "10,9",
+      "row": 10,
+      "col": 9,
+      "sensor": 216
+    },
+    {
+      "key": "10,10",
+      "row": 10,
+      "col": 10,
+      "sensor": 215
+    },
+    {
+      "key": "10,11",
+      "row": 10,
+      "col": 11,
+      "sensor": 214
+    },
+    {
+      "key": "11,9",
+      "row": 11,
+      "col": 9,
+      "sensor": 216
+    },
+    {
+      "key": "11,10",
+      "row": 11,
+      "col": 10,
+      "sensor": 215
+    },
+    {
+      "key": "11,11",
+      "row": 11,
+      "col": 11,
+      "sensor": 214
+    },
+    {
+      "key": "7,13",
+      "row": 7,
+      "col": 13,
+      "sensor": 213
+    },
+    {
+      "key": "7,14",
+      "row": 7,
+      "col": 14,
+      "sensor": 212
+    },
+    {
+      "key": "7,15",
+      "row": 7,
+      "col": 15,
+      "sensor": 211
+    },
+    {
+      "key": "8,13",
+      "row": 8,
+      "col": 13,
+      "sensor": 213
+    },
+    {
+      "key": "8,14",
+      "row": 8,
+      "col": 14,
+      "sensor": 212
+    },
+    {
+      "key": "8,15",
+      "row": 8,
+      "col": 15,
+      "sensor": 211
+    },
+    {
+      "key": "9,13",
+      "row": 9,
+      "col": 13,
+      "sensor": 213
+    },
+    {
+      "key": "9,14",
+      "row": 9,
+      "col": 14,
+      "sensor": 212
+    },
+    {
+      "key": "9,15",
+      "row": 9,
+      "col": 15,
+      "sensor": 211
+    },
+    {
+      "key": "10,13",
+      "row": 10,
+      "col": 13,
+      "sensor": 213
+    },
+    {
+      "key": "10,14",
+      "row": 10,
+      "col": 14,
+      "sensor": 212
+    },
+    {
+      "key": "10,15",
+      "row": 10,
+      "col": 15,
+      "sensor": 211
+    },
+    {
+      "key": "11,13",
+      "row": 11,
+      "col": 13,
+      "sensor": 213
+    },
+    {
+      "key": "11,14",
+      "row": 11,
+      "col": 14,
+      "sensor": 212
+    },
+    {
+      "key": "11,15",
+      "row": 11,
+      "col": 15,
+      "sensor": 211
+    },
+    {
+      "key": "11,17",
+      "row": 11,
+      "col": 17,
+      "sensor": 210
+    },
+    {
+      "key": "11,18",
+      "row": 11,
+      "col": 18,
+      "sensor": 209
+    },
+    {
+      "key": "11,19",
+      "row": 11,
+      "col": 19,
+      "sensor": 208
+    },
+    {
+      "key": "12,17",
+      "row": 12,
+      "col": 17,
+      "sensor": 210
+    },
+    {
+      "key": "12,18",
+      "row": 12,
+      "col": 18,
+      "sensor": 209
+    },
+    {
+      "key": "12,19",
+      "row": 12,
+      "col": 19,
+      "sensor": 208
+    }
+  ],
+  "right": [
+    {
+      "key": "11,1",
+      "row": 11,
+      "col": 1,
+      "sensor": 222
+    },
+    {
+      "key": "11,2",
+      "row": 11,
+      "col": 2,
+      "sensor": 221
+    },
+    {
+      "key": "11,3",
+      "row": 11,
+      "col": 3,
+      "sensor": 220
+    },
+    {
+      "key": "7,5",
+      "row": 7,
+      "col": 5,
+      "sensor": 219
+    },
+    {
+      "key": "7,6",
+      "row": 7,
+      "col": 6,
+      "sensor": 218
+    },
+    {
+      "key": "7,7",
+      "row": 7,
+      "col": 7,
+      "sensor": 217
+    },
+    {
+      "key": "8,5",
+      "row": 8,
+      "col": 5,
+      "sensor": 219
+    },
+    {
+      "key": "8,6",
+      "row": 8,
+      "col": 6,
+      "sensor": 218
+    },
+    {
+      "key": "8,7",
+      "row": 8,
+      "col": 7,
+      "sensor": 217
+    },
+    {
+      "key": "9,5",
+      "row": 9,
+      "col": 5,
+      "sensor": 219
+    },
+    {
+      "key": "9,6",
+      "row": 9,
+      "col": 6,
+      "sensor": 218
+    },
+    {
+      "key": "9,7",
+      "row": 9,
+      "col": 7,
+      "sensor": 217
+    },
+    {
+      "key": "10,5",
+      "row": 10,
+      "col": 5,
+      "sensor": 219
+    },
+    {
+      "key": "10,6",
+      "row": 10,
+      "col": 6,
+      "sensor": 218
+    },
+    {
+      "key": "10,7",
+      "row": 10,
+      "col": 7,
+      "sensor": 217
+    },
+    {
+      "key": "11,5",
+      "row": 11,
+      "col": 5,
+      "sensor": 219
+    },
+    {
+      "key": "11,6",
+      "row": 11,
+      "col": 6,
+      "sensor": 218
+    },
+    {
+      "key": "11,7",
+      "row": 11,
+      "col": 7,
+      "sensor": 217
+    },
+    {
+      "key": "7,9",
+      "row": 7,
+      "col": 9,
+      "sensor": 216
+    },
+    {
+      "key": "7,10",
+      "row": 7,
+      "col": 10,
+      "sensor": 215
+    },
+    {
+      "key": "7,11",
+      "row": 7,
+      "col": 11,
+      "sensor": 214
+    },
+    {
+      "key": "8,9",
+      "row": 8,
+      "col": 9,
+      "sensor": 216
+    },
+    {
+      "key": "8,10",
+      "row": 8,
+      "col": 10,
+      "sensor": 215
+    },
+    {
+      "key": "8,11",
+      "row": 8,
+      "col": 11,
+      "sensor": 214
+    },
+    {
+      "key": "9,9",
+      "row": 9,
+      "col": 9,
+      "sensor": 216
+    },
+    {
+      "key": "9,10",
+      "row": 9,
+      "col": 10,
+      "sensor": 215
+    },
+    {
+      "key": "9,11",
+      "row": 9,
+      "col": 11,
+      "sensor": 214
+    },
+    {
+      "key": "10,9",
+      "row": 10,
+      "col": 9,
+      "sensor": 216
+    },
+    {
+      "key": "10,10",
+      "row": 10,
+      "col": 10,
+      "sensor": 215
+    },
+    {
+      "key": "10,11",
+      "row": 10,
+      "col": 11,
+      "sensor": 214
+    },
+    {
+      "key": "11,9",
+      "row": 11,
+      "col": 9,
+      "sensor": 216
+    },
+    {
+      "key": "11,10",
+      "row": 11,
+      "col": 10,
+      "sensor": 215
+    },
+    {
+      "key": "11,11",
+      "row": 11,
+      "col": 11,
+      "sensor": 214
+    },
+    {
+      "key": "7,13",
+      "row": 7,
+      "col": 13,
+      "sensor": 213
+    },
+    {
+      "key": "7,14",
+      "row": 7,
+      "col": 14,
+      "sensor": 212
+    },
+    {
+      "key": "7,15",
+      "row": 7,
+      "col": 15,
+      "sensor": 211
+    },
+    {
+      "key": "8,13",
+      "row": 8,
+      "col": 13,
+      "sensor": 213
+    },
+    {
+      "key": "8,14",
+      "row": 8,
+      "col": 14,
+      "sensor": 212
+    },
+    {
+      "key": "8,15",
+      "row": 8,
+      "col": 15,
+      "sensor": 211
+    },
+    {
+      "key": "9,13",
+      "row": 9,
+      "col": 13,
+      "sensor": 213
+    },
+    {
+      "key": "9,14",
+      "row": 9,
+      "col": 14,
+      "sensor": 212
+    },
+    {
+      "key": "9,15",
+      "row": 9,
+      "col": 15,
+      "sensor": 211
+    },
+    {
+      "key": "10,13",
+      "row": 10,
+      "col": 13,
+      "sensor": 213
+    },
+    {
+      "key": "10,14",
+      "row": 10,
+      "col": 14,
+      "sensor": 212
+    },
+    {
+      "key": "10,15",
+      "row": 10,
+      "col": 15,
+      "sensor": 211
+    },
+    {
+      "key": "11,13",
+      "row": 11,
+      "col": 13,
+      "sensor": 213
+    },
+    {
+      "key": "11,14",
+      "row": 11,
+      "col": 14,
+      "sensor": 212
+    },
+    {
+      "key": "11,15",
+      "row": 11,
+      "col": 15,
+      "sensor": 211
+    },
+    {
+      "key": "7,17",
+      "row": 7,
+      "col": 17,
+      "sensor": 35
+    },
+    {
+      "key": "7,18",
+      "row": 7,
+      "col": 18,
+      "sensor": 34
+    },
+    {
+      "key": "7,19",
+      "row": 7,
+      "col": 19,
+      "sensor": 33
+    },
+    {
+      "key": "8,17",
+      "row": 8,
+      "col": 17,
+      "sensor": 35
+    },
+    {
+      "key": "8,18",
+      "row": 8,
+      "col": 18,
+      "sensor": 34
+    },
+    {
+      "key": "8,19",
+      "row": 8,
+      "col": 19,
+      "sensor": 33
+    },
+    {
+      "key": "9,17",
+      "row": 9,
+      "col": 17,
+      "sensor": 35
+    },
+    {
+      "key": "9,18",
+      "row": 9,
+      "col": 18,
+      "sensor": 34
+    },
+    {
+      "key": "9,19",
+      "row": 9,
+      "col": 19,
+      "sensor": 33
+    },
+    {
+      "key": "10,17",
+      "row": 10,
+      "col": 17,
+      "sensor": 35
+    },
+    {
+      "key": "10,18",
+      "row": 10,
+      "col": 18,
+      "sensor": 34
+    },
+    {
+      "key": "10,19",
+      "row": 10,
+      "col": 19,
+      "sensor": 33
+    },
+    {
+      "key": "11,17",
+      "row": 11,
+      "col": 17,
+      "sensor": 35
+    },
+    {
+      "key": "11,18",
+      "row": 11,
+      "col": 18,
+      "sensor": 34
+    },
+    {
+      "key": "11,19",
+      "row": 11,
+      "col": 19,
+      "sensor": 33
+    },
+    {
+      "key": "12,1",
+      "row": 12,
+      "col": 1,
+      "sensor": 47
+    },
+    {
+      "key": "12,2",
+      "row": 12,
+      "col": 2,
+      "sensor": 46
+    },
+    {
+      "key": "12,3",
+      "row": 12,
+      "col": 3,
+      "sensor": 45
+    }
+  ]
+}
