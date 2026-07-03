@@ -542,7 +542,7 @@ def main():
     parser.add_argument('--checkpoint', type=str, default="../hamer/_DATA/hamer_ckpts/checkpoints/hamer.ckpt", help='Hamer 模型 Checkpoint 路径')
     parser.add_argument('--model_cfg', type=str, default=None, help='模型配置文件路径 (用于微调后的模型)')
     parser.add_argument('--hdf5_path', type=str, default=None, help='OpenTouch HDF5 数据集文件路径 (用于单文件模式)')
-    parser.add_argument('--data_dir', type=str, default="/data/jiangrui/OpenTouch Data/data", help='提取的 HDF5 数据集目录 (用于 --split 模式)')
+    parser.add_argument('--data_dir', type=str, default="/data1/jiangrui/OpenTouch Data/data", help='提取的 HDF5 数据集目录 (用于 --split 模式)')
     parser.add_argument('--clips', nargs='*', default=None, help='需要评估的 Clips 列表 (可与 --split 结合使用来过滤特定 Clip)')
     parser.add_argument('--gpu', type=str, default='4', help='使用的 GPU 编号')
     parser.add_argument('--split', type=str, default=None, choices=['train', 'val', 'test', 'all'], help='评估的数据集划分')

@@ -102,7 +102,7 @@ sys.path.append(ft_dir)
 sys.path.append(preprocess_dir)
 
 # Import necessary dependencies
-from train import OpenTouchHAMER_TactileWrapper
+from train import OpenTouchHAMER_TactileWrapper, load_compatible_state_dict
 from eval_hamer import ViTDetDataset
 from vitpose_model import ViTPoseModel
 from hamer.utils import recursive_to
@@ -419,9 +419,13 @@ def load_models(checkpoint_path, device):
         
     print(">>> Initializing OpenTouchHAMER_TactileWrapper...")
     model = OpenTouchHAMER_TactileWrapper(cfg=model_cfg)
+    dummy_input = torch.zeros(1, 3, model_cfg.MODEL.IMAGE_SIZE, model_cfg.MODEL.IMAGE_SIZE)
+    with torch.no_grad():
+        dummy_feat = model.backbone(dummy_input[:, :, :, 32:-32])
+        model.tactile_head(dummy_feat)
+        print(f">>> Tactile head initialized with output dim: {model.tactile_dim}")
     print(f">>> Loading weights from checkpoint: {checkpoint_path}")
-    state_dict = torch.load(checkpoint_path, map_location="cpu")['state_dict']
-    model.load_state_dict(state_dict, strict=False)
+    load_compatible_state_dict(model, checkpoint_path)
     model = model.to(device)
     model.eval()
 
@@ -557,6 +561,54 @@ def render_tactile_sequence(pressure_seq, output_dir, demo_id, vmin, vmax, targe
         cv2.imwrite(os.path.join(output_dir, f"{demo_id}_{idx:05d}.png"), img_adj)
         
     print("Tactile rendering completed.")
+
+
+def render_subdiv_tactile_signal_sequence(tactile_seq, output_dir, demo_id, target_size=(1280, 960), temporal_alpha=0.4):
+    from matplotlib import cm
+    width, height = target_size
+
+    obj_path = _find_first_existing([
+        "mano_right_neutral_subdiv.obj",
+        os.path.join(preprocess_dir, "data", "mano_right_neutral_subdiv.obj"),
+        os.path.join(preprocess_dir, "scratch", "mano_right_neutral_subdiv.obj"),
+        os.path.join(preprocess_dir, "mano_right_neutral_subdiv.obj"),
+        os.path.join(workspace_dir, "data", "mano_right_neutral_subdiv.obj"),
+    ])
+    if obj_path is None:
+        raise FileNotFoundError("Missing mano_right_neutral_subdiv.obj")
+
+    mesh = trimesh.load(obj_path, process=False)
+    mano_vertices = np.asarray(mesh.vertices, dtype=np.float32)
+    mano_faces = np.asarray(mesh.faces, dtype=np.int32)
+
+    renderer = ManoRenderer(
+        image_size=(width, height),
+        focal_length=8000.0 * (width / 1280.0),
+        mano_vertices=mano_vertices,
+        mano_faces=mano_faces,
+    )
+
+    os.makedirs(output_dir, exist_ok=True)
+    prev = None
+    colormap_fn = lambda x: np.array(cm.gnuplot2(x))
+
+    print(f"Rendering subdiv tactile signal sequence to {output_dir}...")
+    for idx, signal in enumerate(tactile_seq):
+        signal = np.asarray(signal, dtype=np.float32)
+        if signal.shape[0] != mano_vertices.shape[0]:
+            raise ValueError(
+                f"Predicted tactile dim {signal.shape[0]} does not match subdiv vertex count {mano_vertices.shape[0]}"
+            )
+        if temporal_alpha and prev is not None:
+            signal = temporal_alpha * signal + (1.0 - temporal_alpha) * prev
+        prev = signal
+
+        color_new = np.clip(1.0 - signal, 0.0, 1.0)
+        img_bgr = renderer.render(vertex_colors=colormap_fn(color_new), colormap_fn=colormap_fn, smooth=True)
+        img_adj = cv2.convertScaleAbs(img_bgr, alpha=1.2, beta=0.1 * 255)
+        cv2.imwrite(os.path.join(output_dir, f"{demo_id}_{idx:05d}.png"), img_adj)
+
+    print("Subdiv tactile rendering completed.")
 
 
 def main():
@@ -762,7 +814,7 @@ def main():
     if first_valid_idx is None:
         print(">>> Warning: No hand detected in any frame of the video!")
         pred_joints_seq = np.zeros((num_frames, 21, 3), dtype=np.float32)
-        pred_tactile_seq = np.zeros((num_frames, 256), dtype=np.float32)
+        pred_tactile_seq = np.zeros((num_frames, model.tactile_dim), dtype=np.float32)
     else:
         for idx in range(first_valid_idx):
             pred_joints_list[idx] = pred_joints_list[first_valid_idx]
@@ -792,20 +844,12 @@ def main():
         use_cuda=(device.type == 'cuda'),
     )
 
-    # Step 5: Render Predicted Tactile using custom render_tactile_sequence matching export_tactile_mano
-    print("\n>>> [6/7] Rendering Predicted Tactile Heatmap...")
-    pred_pressure_seq = []
-    for pred_frame in pred_tactile_seq:
-        grid_pred = pred_frame.reshape(16, 16)
-        pressure_raw = np.clip(3072.0 - grid_pred * 3072.0, 0.0, 3072.0)
-        pred_pressure_seq.append(pressure_raw)
-        
-    render_tactile_sequence(
-        pressure_seq=pred_pressure_seq,
+    # Step 5: Render predicted tactile directly on the subdiv MANO vertices.
+    print("\n>>> [6/7] Rendering Predicted Subdiv Tactile Heatmap...")
+    render_subdiv_tactile_signal_sequence(
+        tactile_seq=pred_tactile_seq,
         output_dir=str(pred_touch_dir),
         demo_id=clip_id,
-        vmin=vmin,
-        vmax=vmax,
         target_size=target_size,
     )
 

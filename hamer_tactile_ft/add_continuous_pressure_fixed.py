@@ -255,15 +255,15 @@ def main():
     print("🚀 启动完美双轨道数据注入流 (PyTorch GPU 加速版)...")
     deps_low, deps_sub = load_all_deps()
     
-    # 1. /data/jiangrui/OpenTouch Data/data/
-    h5_dir = "/data/jiangrui/OpenTouch Data/data/"
+    # 1. /data1/jiangrui/OpenTouch Data/data/
+    h5_dir = "/data1/jiangrui/OpenTouch Data/data/"
     h5_files = glob.glob(os.path.join(h5_dir, "*.h5")) + glob.glob(os.path.join(h5_dir, "*.hdf5"))
     if len(h5_files) > 0:
         for h5f in tqdm(h5_files, desc="Processing HDF5 data files"):
             process_h5_file(h5f, deps_low, deps_sub)
             
-    # 2. /data/jiangrui/OpenTouch Data/extracted_dataset/
-    ext_dir = "/data/jiangrui/OpenTouch Data/extracted_dataset/"
+    # 2. /data1/jiangrui/OpenTouch Data/extracted_dataset/
+    ext_dir = "/data1/jiangrui/OpenTouch Data/extracted_dataset/"
     if os.path.exists(ext_dir):
         process_extracted_dataset(ext_dir, deps_low, deps_sub)
 

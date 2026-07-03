@@ -222,7 +222,7 @@ def parse_args():
     parser.add_argument("--checkpoint", type=str, default=os.path.join(workspace_dir, "hamer/_DATA/hamer_ckpts/checkpoints/hamer.ckpt"), help="Path to pretrained Hamer checkpoint")
     parser.add_argument("--split_json", type=str, default=os.path.join(workspace_dir, "evaluation/opentouch_splits.json"), help="Splits JSON path")
     parser.add_argument("--bbox_json", type=str, default=os.path.join(ft_dir, "opentouch_train_val_bboxes.json"), help="BBox JSON path")
-    parser.add_argument("--data_dir", type=str, default="/data/jiangrui/OpenTouch Data/extracted_dataset", help="Data folder path")
+    parser.add_argument("--data_dir", type=str, default="/data1/jiangrui/OpenTouch Data/extracted_dataset", help="Data folder path")
     
     # Multi-GPU training support
     parser.add_argument("--gpus", type=str, default="4", help="GPU indices (comma-separated, e.g. 4,5)")

@@ -9,8 +9,8 @@ os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
 def extract_dataset():
     # 路径配置
     bbox_json_path = "/code/users/jiangrui/Full-Hand-Tactile-Estimation/opentouch_hamer_ft/opentouch_train_val_bboxes.json"
-    data_dir = "/data/jiangrui/OpenTouch Data/data"
-    output_dir = "/data/jiangrui/OpenTouch Data/extracted_dataset"
+    data_dir = "/data1/jiangrui/OpenTouch Data/data"
+    output_dir = "/data1/jiangrui/OpenTouch Data/extracted_dataset"
     
     # 划分文件配置
     splits_json_path = "/code/users/jiangrui/Full-Hand-Tactile-Estimation/evaluation/opentouch_splits.json"

@@ -13,7 +13,7 @@ def dump_h5_structure(h5_path, output_txt):
 
 if __name__ == "__main__":
     # 以 demo_85 为例，或者读取整个文件结构
-    data_dir = "/data/jiangrui/OpenTouch Data/data"
+    data_dir = "/data1/jiangrui/OpenTouch Data/data"
     scene = "home_kitchen_p3"
     h5_path = f"{data_dir}/{scene}.hdf5"
     output_path = "/code/users/jiangrui/Full-Hand-Tactile-Estimation/opentouch_hamer_ft/opentouch_hdf5_structure.txt"

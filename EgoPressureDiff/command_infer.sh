@@ -1,0 +1,20 @@
+
+CUDA_VISIBLE_DEVICES=0 python inference_hand.py \
+  --pretrained_model_name_or_path="./checkpoints/stable-video-diffusion-img2vid-xt" \
+  --validation_dir="./Final_Data-bare_hand/p007-Dumbbell-repeat0000" \
+  --output_dir="./outputs/Final_Data/p007-Dumbbell-repeat0000" \
+  --width=256 \
+  --height=256 \
+  --sample_n_frames=64 \
+  --sample_frame_rate=5 \
+  --guidance_scale=3.0 \
+  --num_inference_steps=25 \
+  --masknet_model_name_or_path="./checkpoints/checkpoint-40000/mask_net-40000.pth" \
+  --unet_model_name_or_path="./checkpoints/checkpoint-40000/unet-40000.pth" \
+  --tile_size=16 \
+  --frames_overlap=4 \
+  --decode_chunk_size=8 \
+  --prototype_left_path="./V2P_data/prototype_left.png" \
+  --prototype_right_path="./V2P_data/prototype_right.png" \
+  --mask_left_path="./V2P_data/mask_left.png" \
+  --mask_right_path="./V2P_data/mask_right.png"

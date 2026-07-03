@@ -9,8 +9,9 @@ PATH_MAPPINGS = {
     "/code/users/jiangrui/Full-Hand-Tactile-Estimation": "/home/ma-user/work/cfzhao/Full-Hand-Tactile-Estimation",
     
     # 替换数据集目录（请把下面的远端路径换成你实际在 ModelArts 上的数据集绝对路径）
-    "/data/jiangrui/OpenTouch Data": "/home/ma-user/work/cfzhao/OpenTouch Data", 
-    "/data/jiangrui/EgoTouch/": "/home/ma-user/work/cfzhao/EgoTouch/"
+    "/data1/jiangrui/OpenTouch Data": "/home/ma-user/work/cfzhao/OpenTouch Data", 
+    "/data1/jiangrui/EgoTouch/": "/home/ma-user/work/cfzhao/EgoTouch/",
+    "/data1/jiangrui/EgoTactile/": "/home/ma-user/work/cfzhao/EgoTactile/"
     # 你可以继续在这里无限添加你需要自动替换的字符串
 }
 

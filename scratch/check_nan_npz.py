@@ -1,7 +1,7 @@
 import numpy as np
 import sys
 
-npz_path = "/data/jiangrui/EgoTouch/Home/arrange_pillow/20260412_101136_379/pressure_grids.npz"
+npz_path = "/data1/jiangrui/EgoTouch/Home/arrange_pillow/20260412_101136_379/pressure_grids.npz"
 data = np.load(npz_path)
 
 for key in ['left_pressure_grid', 'right_pressure_grid']:

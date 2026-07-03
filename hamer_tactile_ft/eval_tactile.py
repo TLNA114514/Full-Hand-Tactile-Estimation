@@ -403,7 +403,7 @@ def main():
     parser = argparse.ArgumentParser(description='Hamer Tactile Head Evaluation')
     parser.add_argument('--checkpoint', type=str, required=True, help='Trained Tactile Checkpoint 路径')
     parser.add_argument('--hdf5_path', type=str, default=None)
-    parser.add_argument('--data_dir', type=str, default="/data/jiangrui/OpenTouch Data/data")
+    parser.add_argument('--data_dir', type=str, default="/data1/jiangrui/OpenTouch Data/data")
     parser.add_argument('--gpu', type=str, default='4')
     parser.add_argument('--split', type=str, default='test', choices=['train', 'val', 'test', 'all'])
     parser.add_argument('--split_json', type=str, default=os.path.join(eval_dir, "opentouch_splits.json"))

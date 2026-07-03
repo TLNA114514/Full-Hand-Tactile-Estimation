@@ -99,6 +99,53 @@ sys.path.append(ft_dir)
 from dataset import OpenTouchTactileDataset
 from hamer_tactile import HAMER_Tactile
 
+DATASET_ROOTS = {
+    "opentouch": "/data1/jiangrui/OpenTouch Data/full_dataset",
+    "open_touch": "/data1/jiangrui/OpenTouch Data/full_dataset",
+    "ot": "/data1/jiangrui/OpenTouch Data/full_dataset",
+    "touchanything": "/data1/jiangrui/EgoTouch/extracted_frames",
+    "touch_anything": "/data1/jiangrui/EgoTouch/extracted_frames",
+    "egotouch": "/data1/jiangrui/EgoTouch/extracted_frames",
+    "ego_touch": "/data1/jiangrui/EgoTouch/extracted_frames",
+    "ta": "/data1/jiangrui/EgoTouch/extracted_frames",
+    "egotactile": "/data1/jiangrui/EgoTactile/Raw_data/extracted_frames",
+    "ego_tactile": "/data1/jiangrui/EgoTactile/Raw_data/extracted_frames",
+    "ego": "/data1/jiangrui/EgoTactile/Raw_data/extracted_frames",
+}
+
+
+def _split_csv(value):
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [item.strip() for item in str(value).split(",") if item.strip()]
+
+
+def resolve_data_dirs(args):
+    data_dirs = []
+
+    for dataset_name in _split_csv(args.datasets):
+        key = dataset_name.lower()
+        if key not in DATASET_ROOTS:
+            known = ", ".join(sorted(set(DATASET_ROOTS.keys())))
+            raise ValueError(f"Unknown dataset name '{dataset_name}'. Known names/aliases: {known}")
+        data_dirs.append(DATASET_ROOTS[key])
+
+    data_dirs.extend(_split_csv(args.data_dir))
+
+    if not data_dirs:
+        data_dirs.append(DATASET_ROOTS["opentouch"])
+
+    deduped = []
+    seen = set()
+    for path in data_dirs:
+        if path not in seen:
+            deduped.append(path)
+            seen.add(path)
+    return deduped
+
+
 class OpenTouchHAMER_TactileWrapper(HAMER_Tactile):
     def __init__(self, cfg, learning_rate=1e-4):
         # Initialize without loading rendering to save GPU memory
@@ -198,17 +245,66 @@ class OpenTouchHAMER_TactileWrapper(HAMER_Tactile):
             }
         }
 
+
+def load_compatible_state_dict(model, checkpoint_path):
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
+    model_state = model.state_dict()
+
+    compatible_state = {}
+    skipped = []
+    for key, value in state_dict.items():
+        if key not in model_state:
+            compatible_state[key] = value
+            continue
+        if tuple(model_state[key].shape) == tuple(value.shape):
+            compatible_state[key] = value
+        else:
+            skipped.append((key, tuple(value.shape), tuple(model_state[key].shape)))
+
+    missing, unexpected = model.load_state_dict(compatible_state, strict=False)
+    if skipped:
+        print("Skipped incompatible checkpoint tensors:")
+        for key, old_shape, new_shape in skipped:
+            print(f"  {key}: checkpoint {old_shape} -> model {new_shape}")
+    return missing, unexpected
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Fine-tune Hamer Tactile Head")
     # Default to the fine-tuned checkpoint!
     parser.add_argument("--checkpoint", type=str, default=os.path.join(workspace_dir, "opentouch_hamer_ft/checkpoints/regression_wocam_60/best_ft_model.ckpt"), help="Path to fine-tuned Hamer checkpoint")
-    parser.add_argument("--data_dir", type=str, default="/data/jiangrui/OpenTouch Data/extracted_dataset", help="Data folder path")
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        default=None,
+        help=(
+            "One or more explicit extracted dataset roots. Use comma-separated paths for mixed training. "
+            "If omitted, --datasets is resolved to the default processed roots."
+        ),
+    )
+    parser.add_argument(
+        "--datasets",
+        type=str,
+        default=None,
+        help=(
+            "Dataset names/aliases to train on, comma-separated. Supported: "
+            "opentouch/ot, touchanything/egotouch/ta, egotactile/ego. "
+            "Explicit --data_dir paths are appended after these resolved roots. "
+            "If both --datasets and --data_dir are omitted, defaults to opentouch."
+        ),
+    )
     
     parser.add_argument("--gpus", type=str, default="4", help="GPU indices (comma-separated, e.g. 4,5)")
     parser.add_argument("--lr", type=float, default=1e-4, help="Base learning rate (per GPU)")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size per GPU")
     parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of workers for DataLoader")
+    parser.add_argument("--index_workers", type=int, default=1, help="Processes for initial meta.json index scanning")
+    parser.add_argument("--index_chunksize", type=int, default=256, help="Chunk size for parallel index scanning")
+    parser.add_argument("--index_cache_dir", type=str, default=os.path.join(ft_dir, "index_cache"), help="Shared JSONL cache for scanned dataset indices")
+    parser.add_argument("--rebuild_index", action="store_true", help="Force rank 0 to rebuild the index cache")
+    parser.add_argument("--index_cache_timeout", type=int, default=3600, help="Seconds nonzero ranks wait for index cache")
     parser.add_argument("--use_wandb", action="store_true", help="Enable Weights & Biases logging")
     parser.add_argument("--exp_name", type=str, default="tactile_ft", help="Experiment name")
     parser.add_argument("--quick_test", action="store_true", help="Run a quick test training")
@@ -217,6 +313,10 @@ def parse_args():
 
 def main():
     args = parse_args()
+    data_dirs = resolve_data_dirs(args)
+    print("Resolved training data roots:")
+    for data_dir in data_dirs:
+        print(f"  - {data_dir}")
     
     hamer_root = os.path.join(workspace_dir, "hamer")
     os.chdir(hamer_root)
@@ -256,32 +356,39 @@ def main():
         learning_rate=lr_scaled
     )
     
-    print("Loading weights from fine-tuned model...")
-    state_dict = torch.load(args.checkpoint, map_location="cpu")['state_dict']
-    
-    # Load strictly the matching keys, skipping tactile_head which is new
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    print(f"Missing keys during load (should only be tactile_head): {len(missing)}")
-    
-    # Do a dummy forward pass to initialize the LazyLinear in tactile_head
+    # Do a dummy forward pass to initialize lazy layers before shape-aware loading.
     dummy_input = torch.zeros(1, 3, model_cfg.MODEL.IMAGE_SIZE, model_cfg.MODEL.IMAGE_SIZE)
     with torch.no_grad():
         dummy_feat = model.backbone(dummy_input[:, :, :, 32:-32])
         model.tactile_head(dummy_feat)
-        print("LazyLinear in tactile_head has been initialized.")
+        print(f"Tactile head initialized with output dim: {model.tactile_dim}")
+
+    print("Loading compatible weights from fine-tuned model...")
+    missing, unexpected = load_compatible_state_dict(model, args.checkpoint)
+    print(f"Missing keys during load: {len(missing)}")
         
     train_dataset = OpenTouchTactileDataset(
         cfg=model_cfg,
         split="train",
-        data_dir=args.data_dir,
-        train=True
+        data_dir=data_dirs,
+        train=True,
+        index_workers=args.index_workers,
+        index_chunksize=args.index_chunksize,
+        index_cache_dir=args.index_cache_dir,
+        rebuild_index=args.rebuild_index,
+        index_cache_timeout=args.index_cache_timeout,
     )
     
     val_dataset = OpenTouchTactileDataset(
         cfg=model_cfg,
         split="val",
-        data_dir=args.data_dir,
-        train=False
+        data_dir=data_dirs,
+        train=False,
+        index_workers=args.index_workers,
+        index_chunksize=args.index_chunksize,
+        index_cache_dir=args.index_cache_dir,
+        rebuild_index=args.rebuild_index,
+        index_cache_timeout=args.index_cache_timeout,
     )
     
     if args.quick_test:
@@ -289,12 +396,25 @@ def main():
         val_dataset.samples = val_dataset.samples[:32]
         args.epochs = 1
         args.num_workers = 0
+
+    if len(train_dataset) == 0:
+        raise RuntimeError(
+            "Training dataset is empty after scanning resolved roots. "
+            "Check --datasets/--data_dir and the extracted meta.json structure."
+        )
         
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
+    val_loader = None
+    if len(val_dataset) > 0:
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
+    else:
+        print("Validation dataset is empty; training will run without validation metrics/checkpoint monitoring.")
     
     ckpt_dir = os.path.join(ft_dir, "checkpoints", args.exp_name) if not args.quick_test else os.path.join(ft_dir, "checkpoints_test")
-    checkpoint_callback = ModelCheckpoint(dirpath=ckpt_dir, filename="best_tactile_model", monitor="val/loss_tactile", mode="min", save_top_k=1, save_last=True)
+    if val_loader is None:
+        checkpoint_callback = ModelCheckpoint(dirpath=ckpt_dir, filename="tactile_model", save_top_k=0, save_last=True)
+    else:
+        checkpoint_callback = ModelCheckpoint(dirpath=ckpt_dir, filename="best_tactile_model", monitor="val/loss_tactile", mode="min", save_top_k=1, save_last=True)
     lr_monitor = LearningRateMonitor(logging_interval="step")
     
     strategy = "ddp_find_unused_parameters_true" if num_gpus > 1 else "auto"
@@ -316,8 +436,13 @@ def main():
         log_every_n_steps=10
     )
     
-    trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
-    print(f"\nFine-tuning completed. Best checkpoint saved at: {checkpoint_callback.best_model_path}")
+    if val_loader is None:
+        trainer.fit(model, train_dataloaders=train_loader)
+    else:
+        trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+
+    saved_path = checkpoint_callback.best_model_path or checkpoint_callback.last_model_path
+    print(f"\nFine-tuning completed. Checkpoint saved at: {saved_path}")
 
 if __name__ == "__main__":
     main()

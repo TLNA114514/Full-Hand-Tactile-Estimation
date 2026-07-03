@@ -8,8 +8,11 @@ DEST_BASE="/code/users/jiangrui/full_hand_tactile_estimation"
 # 以后如果想同步新的文件夹，直接在这里换行添加名字即可！
 SYNC_DIRS=(
     "evaluation"
-    "opentouch_hamer_ft"
     "hamer_tactile_ft"
+    "hamer_tactile_infiller"
+    "opentouch_hamer_ft"
+    "preprocess"
+    "scratch"
     # "未来你想同步的新文件夹A"
     # "未来你想同步的新文件夹B"
 )

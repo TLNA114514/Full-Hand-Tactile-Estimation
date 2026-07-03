@@ -72,7 +72,7 @@ def analyze_npz(filepath):
         return f"Error reading {filepath}: {e}"
 
 def main():
-    base_dir = "/data/jiangrui/EgoTouch"
+    base_dir = "/data1/jiangrui/EgoTouch"
     categories = ["Home", "Office", "Outdoor", "Retail", "Workbench"]
     
     expected_files = {

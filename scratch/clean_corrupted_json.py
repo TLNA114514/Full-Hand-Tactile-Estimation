@@ -4,7 +4,7 @@ import json
 import shutil
 from tqdm import tqdm
 
-dataset_dir = "/data/jiangrui/OpenTouch Data/extracted_dataset/"
+dataset_dir = "/data1/jiangrui/OpenTouch Data/extracted_dataset/"
 meta_files = glob.glob(os.path.join(dataset_dir, "*", "*", "meta.json"))
 
 broken_count = 0

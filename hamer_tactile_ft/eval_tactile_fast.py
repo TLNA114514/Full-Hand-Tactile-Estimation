@@ -91,13 +91,26 @@ sys.path.append(os.path.join(base_dir, 'hamer_tactile_ft'))
 
 from hamer.configs import get_config
 from train import OpenTouchHAMER_TactileWrapper
+from train import load_compatible_state_dict
+from train import resolve_data_dirs
 from dataset import OpenTouchTactileDataset
 from hamer.utils import recursive_to
 
 def main():
     parser = argparse.ArgumentParser(description='Hamer Tactile Fast Evaluation using Extracted Dataset')
     parser.add_argument('--checkpoint', type=str, required=True, help='Trained Tactile Checkpoint 路径')
-    parser.add_argument('--data_dir', type=str, default="/data/jiangrui/OpenTouch Data/extracted_dataset")
+    parser.add_argument(
+        '--data_dir',
+        type=str,
+        default=None,
+        help='Explicit extracted dataset root(s), comma-separated. Appended after --datasets if both are provided.',
+    )
+    parser.add_argument(
+        '--datasets',
+        type=str,
+        default=None,
+        help='Dataset names/aliases, comma-separated: opentouch/ot, touchanything/egotouch/ta, egotactile/ego.',
+    )
     parser.add_argument('--split', type=str, default='test', choices=['train', 'val', 'test'])
     parser.add_argument('--gpu', type=str, default='4')
     parser.add_argument('--batch_size', type=int, default=64)
@@ -105,6 +118,10 @@ def main():
     parser.add_argument('--contact_thr', type=float, default=0.00, help='Threshold for defining contact (0-1)')
     parser.add_argument('--render_platform', type=str, default='egl', choices=['egl', 'osmesa'], help='Rendering platform (egl or osmesa)')
     args = parser.parse_args()
+    data_dirs = resolve_data_dirs(args)
+    print("Resolved evaluation data roots:")
+    for data_dir in data_dirs:
+        print(f"  - {data_dir}")
     
     os.chdir(os.path.join(base_dir, 'hamer'))
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
@@ -122,14 +139,19 @@ def main():
         model_cfg.freeze()
         
     model = OpenTouchHAMER_TactileWrapper(cfg=model_cfg)
+    dummy_input = torch.zeros(1, 3, model_cfg.MODEL.IMAGE_SIZE, model_cfg.MODEL.IMAGE_SIZE)
+    with torch.no_grad():
+        dummy_feat = model.backbone(dummy_input[:, :, :, 32:-32])
+        model.tactile_head(dummy_feat)
+        print(f"Tactile head initialized with output dim: {model.tactile_dim}")
+
     print(f"📦 Loading checkpoint from: {args.checkpoint}")
-    state_dict = torch.load(args.checkpoint, map_location="cpu")['state_dict']
-    model.load_state_dict(state_dict, strict=False)
+    load_compatible_state_dict(model, args.checkpoint)
     model = model.to(device)
     model.eval()
     
     print(f"📦 加载 {args.split} 划分集...")
-    dataset = OpenTouchTactileDataset(model_cfg, split=args.split, data_dir=args.data_dir, train=False)
+    dataset = OpenTouchTactileDataset(model_cfg, split=args.split, data_dir=data_dirs, train=False)
     dataloader = torch.utils.data.DataLoader(
         dataset, 
         batch_size=args.batch_size, 
@@ -162,8 +184,8 @@ def main():
             traceback.print_exc()
             continue
             
-        pred_tactile = out['pred_tactile'].detach().cpu().numpy() # [B, 778]
-        gt_tactile = batch['tactile_signal'].detach().cpu().numpy() # [B, 778] 已经被归一化过
+        pred_tactile = out['pred_tactile'].detach().cpu().numpy() # [B, tactile_dim]
+        gt_tactile = batch['tactile_signal'].detach().cpu().numpy() # [B, tactile_dim]
         
         for n in range(pred_tactile.shape[0]):
             if valid_tactile_mask[n]:
@@ -174,8 +196,8 @@ def main():
         print("❌ 未产生任何有效的评估指标！可能数据集中 has_tactile 都是 0。")
         return
         
-    all_pred = np.stack(all_pred_tactile) # [N, 778]
-    all_gt = np.stack(all_gt_tactile)     # [N, 778]
+    all_pred = np.stack(all_pred_tactile) # [N, tactile_dim]
+    all_gt = np.stack(all_gt_tactile)     # [N, tactile_dim]
     
     print("\n🧮 推理完成，正在计算指标...")
     
@@ -226,6 +248,7 @@ def main():
         "="*55,
         f" 评测划分集    : {args.split}",
         f" 总有效评估帧数: {total_frames}",
+        f" 触觉输出维度  : {all_pred_tactile[0].shape[0]} (subdiv MANO vertices)",
         f" 整体 MAE      : {mae:.4f} (归一化区间 [0,1])",
         f" 整体 RMSE     : {rmse:.4f} (归一化区间 [0,1])",
         f" 整体 PCC      : {avg_pcc:.4f} (皮尔逊相关系数)",

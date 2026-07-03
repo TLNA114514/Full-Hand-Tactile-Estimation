@@ -1,0 +1,21 @@
+# CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+CUDA_VISIBLE_DEVICES=0,1 accelerate launch train_hand.py \
+ --pretrained_model_name_or_path="./checkpoints/stable-video-diffusion-img2vid-xt" \
+ --output_dir="./checkpoints" \
+ --data_root_path="./V2P_data" \
+ --data_path="./V2P_data/motion_list.txt" \
+ --dataset_width=256 \
+ --dataset_height=256 \
+ --num_workers=1 \
+ --lr_warmup_steps=500 \
+ --sample_n_frames=16 \
+ --sample_frame_rate=5 \
+ --learning_rate=1e-5 \
+ --per_gpu_batch_size=2 \
+ --num_train_epochs=600 \
+ --mixed_precision="fp16" \
+ --gradient_accumulation_steps=1 \
+ --checkpointing_steps=10000 \
+ --gradient_checkpointing \
+ --checkpoints_total_limit=5000 \
+ --resume_from_checkpoint="latest"

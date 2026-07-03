@@ -50,5 +50,5 @@ def check_extracted(ext_dir):
             print(f"[{key}] Not found")
 
 if __name__ == "__main__":
-    check_h5("/data/jiangrui/OpenTouch Data/data/")
-    check_extracted("/data/jiangrui/OpenTouch Data/extracted_dataset/")
+    check_h5("/data1/jiangrui/OpenTouch Data/data/")
+    check_extracted("/data1/jiangrui/OpenTouch Data/extracted_dataset/")

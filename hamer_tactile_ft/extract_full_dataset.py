@@ -167,12 +167,14 @@ def extract_worker(gpu_id, clips_chunk, cache_dir, data_dir):
         traceback.print_exc()
 
 
-def extract_full_bboxes_multigpu(logical_gpus, data_dir):
+def extract_full_bboxes_multigpu(logical_gpus, data_dir, cache_dir=None, output_bbox_json=None):
     """主进程：分配 train/val/test 任务，等待结束，然后合并大 JSON"""
     splits_json_path = os.path.join(base_dir, "evaluation/opentouch_splits.json")
-    output_bbox_json = os.path.join(base_dir, "hamer_tactile_ft/opentouch_all_bboxes.json")
+    if output_bbox_json is None:
+        output_bbox_json = os.path.join(base_dir, "hamer_tactile_ft/opentouch_all_bboxes.json")
     
-    cache_dir = os.path.join(base_dir, "hamer_tactile_ft/full_bboxes_cache")
+    if cache_dir is None:
+        cache_dir = os.path.join(base_dir, "hamer_tactile_ft/full_bboxes_cache")
     os.makedirs(cache_dir, exist_ok=True)
     
     with open(splits_json_path, 'r') as f:
@@ -234,10 +236,11 @@ def extract_full_bboxes_multigpu(logical_gpus, data_dir):
     return output_bbox_json
 
 
-def extract_full_to_disk(bbox_json_path, data_dir, output_dir):
+def extract_full_to_disk(bbox_json_path, data_dir, output_dir, registry_path=None):
     """第二阶段：读取全量大 JSON，从 HDF5 中解包图像和 meta，并记录 Registry"""
     print("\n📦 开始将全量数据集图片及 meta.json 写入磁盘，并生成 Registry...")
-    registry_path = os.path.join(base_dir, "hamer_tactile_ft/dataset_frames_registry.json")
+    if registry_path is None:
+        registry_path = os.path.join(base_dir, "hamer_tactile_ft/dataset_frames_registry.json")
     
     with open(bbox_json_path, 'r') as f:
         samples_dict = json.load(f)
@@ -287,6 +290,10 @@ def extract_full_to_disk(bbox_json_path, data_dir, output_dir):
                 is_right = sample.get("is_right", 1)
                 bbox = sample["bbox"]
                 
+                sample_folder_name = f"{scene}_{clip_id}_{frame_idx:04d}_{is_right}"
+                sample_dir = os.path.join(output_dir, split_name, sample_folder_name)
+                os.makedirs(sample_dir, exist_ok=True)
+                
                 # 记录 Registry
                 reg_key = f"{split_name}/{scene}/{clip_id}/{frame_idx}/{is_right}"
                 if reg_key not in existing_registry:
@@ -296,13 +303,10 @@ def extract_full_to_disk(bbox_json_path, data_dir, output_dir):
                         "clip": clip_id,
                         "frame_idx": frame_idx,
                         "is_right": is_right,
-                        "has_bbox": bbox != "null"
+                        "has_bbox": bbox != "null",
+                        "sample_dir": sample_dir
                     })
                     existing_registry.add(reg_key)
-                
-                sample_folder_name = f"{scene}_{clip_id}_{frame_idx:04d}_{is_right}"
-                sample_dir = os.path.join(output_dir, split_name, sample_folder_name)
-                os.makedirs(sample_dir, exist_ok=True)
                 
                 meta_path = os.path.join(sample_dir, "meta.json")
                 if os.path.exists(meta_path):
@@ -405,8 +409,11 @@ def extract_full_to_disk(bbox_json_path, data_dir, output_dir):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Extract full dataset with multi-GPU and fallback null bboxes")
     parser.add_argument('--gpu', type=str, default='0', help='使用的 GPU 编号 (例: 0,1,2,3)')
-    parser.add_argument('--data_dir', type=str, default='/data/jiangrui/OpenTouch Data/data', help='原始 HDF5 数据目录')
-    parser.add_argument('--output_dir', type=str, default='/data/jiangrui/OpenTouch Data/full_dataset', help='输出的全量数据集目录')
+    parser.add_argument('--data_dir', type=str, default='/data1/jiangrui/OpenTouch Data/data', help='原始 HDF5 数据目录')
+    parser.add_argument('--output_dir', type=str, default='/data1/jiangrui/OpenTouch Data/full_dataset', help='输出的全量数据集目录')
+    parser.add_argument('--cache_dir', type=str, default=None, help='BBox cache directory')
+    parser.add_argument('--bbox_json', type=str, default=None, help='Merged bbox JSON path')
+    parser.add_argument('--registry_json', type=str, default=None, help='Extracted frames registry JSON path')
     args = parser.parse_args()
     
     os.chdir(base_dir)
@@ -414,6 +421,16 @@ if __name__ == "__main__":
     gpu_list = args.gpu.split(',') if args.gpu else ['0']
     logical_gpus = list(range(len(gpu_list)))
     
-    bbox_path = extract_full_bboxes_multigpu(logical_gpus, args.data_dir)
+    bbox_path = extract_full_bboxes_multigpu(
+        logical_gpus,
+        args.data_dir,
+        cache_dir=args.cache_dir,
+        output_bbox_json=args.bbox_json,
+    )
     if bbox_path:
-        extract_full_to_disk(bbox_path, args.data_dir, args.output_dir)
+        extract_full_to_disk(
+            bbox_path,
+            args.data_dir,
+            args.output_dir,
+            registry_path=args.registry_json,
+        )

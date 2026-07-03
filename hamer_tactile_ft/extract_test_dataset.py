@@ -76,7 +76,7 @@ def extract_worker(gpu_id, clips_chunk, cache_dir):
         print(f"[Worker GPU {gpu_id}] 初始化模型... 分配了 {len(clips_chunk)} 个 clip。")
         detector, cpm = initialize_models(device)
         
-        data_dir = "/data/jiangrui/OpenTouch Data/data"
+        data_dir = "/data1/jiangrui/OpenTouch Data/data"
         
         # 按照 scene 进行分组，减少切换 HDF5 的开销
         from collections import defaultdict
@@ -240,8 +240,8 @@ def extract_test_bboxes_multigpu(logical_gpus):
 def extract_test_to_disk(bbox_json_path):
     """第二阶段：读取大 JSON，从 HDF5 中解包图像和 meta"""
     print("\n📦 开始将数据集图片及 meta.json 写入磁盘...")
-    data_dir = "/data/jiangrui/OpenTouch Data/data"
-    output_dir = "/data/jiangrui/OpenTouch Data/extracted_dataset"
+    data_dir = "/data1/jiangrui/OpenTouch Data/data"
+    output_dir = "/data1/jiangrui/OpenTouch Data/extracted_dataset"
     os.makedirs(os.path.join(output_dir, "test"), exist_ok=True)
     
     with open(bbox_json_path, 'r') as f:

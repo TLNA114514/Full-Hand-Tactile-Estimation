@@ -104,8 +104,8 @@ def estimate_time(frame_count, fps=4.0):
 def run_gpu_worker(gpu_id, video_list_file, log_file, skip_video):
     """Run the processing task on the specified GPU"""
     python_exe = "/home/intern10/anaconda3/envs/wilor/bin/python"
-    batch_script = "/data_all/intern10/tmp/TouchAnything-Dev/third_party/wilor/demo_sam3_video_batch.py"
-    wilor_dir = "/data_all/intern10/tmp/TouchAnything-Dev/third_party/wilor"
+    batch_script = "/data1_all/intern10/tmp/TouchAnything-Dev/third_party/wilor/demo_sam3_video_batch.py"
+    wilor_dir = "/data1_all/intern10/tmp/TouchAnything-Dev/third_party/wilor"
     
     # Use absolute path for video list file
     abs_video_list = str(Path(video_list_file).absolute())

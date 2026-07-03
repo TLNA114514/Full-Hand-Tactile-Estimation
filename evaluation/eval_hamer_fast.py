@@ -98,7 +98,7 @@ def main():
     parser = argparse.ArgumentParser(description='Hamer Fast Evaluation using Extracted Dataset')
     parser.add_argument('--checkpoint', type=str, default="../hamer/_DATA/hamer_ckpts/checkpoints/hamer.ckpt")
     parser.add_argument('--model_cfg', type=str, default=None)
-    parser.add_argument('--data_dir', type=str, default="/data/jiangrui/OpenTouch Data/extracted_dataset")
+    parser.add_argument('--data_dir', type=str, default="/data1/jiangrui/OpenTouch Data/extracted_dataset")
     parser.add_argument('--split', type=str, default='test', choices=['train', 'val', 'test'])
     parser.add_argument('--gpu', type=str, default='4')
     parser.add_argument('--batch_size', type=int, default=64)

@@ -2,8 +2,24 @@ import torch
 import torch.nn as nn
 from typing import Dict
 from hamer.models.hamer import HAMER
+from pathlib import Path
 
 import torch.nn.functional as F
+
+
+def count_obj_vertices(obj_path: Path) -> int:
+    count = 0
+    with obj_path.open("r") as f:
+        for line in f:
+            if line.startswith("v "):
+                count += 1
+    return count
+
+
+def default_tactile_dim() -> int:
+    repo_root = Path(__file__).resolve().parents[1]
+    subdiv_obj = repo_root / "opentouch" / "preprocess" / "scratch" / "mano_right_neutral_subdiv.obj"
+    return count_obj_vertices(subdiv_obj)
 
 class ResidualBlock(nn.Module):
     def __init__(self, dim):
@@ -48,6 +64,7 @@ class AnatomicalSpatialPooling(nn.Module):
 class HAMER_Tactile(HAMER):
     def __init__(self, cfg, init_renderer=False):
         super().__init__(cfg, init_renderer=init_renderer)
+        self.tactile_dim = default_tactile_dim()
         
         # 仿生手部解剖学瓶颈架构 (Anatomical Spatial Bottleneck)
         self.tactile_head = nn.Sequential(
@@ -66,7 +83,7 @@ class HAMER_Tactile(HAMER):
             nn.GELU(),
             nn.Dropout(p=0.3),
             ResidualBlock(512),
-            nn.Linear(512, 778)
+            nn.Linear(512, self.tactile_dim)
         )
         
         # Ensure we don't automatically optimize as we want to control freezing
@@ -106,6 +123,7 @@ class HAMER_Tactile(HAMER):
         # Compute tactile loss
         gt_tactile = batch['tactile_signal']
         has_tactile = batch['has_tactile']  # (B,) boolean or float
+        dataset_names = batch.get('dataset', None)
         pred_logits = output['pred_logits']
         pred_tactile = output['pred_tactile']
         
@@ -117,13 +135,25 @@ class HAMER_Tactile(HAMER):
         
         # Combine them with absolute mathematical fairness (no asymmetric weighting to prevent expected value shifts)
         loss_tactile_base = loss_main + 0.1 * loss_highway
-        
+
+        # Dataset-specific reweighting:
+        # only downweight high-pressure regions for OpenTouch; keep other datasets unchanged.
+        if dataset_names is None:
+            dataset_names = ["OpenTouch"] * gt_tactile.shape[0]
+        elif isinstance(dataset_names, str):
+            dataset_names = [dataset_names]
+
+        dataset_weights = torch.ones_like(gt_tactile)
+        for i, name in enumerate(dataset_names):
+            if str(name).lower() == "opentouch":
+                dataset_weights[i] = torch.where(gt_tactile[i] > 0.6, 0.3, 1.0)
+
         # Mask out non-palm vertices using palm_mask
-        palm_mask = batch['palm_mask'] # (B, 778)
-        loss_tactile = loss_tactile_base * palm_mask
+        palm_mask = batch['palm_mask']
+        loss_tactile = loss_tactile_base * dataset_weights * palm_mask
         
         # Mask out samples that don't have tactile data
-        # has_tactile shape is (B,) while loss_tactile shape is (B, 778)
+        # has_tactile shape is (B,) while loss_tactile shape is (B, tactile_dim)
         has_tactile_expanded = has_tactile.unsqueeze(1).expand_as(loss_tactile)
         
         loss_tactile_masked = loss_tactile * has_tactile_expanded

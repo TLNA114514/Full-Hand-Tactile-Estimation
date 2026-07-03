@@ -98,6 +98,6 @@ def check_mapping(clip_dir):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--clip", type=str, default="/data/jiangrui/EgoTouch/Home/arrange_pillow/20260412_101136_379")
+    parser.add_argument("--clip", type=str, default="/data1/jiangrui/EgoTouch/Home/arrange_pillow/20260412_101136_379")
     args = parser.parse_args()
     check_mapping(args.clip)

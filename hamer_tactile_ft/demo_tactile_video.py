@@ -70,6 +70,7 @@ from hamer.utils.utils_detectron2 import DefaultPredictor_Lazy
 from detectron2.config import LazyConfig
 import hamer
 from hamer_tactile import HAMER_Tactile
+from train import load_compatible_state_dict
 
 class OpenTouchHAMER_TactileWrapper(HAMER_Tactile):
     def __init__(self, cfg, learning_rate=1e-4):
@@ -308,9 +309,13 @@ def load_models(checkpoint_path, device):
         
     print(">>> Initializing OpenTouchHAMER_TactileWrapper...")
     model = OpenTouchHAMER_TactileWrapper(cfg=model_cfg)
+    dummy_input = torch.zeros(1, 3, model_cfg.MODEL.IMAGE_SIZE, model_cfg.MODEL.IMAGE_SIZE)
+    with torch.no_grad():
+        dummy_feat = model.backbone(dummy_input[:, :, :, 32:-32])
+        model.tactile_head(dummy_feat)
+        print(f">>> Tactile head initialized with output dim: {model.tactile_dim}")
     print(f">>> Loading weights from checkpoint: {checkpoint_path}")
-    state_dict = torch.load(checkpoint_path, map_location="cpu")['state_dict']
-    model.load_state_dict(state_dict, strict=False)
+    load_compatible_state_dict(model, checkpoint_path)
     model = model.to(device)
     model.eval()
 
@@ -400,20 +405,20 @@ def render_pose_sequence(joints_seq, output_dir, demo_id, target_size=(1280, 960
     print("Pose rendering completed.")
 
 
-def render_tactile_778_sequence(pressure_seq, output_dir, demo_id, target_size=(1280, 960), temporal_alpha=0.4):
+def render_subdiv_tactile_sequence(pressure_seq, output_dir, demo_id, target_size=(1280, 960), temporal_alpha=0.4):
     from matplotlib import cm
     width, height = target_size
     
-    # Find low-res OBJ (778 vertices)
+    # Find subdiv OBJ.
     obj_path = _find_first_existing([
-        "mano_right_neutral.obj",
-        os.path.join(preprocess_dir, "data", "mano_right_neutral.obj"),
-        os.path.join(preprocess_dir, "scratch", "mano_right_neutral.obj"),
-        os.path.join(preprocess_dir, "mano_right_neutral.obj"),
-        os.path.join(workspace_dir, "data", "mano_right_neutral.obj"),
+        "mano_right_neutral_subdiv.obj",
+        os.path.join(preprocess_dir, "data", "mano_right_neutral_subdiv.obj"),
+        os.path.join(preprocess_dir, "scratch", "mano_right_neutral_subdiv.obj"),
+        os.path.join(preprocess_dir, "mano_right_neutral_subdiv.obj"),
+        os.path.join(workspace_dir, "data", "mano_right_neutral_subdiv.obj"),
     ])
     if obj_path is None:
-        raise FileNotFoundError("Missing mano_right_neutral.obj")
+        raise FileNotFoundError("Missing mano_right_neutral_subdiv.obj")
         
     mesh = trimesh.load(obj_path, process=False)
     mano_vertices = np.asarray(mesh.vertices, dtype=np.float32)
@@ -436,15 +441,20 @@ def render_tactile_778_sequence(pressure_seq, output_dir, demo_id, target_size=(
     os.makedirs(output_dir, exist_ok=True)
     prev = None
     
-    print(f"Rendering 778-dim tactile sequence to {output_dir}...")
+    print(f"Rendering subdiv tactile sequence to {output_dir}...")
     colormap_fn = lambda x: np.array(cm.gnuplot2(x))
 
     for idx, grid in enumerate(pressure_seq):
+        grid = np.asarray(grid, dtype=np.float32)
+        if grid.shape[0] != mano_vertices.shape[0]:
+            raise ValueError(
+                f"Predicted tactile dim {grid.shape[0]} does not match subdiv vertex count {mano_vertices.shape[0]}"
+            )
         if temporal_alpha and prev is not None:
             grid = temporal_alpha * grid + (1.0 - temporal_alpha) * prev
         prev = grid
 
-        # grid is assumed to be (778,) and in range [0, 1] where 1 is highest pressure
+        # grid is assumed to be (V_subdiv,) and in range [0, 1] where 1 is highest pressure.
         # Map to color: 1.0 - value so that highest pressure maps to 0 in colormap (which is usually brightest in gnuplot2)
         color_new = np.clip(1.0 - grid, 0.0, 1.0)
         img_bgr = renderer.render(vertex_colors=colormap_fn(color_new), colormap_fn=colormap_fn, smooth=True)
@@ -623,7 +633,7 @@ def main():
     if first_valid_idx is None:
         print(">>> Warning: No hand detected in any frame of the video!")
         pred_joints_seq = np.zeros((num_frames, 21, 3), dtype=np.float32)
-        pred_tactile_seq = np.zeros((num_frames, 778), dtype=np.float32) # Default to 778 dims
+        pred_tactile_seq = np.zeros((num_frames, model.tactile_dim), dtype=np.float32)
     else:
         for idx in range(first_valid_idx):
             pred_joints_list[idx] = pred_joints_list[first_valid_idx]
@@ -645,16 +655,16 @@ def main():
     # Post-process the tactile predictions to remove artifacts
     # 1. Mask out non-palm vertices (which were never penalized during training)
     import json
-    palm_faces_path = os.path.join(workspace_dir, "opentouch", "preprocess", "scratch", "auto_calibrated_palm_faces.json")
+    palm_faces_path = os.path.join(workspace_dir, "opentouch", "preprocess", "scratch", "auto_calibrated_palm_subdiv_faces.json")
     with open(palm_faces_path, "r") as f:
         palm_data = json.load(f)
         
     palm_vertices_set = set()
     for triplet in palm_data["group_negative"]["face_triplets"]:
         for vid in triplet:
-            if vid <= 777:
+            if 0 <= vid < model.tactile_dim:
                 palm_vertices_set.add(vid)
-    palm_mask = np.zeros(778, dtype=np.float32)
+    palm_mask = np.zeros(model.tactile_dim, dtype=np.float32)
     palm_mask[list(palm_vertices_set)] = 1.0
     
     pred_tactile_seq = pred_tactile_seq * palm_mask
@@ -670,9 +680,9 @@ def main():
         use_cuda=(device.type == 'cuda'),
     )
 
-    # Step 4: Render Predicted Tactile (778-dim MANO basis)
-    print("\n>>> [4/5] Rendering Predicted Tactile Heatmap (778-dim)...")
-    render_tactile_778_sequence(
+    # Step 4: Render Predicted Tactile (subdiv MANO basis)
+    print("\n>>> [4/5] Rendering Predicted Tactile Heatmap (subdiv MANO basis)...")
+    render_subdiv_tactile_sequence(
         pressure_seq=pred_tactile_seq,
         output_dir=str(pred_touch_dir),
         demo_id=demo_id,

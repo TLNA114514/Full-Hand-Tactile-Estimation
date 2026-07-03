@@ -1,0 +1,116 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="760" viewBox="0 0 1280 760">
+  <defs>
+    <style>
+      .title { font: 700 26px Arial, sans-serif; fill: #172033; }
+      .label { font: 700 16px Arial, sans-serif; fill: #172033; }
+      .text { font: 13px Arial, sans-serif; fill: #263248; }
+      .small { font: 12px Arial, sans-serif; fill: #41506a; }
+      .box { fill: #f7f9fc; stroke: #9aa9bd; stroke-width: 1.5; rx: 8; }
+      .blue { fill: #e8f1ff; stroke: #4f7fbd; }
+      .green { fill: #e8f7ef; stroke: #4c9a6a; }
+      .orange { fill: #fff3df; stroke: #c78938; }
+      .red { fill: #ffeded; stroke: #c95c5c; }
+      .gray { fill: #eef1f5; stroke: #8b98aa; }
+      .arrow { stroke: #52627a; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+      .dash { stroke-dasharray: 6 5; }
+    </style>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L8,3 z" fill="#52627a" />
+    </marker>
+  </defs>
+
+  <rect width="1280" height="760" fill="#ffffff"/>
+  <text x="40" y="46" class="title">Sequence-level Tactile Infiller Pipeline</text>
+  <text x="40" y="72" class="small">Goal: use sparse bbox-visible frames to infer full-palm MANO tactile pressure for every tactile-valid frame.</text>
+
+  <!-- Data pipeline -->
+  <rect x="40" y="110" width="210" height="108" class="box blue"/>
+  <text x="60" y="138" class="label">Extracted Frames</text>
+  <text x="60" y="164" class="text">image / bbox / meta.json</text>
+  <text x="60" y="185" class="text">pressure target if available</text>
+  <text x="60" y="206" class="small">OpenTouch / TouchAnything / EgoTactile</text>
+
+  <rect x="300" y="110" width="230" height="108" class="box blue"/>
+  <text x="320" y="138" class="label">Sequence Manifest</text>
+  <text x="320" y="164" class="text">one row = one hand sequence</text>
+  <text x="320" y="185" class="text">frame list + bbox_valid</text>
+  <text x="320" y="206" class="text">tactile_key + tactile_valid</text>
+
+  <rect x="580" y="110" width="250" height="108" class="box blue"/>
+  <text x="600" y="138" class="label">TactileSequenceDataset</text>
+  <text x="600" y="164" class="text">cut sequence into windows</text>
+  <text x="600" y="185" class="text">seq_len / stride / frame_rate</text>
+  <text x="600" y="206" class="text">randomly hide observed bbox frames</text>
+
+  <path d="M250 164 L300 164" class="arrow"/>
+  <path d="M530 164 L580 164" class="arrow"/>
+
+  <!-- Frame branches -->
+  <rect x="90" y="290" width="250" height="116" class="box green"/>
+  <text x="110" y="318" class="label">bbox-valid observed frames</text>
+  <text x="110" y="344" class="text">crop hand image by bbox</text>
+  <text x="110" y="365" class="text">left hand is horizontally flipped</text>
+  <text x="110" y="386" class="small">observed_mask = 1</text>
+
+  <rect x="90" y="455" width="250" height="108" class="box gray"/>
+  <text x="110" y="483" class="label">bbox-missing frames</text>
+  <text x="110" y="509" class="text">zero image / zero visual token</text>
+  <text x="110" y="530" class="text">can still be supervised</text>
+  <text x="110" y="551" class="small">observed_mask = 0</text>
+
+  <rect x="400" y="290" width="260" height="116" class="box green"/>
+  <text x="420" y="318" class="label">Frozen HAMER_Tactile</text>
+  <text x="420" y="344" class="text">ViT backbone features</text>
+  <text x="420" y="365" class="text">frame tactile head logits</text>
+  <text x="420" y="386" class="small">default: freeze frame model</text>
+
+  <rect x="710" y="290" width="220" height="116" class="box orange"/>
+  <text x="730" y="318" class="label">Observed Tokens</text>
+  <text x="730" y="344" class="text">tactile_proj(sigmoid logits)</text>
+  <text x="730" y="365" class="text">+ visual pooled feature</text>
+  <text x="730" y="386" class="small">zero token for missing frames</text>
+
+  <path d="M340 348 L400 348" class="arrow"/>
+  <path d="M660 348 L710 348" class="arrow"/>
+  <path d="M340 509 C500 509 565 448 710 380" class="arrow dash"/>
+
+  <!-- Conditioning -->
+  <rect x="710" y="455" width="220" height="108" class="box orange"/>
+  <text x="730" y="483" class="label">Condition Embeddings</text>
+  <text x="730" y="509" class="text">observed / bbox / target masks</text>
+  <text x="730" y="530" class="text">dataset + hand embeddings</text>
+  <text x="730" y="551" class="text">learned time embedding</text>
+
+  <path d="M820 406 L820 455" class="arrow"/>
+
+  <!-- Temporal model -->
+  <rect x="985" y="310" width="240" height="150" class="box red"/>
+  <text x="1005" y="340" class="label">Temporal Transformer</text>
+  <text x="1005" y="366" class="text">4 encoder layers</text>
+  <text x="1005" y="387" class="text">hidden dim 512, 8 heads</text>
+  <text x="1005" y="408" class="text">uses all frames in window</text>
+  <text x="1005" y="429" class="small">propagates tactile evidence over time</text>
+
+  <path d="M930 380 L985 380" class="arrow"/>
+  <path d="M930 509 C960 509 968 435 985 410" class="arrow"/>
+
+  <!-- Output -->
+  <rect x="985" y="535" width="240" height="116" class="box red"/>
+  <text x="1005" y="563" class="label">Output Head</text>
+  <text x="1005" y="589" class="text">linear to subdiv MANO vertices</text>
+  <text x="1005" y="610" class="text">sigmoid pressure in [0, 1]</text>
+  <text x="1005" y="631" class="small">prediction for every frame</text>
+
+  <path d="M1105 460 L1105 535" class="arrow"/>
+
+  <!-- Loss -->
+  <rect x="380" y="610" width="500" height="98" class="box"/>
+  <text x="400" y="638" class="label">Training Objective</text>
+  <text x="400" y="664" class="text">SmoothL1(pred, target) + 0.1 * BCEWithLogits(logits, target)</text>
+  <text x="400" y="685" class="text">apply palm mask, target_mask, bbox loss weights, dataset weights</text>
+  <text x="400" y="706" class="small">main validation metric: missing_bbox_mae</text>
+
+  <path d="M985 615 L880 660" class="arrow"/>
+  <path d="M580 218 C580 250 215 250 215 290" class="arrow"/>
+  <path d="M705 218 C705 250 215 250 215 455" class="arrow dash"/>
+</svg>

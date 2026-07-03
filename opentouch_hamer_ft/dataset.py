@@ -32,7 +32,7 @@ class OpenTouchHamerDataset(Dataset):
         
         # New base directory for the extracted dataset
         if data_dir is None:
-            self.data_dir = "/data/jiangrui/OpenTouch Data/extracted_dataset"
+            self.data_dir = "/data1/jiangrui/OpenTouch Data/extracted_dataset"
         else:
             self.data_dir = data_dir
         

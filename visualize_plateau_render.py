@@ -175,7 +175,7 @@ if __name__ == "__main__":
     parser.add_argument("--gif", action="store_true", help="Generate a GIF of a full clip instead of a single frame.")
     args = parser.parse_args()
 
-    h5_dir = "/data/jiangrui/OpenTouch Data/data/"
+    h5_dir = "/data1/jiangrui/OpenTouch Data/data/"
     h5_files = glob.glob(os.path.join(h5_dir, "*.h5")) + glob.glob(os.path.join(h5_dir, "*.hdf5"))
     random.shuffle(h5_files)
 

@@ -4,7 +4,7 @@ import glob
 import numpy as np
 
 def main():
-    data_dir = "/data/jiangrui/OpenTouch Data/extracted_dataset/train"
+    data_dir = "/data1/jiangrui/OpenTouch Data/extracted_dataset/train"
     meta_files = glob.glob(os.path.join(data_dir, "*", "meta.json"))
     
     print(f"Found {len(meta_files)} meta.json files.")
