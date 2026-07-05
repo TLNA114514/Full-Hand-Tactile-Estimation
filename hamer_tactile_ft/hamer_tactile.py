@@ -4,7 +4,7 @@ from typing import Dict
 from hamer.models.hamer import HAMER
 from pathlib import Path
 
-import torch.nn.functional as F
+from losses import TactileLossConfig, compute_tactile_loss
 
 
 def count_obj_vertices(obj_path: Path) -> int:
@@ -65,6 +65,7 @@ class HAMER_Tactile(HAMER):
     def __init__(self, cfg, init_renderer=False):
         super().__init__(cfg, init_renderer=init_renderer)
         self.tactile_dim = default_tactile_dim()
+        self.tactile_loss_config = TactileLossConfig()
         
         # 仿生手部解剖学瓶颈架构 (Anatomical Spatial Bottleneck)
         self.tactile_head = nn.Sequential(
@@ -88,6 +89,9 @@ class HAMER_Tactile(HAMER):
         
         # Ensure we don't automatically optimize as we want to control freezing
         self.automatic_optimization = True
+
+    def set_tactile_loss_config(self, config: TactileLossConfig):
+        self.tactile_loss_config = config
 
     def forward_step(self, batch: Dict, train: bool = False) -> Dict:
         """
@@ -120,53 +124,17 @@ class HAMER_Tactile(HAMER):
         # Get base loss from HAMER
         base_loss = super().compute_loss(batch, output, train=train)
         
-        # Compute tactile loss
-        gt_tactile = batch['tactile_signal']
-        has_tactile = batch['has_tactile']  # (B,) boolean or float
-        dataset_names = batch.get('dataset', None)
-        pred_logits = output['pred_logits']
-        pred_tactile = output['pred_tactile']
-        
-        # BCE-Stabilized Regression (BSR) Loss
-        # 1. Main Objective: SmoothL1 directly aligns with RMSE, completely eliminating extreme confidence penalties
-        loss_main = F.smooth_l1_loss(pred_tactile, gt_tactile, reduction='none')
-        # 2. Gradient Highway: A 10% BCE loss ensures gradients never vanish at the edges of Sigmoid
-        loss_highway = F.binary_cross_entropy_with_logits(pred_logits, gt_tactile, reduction='none')
-        
-        # Combine them with absolute mathematical fairness (no asymmetric weighting to prevent expected value shifts)
-        loss_tactile_base = loss_main + 0.1 * loss_highway
-
-        # Dataset-specific reweighting:
-        # only downweight high-pressure regions for OpenTouch; keep other datasets unchanged.
-        if dataset_names is None:
-            dataset_names = ["OpenTouch"] * gt_tactile.shape[0]
-        elif isinstance(dataset_names, str):
-            dataset_names = [dataset_names]
-
-        dataset_weights = torch.ones_like(gt_tactile)
-        for i, name in enumerate(dataset_names):
-            if str(name).lower() == "opentouch":
-                dataset_weights[i] = torch.where(gt_tactile[i] > 0.6, 0.3, 1.0)
-
-        # Mask out non-palm vertices using palm_mask
-        palm_mask = batch['palm_mask']
-        loss_tactile = loss_tactile_base * dataset_weights * palm_mask
-        
-        # Mask out samples that don't have tactile data
-        # has_tactile shape is (B,) while loss_tactile shape is (B, tactile_dim)
-        has_tactile_expanded = has_tactile.unsqueeze(1).expand_as(loss_tactile)
-        
-        loss_tactile_masked = loss_tactile * has_tactile_expanded
-        
-        # Average over valid samples and palm vertices
-        valid_samples = has_tactile.sum()
-        num_palm_vertices = palm_mask[0].sum() if palm_mask.shape[0] > 0 else 0
-        if valid_samples > 0 and num_palm_vertices > 0:
-            loss_tactile_mean = loss_tactile_masked.sum() / (valid_samples * num_palm_vertices)
-        else:
-            loss_tactile_mean = torch.tensor(0.0, device=pred_tactile.device, requires_grad=True)
-            
-        output['losses']['loss_tactile'] = loss_tactile_mean.detach()
+        loss_tactile_mean, tactile_losses = compute_tactile_loss(
+            pred=output['pred_tactile'],
+            logits=output['pred_logits'],
+            target=batch['tactile_signal'],
+            palm_mask=batch['palm_mask'],
+            valid_mask=batch['has_tactile'],
+            dataset_batch=batch.get('dataset', None),
+            config=self.tactile_loss_config,
+            current_epoch=getattr(self, "current_epoch", 0),
+        )
+        output['losses'].update(tactile_losses)
         
         # Total loss combines base loss and tactile loss.
         # Since backbone is frozen, base loss will just be passed for logging, 

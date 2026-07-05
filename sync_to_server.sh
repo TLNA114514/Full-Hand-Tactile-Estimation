@@ -41,6 +41,7 @@ RSYNC_EXCLUDES=(
     --exclude='hamer_tactile_ft/egotactile_bboxes_cache/'
     --exclude='hamer_tactile_ft/full_bboxes_cache/'
     --exclude='hamer_tactile_ft/test_bboxes_cache/'
+    --exclude='hamer_tactile_ft/eval_reports'
     --exclude='hamer_tactile_ft/touchanything_all_bboxes.json'
     --exclude='hamer_tactile_ft/egotactile_all_bboxes.json'
     --exclude='hamer_tactile_ft/opentouch_all_bboxes.json'

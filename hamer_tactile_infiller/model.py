@@ -24,6 +24,7 @@ if str(FT_DIR) not in sys.path:
     sys.path.append(str(FT_DIR))
 
 from hamer_tactile import HAMER_Tactile  # noqa: E402
+from losses import TactileLossConfig, compute_tactile_loss  # noqa: E402
 
 
 class TactileInfiller(nn.Module):
@@ -147,38 +148,24 @@ class TactileInfiller(nn.Module):
         }
 
 
-def dataset_weights(dataset_batch, target):
-    weights = torch.ones_like(target)
-    bsz, seq_len, _ = target.shape
-    if not isinstance(dataset_batch, (list, tuple)):
-        return weights
-    for t, names_at_t in enumerate(dataset_batch):
-        if isinstance(names_at_t, (list, tuple)):
-            names = names_at_t
-        else:
-            names = [names_at_t] * bsz
-        for b, name in enumerate(names[:bsz]):
-            if str(name).lower() == "opentouch":
-                weights[b, t] = torch.where(target[b, t] > 0.6, 0.3, 1.0)
-    return weights
-
-
-def infiller_loss(batch, output, temporal_smooth_weight=0.05):
+def infiller_loss(batch, output, temporal_smooth_weight=0.05, tactile_loss_config=None, current_epoch=0):
     target = batch["tactile_signal"]
     pred = output["pred_tactile"]
-    logits = output["pred_logits"]
     palm_mask = batch["palm_mask"]
     target_mask = batch["target_mask"]
     loss_weight = batch["loss_weight"]
 
-    base = F.smooth_l1_loss(pred, target, reduction="none")
-    highway = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
-    loss = base + 0.1 * highway
-    loss = loss * dataset_weights(batch.get("dataset"), target) * palm_mask
-    loss = loss * target_mask.unsqueeze(-1) * loss_weight.unsqueeze(-1)
-
-    denom = (target_mask * loss_weight).sum() * palm_mask[0, 0].sum().clamp_min(1.0)
-    tactile_loss = loss.sum() / denom.clamp_min(1.0)
+    tactile_loss, tactile_losses = compute_tactile_loss(
+        pred=pred,
+        logits=output["pred_logits"],
+        target=target,
+        palm_mask=palm_mask,
+        valid_mask=target_mask,
+        dataset_batch=batch.get("dataset"),
+        config=tactile_loss_config or TactileLossConfig(),
+        current_epoch=current_epoch,
+        sample_weight=loss_weight,
+    )
 
     smooth_loss = torch.zeros((), dtype=pred.dtype, device=pred.device)
     if pred.shape[1] > 1 and temporal_smooth_weight > 0:
@@ -191,11 +178,11 @@ def infiller_loss(batch, output, temporal_smooth_weight=0.05):
             smooth_loss = smooth.sum() / (both_valid.sum() * palm_mask[0, 0].sum().clamp_min(1.0)).clamp_min(1.0)
 
     total = tactile_loss + temporal_smooth_weight * smooth_loss
-    return total, {
-        "loss_tactile": tactile_loss.detach(),
+    tactile_losses.update({
         "loss_temporal": smooth_loss.detach(),
         "loss_total": total.detach(),
-    }
+    })
+    return total, tactile_losses
 
 
 def metrics(batch, output):

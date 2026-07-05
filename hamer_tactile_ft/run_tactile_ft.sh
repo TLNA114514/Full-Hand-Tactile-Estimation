@@ -26,7 +26,6 @@ python train.py \
     --lr 1e-4 \
     --batch_size 32 \
     --epochs 90 \
-    --exp_name "tactile_ft" \
     --use_wandb \
     --datasets opentouch,touchanything,egotactile \
     --exp_name mixed_ot_ta_ego \
@@ -34,4 +33,16 @@ python train.py \
     --index_workers 32 \
     --index_chunksize 512 \
     --num_workers 32 \
+    --active_pressure_thr 0.05 \
+    --active_pressure_peak 0.10 \
+    --active_pressure_high 0.30 \
+    --background_pressure_thr 0.02 \
+    --background_pred_margin 0.02 \
+    --active_pressure_weight 1.0 \
+    --active_pressure_gamma 1.0 \
+    --background_loss_weight 1.0 \
+    --volume_iou_loss_weight 0.0 \
+    --opentouch_high_pressure_thr 0.9 \
+    --opentouch_high_pressure_weight 0.3 \
+    --loss_ramp_epochs 10 \
     "$@"

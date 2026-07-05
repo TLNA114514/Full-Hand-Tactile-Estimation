@@ -167,7 +167,8 @@ class OpenTouchTactileDataset(Dataset):
     def __init__(self, cfg: CfgNode, split: str = "train", 
                  data_dir: str = None, train: bool = True, index_workers: int = 1,
                  index_chunksize: int = 256, index_cache_dir: str = None,
-                 rebuild_index: bool = False, index_cache_timeout: int = 3600):
+                 rebuild_index: bool = False, index_cache_timeout: int = 3600,
+                 sample_records=None):
         super().__init__()
         self.cfg = cfg
         self.split = split
@@ -195,7 +196,10 @@ class OpenTouchTactileDataset(Dataset):
         print(f"[{split}] Loading subdiv palm mask for evaluation and loss masking...")
         self.palm_mask = self._load_palm_mask()
         
-        self.samples = self._load_or_build_index()
+        if sample_records is None:
+            self.samples = self._load_or_build_index()
+        else:
+            self.samples = list(sample_records)
         source_counts = {}
         for sample in self.samples:
             source_counts[sample["dataset"]] = source_counts.get(sample["dataset"], 0) + 1

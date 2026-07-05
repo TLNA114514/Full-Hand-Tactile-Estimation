@@ -127,3 +127,7 @@ worker_crash_dump_*.txt
 *.manifest
 *.lock
 wandb/
+
+# others
+hamer_tactile_ft/eval_reports
+hamer_tactile_ft/eval_reports_baseline

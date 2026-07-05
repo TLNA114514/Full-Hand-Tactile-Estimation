@@ -98,6 +98,7 @@ sys.path.append(ft_dir)
 
 from dataset import OpenTouchTactileDataset
 from hamer_tactile import HAMER_Tactile
+from losses import TactileLossConfig
 
 DATASET_ROOTS = {
     "opentouch": "/data1/jiangrui/OpenTouch Data/full_dataset",
@@ -147,10 +148,12 @@ def resolve_data_dirs(args):
 
 
 class OpenTouchHAMER_TactileWrapper(HAMER_Tactile):
-    def __init__(self, cfg, learning_rate=1e-4):
+    def __init__(self, cfg, learning_rate=1e-4, tactile_loss_config=None):
         # Initialize without loading rendering to save GPU memory
         super().__init__(cfg, init_renderer=False)
         self.learning_rate = learning_rate
+        if tactile_loss_config is not None:
+            self.set_tactile_loss_config(tactile_loss_config)
         
         self.automatic_optimization = True
         
@@ -174,6 +177,7 @@ class OpenTouchHAMER_TactileWrapper(HAMER_Tactile):
         # Log tactile loss and total loss
         self.log('train/loss_tactile', output['losses']['loss_tactile'], on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
         self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        self._log_tactile_loss_breakdown("train", output, on_step=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -200,7 +204,22 @@ class OpenTouchHAMER_TactileWrapper(HAMER_Tactile):
             
         self.log('val/loss_tactile', output['losses']['loss_tactile'], on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
         self.log('val/loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        self._log_tactile_loss_breakdown("val", output, on_step=False)
         return loss
+
+    def _log_tactile_loss_breakdown(self, prefix, output, on_step):
+        mapping = {
+            "loss_base_tactile": "loss/base_tactile",
+            "loss_weighted_tactile": "loss/weighted_tactile",
+            "loss_background": "loss/background",
+            "loss_volume_iou": "loss/volume_iou",
+            "pred_volume": "stats/pred_volume",
+            "gt_volume": "stats/gt_volume",
+            "pred_gt_volume_ratio": "stats/pred_gt_volume_ratio",
+        }
+        for key, name in mapping.items():
+            if key in output["losses"]:
+                self.log(f"{prefix}/{name}", output["losses"][key], on_step=on_step, on_epoch=True, logger=True, sync_dist=True)
         
     def tensorboard_logging(self, *args, **kwargs):
         # Override to be a no-op to prevent WebGL/OpenGL/Renderer crashes during training
@@ -309,7 +328,36 @@ def parse_args():
     parser.add_argument("--exp_name", type=str, default="tactile_ft", help="Experiment name")
     parser.add_argument("--quick_test", action="store_true", help="Run a quick test training")
     parser.add_argument("--render_platform", type=str, default="egl", choices=["egl", "osmesa"], help="Rendering platform (egl or osmesa)")
+    parser.add_argument("--active_pressure_thr", type=float, default=0.05)
+    parser.add_argument("--active_pressure_peak", type=float, default=0.12)
+    parser.add_argument("--active_pressure_high", type=float, default=0.60)
+    parser.add_argument("--background_pressure_thr", type=float, default=0.02)
+    parser.add_argument("--background_pred_margin", type=float, default=0.02)
+    parser.add_argument("--active_pressure_weight", type=float, default=4.0)
+    parser.add_argument("--active_pressure_gamma", type=float, default=1.0)
+    parser.add_argument("--background_loss_weight", type=float, default=0.5)
+    parser.add_argument("--volume_iou_loss_weight", type=float, default=0.2)
+    parser.add_argument("--opentouch_high_pressure_thr", type=float, default=0.9)
+    parser.add_argument("--opentouch_high_pressure_weight", type=float, default=0.3)
+    parser.add_argument("--loss_ramp_epochs", type=int, default=5)
     return parser.parse_args()
+
+
+def tactile_loss_config_from_args(args):
+    return TactileLossConfig(
+        active_pressure_thr=args.active_pressure_thr,
+        active_pressure_peak=args.active_pressure_peak,
+        active_pressure_high=args.active_pressure_high,
+        background_pressure_thr=args.background_pressure_thr,
+        background_pred_margin=args.background_pred_margin,
+        active_pressure_weight=args.active_pressure_weight,
+        active_pressure_gamma=args.active_pressure_gamma,
+        background_loss_weight=args.background_loss_weight,
+        volume_iou_loss_weight=args.volume_iou_loss_weight,
+        opentouch_high_pressure_thr=args.opentouch_high_pressure_thr,
+        opentouch_high_pressure_weight=args.opentouch_high_pressure_weight,
+        loss_ramp_epochs=args.loss_ramp_epochs,
+    )
 
 def main():
     args = parse_args()
@@ -353,7 +401,8 @@ def main():
     print("Initializing HAMER_Tactile Wrapper...")
     model = OpenTouchHAMER_TactileWrapper(
         cfg=model_cfg,
-        learning_rate=lr_scaled
+        learning_rate=lr_scaled,
+        tactile_loss_config=tactile_loss_config_from_args(args),
     )
     
     # Do a dummy forward pass to initialize lazy layers before shape-aware loading.
