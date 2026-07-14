@@ -1,0 +1,48 @@
+{
+  "bin_counts": [
+    3086561268,
+    213951509,
+    149465338,
+    104617804,
+    90537247,
+    58209548,
+    21006847,
+    10380008
+  ],
+  "bin_edges": [
+    0.0,
+    0.005,
+    0.02,
+    0.05,
+    0.1,
+    0.2,
+    0.4,
+    0.7,
+    1.0
+  ],
+  "bin_values": [
+    0.0001721462267294305,
+    0.011102094337509257,
+    0.03264220207228545,
+    0.07168657097366082,
+    0.1424064371429032,
+    0.27643163554906625,
+    0.5159708438732055,
+    0.8567567142053167
+  ],
+  "note": "Dense subdiv GT statistics only; no raw sensor-pressure map is used.",
+  "ordinal_thresholds": [
+    0.005,
+    0.02,
+    0.05,
+    0.1,
+    0.2,
+    0.4,
+    0.7
+  ],
+  "resolved_data_dirs": [
+    "/home/ma-user/work/cfzhao/OpenTouch Data/full_dataset",
+    "/home/ma-user/work/cfzhao/EgoTouch/extracted_frames"
+  ],
+  "source_split": "train"
+}

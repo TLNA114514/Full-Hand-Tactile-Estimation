@@ -24,8 +24,14 @@ python train.py \
     --lr 1e-4 \
     --batch_size 16 \
     --epochs 90 \
-    --num_workers 16 \
+    --num_workers 12 \
+    --val_num_workers 8 \
+    --persistent_workers \
+    --prefetch_factor 4 \
+    --check_val_every_n_epoch 1 \
     --use_wandb \
+    --checkpoint_monitor val/eval_missing_bbox_mae \
+    --checkpoint_mode min \
     --datasets opentouch,touchanything,egotactile \
     --manifest_dir "$MANIFEST_DIR" \
     --manifest_workers 128 \
@@ -43,16 +49,13 @@ python train.py \
     --pressure_key_priority "continuous_subdiv>gaussian_pressure>original_hdf5_data" \
     --temporal_smooth_weight 0.05 \
     --active_pressure_thr 0.05 \
-    --active_pressure_peak 0.10 \
-    --active_pressure_high 0.30 \
-    --background_pressure_thr 0.02 \
-    --background_pred_margin 0.02 \
-    --active_pressure_weight 1.0 \
-    --active_pressure_gamma 1.0 \
-    --background_loss_weight 1.0 \
-    --volume_iou_loss_weight 0.0 \
+    --active_pressure_weight 1.5 \
+    --active_pressure_gamma 0.7 \
+    --active_pressure_max_weight 2.5 \
+    --active_pressure_weight_warmup_epochs 10 \
+    --pressure_loss_warmup_epochs 0 \
+    --pressure_loss_warmup_start 1.0 \
     --opentouch_high_pressure_thr 0.9 \
     --opentouch_high_pressure_weight 0.3 \
-    --loss_ramp_epochs 10 \
     --exp_name mixed_ot_ta_ego_infiller \
     "$@"

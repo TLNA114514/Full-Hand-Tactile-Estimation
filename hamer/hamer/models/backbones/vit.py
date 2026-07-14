@@ -317,7 +317,7 @@ class ViT(nn.Module):
     def no_weight_decay(self):
         return {'pos_embed', 'cls_token'}
 
-    def forward_features(self, x):
+    def forward_features(self, x, return_intermediate_layers=None):
         B, C, H, W = x.shape
         x, (Hp, Wp) = self.patch_embed(x)
 
@@ -326,20 +326,41 @@ class ViT(nn.Module):
             # since the first element for pos embed (sin-cos manner) is zero, it will cause no difference
             x = x + self.pos_embed[:, 1:] + self.pos_embed[:, :1]
 
-        for blk in self.blocks:
+        requested_layers = None
+        intermediate_tokens = {}
+        if return_intermediate_layers is not None:
+            requested_layers = tuple(int(layer) for layer in return_intermediate_layers)
+            if not requested_layers or len(set(requested_layers)) != len(requested_layers):
+                raise ValueError("return_intermediate_layers must contain unique 1-based layer indices")
+            if min(requested_layers) < 1 or max(requested_layers) > len(self.blocks):
+                raise ValueError(
+                    f"return_intermediate_layers must be in [1, {len(self.blocks)}], got {requested_layers}"
+                )
+
+        for layer_index, blk in enumerate(self.blocks, start=1):
             if self.use_checkpoint:
                 x = checkpoint.checkpoint(blk, x)
             else:
                 x = blk(x)
+            if requested_layers is not None and layer_index in requested_layers:
+                intermediate_tokens[layer_index] = x
 
         x = self.last_norm(x)
+
+        if requested_layers is not None:
+            if len(self.blocks) in intermediate_tokens:
+                intermediate_tokens[len(self.blocks)] = x
+            return [
+                intermediate_tokens[layer].permute(0, 2, 1).reshape(B, -1, Hp, Wp).contiguous()
+                for layer in requested_layers
+            ]
 
         xp = x.permute(0, 2, 1).reshape(B, -1, Hp, Wp).contiguous()
 
         return xp
 
-    def forward(self, x):
-        x = self.forward_features(x)
+    def forward(self, x, return_intermediate_layers=None):
+        x = self.forward_features(x, return_intermediate_layers=return_intermediate_layers)
         return x
 
     def train(self, mode=True):

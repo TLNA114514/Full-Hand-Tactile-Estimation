@@ -7,7 +7,8 @@ import torch
 import glob
 import hashlib
 import time
-from concurrent.futures import ProcessPoolExecutor
+import socket
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from torch.utils.data import Dataset
 from yacs.config import CfgNode
 
@@ -163,18 +164,95 @@ def wait_for_file(path, timeout_sec=3600, poll_sec=5):
         time.sleep(poll_sec)
 
 
+def wait_for_shared_cache(cache_path, done_path, lock_dir, timeout_sec=3600, poll_sec=5):
+    start = time.time()
+    while True:
+        builder_active = os.path.isdir(lock_dir)
+        cache_ready = os.path.isfile(cache_path) and os.path.isfile(done_path)
+        if not builder_active and cache_ready:
+            return
+        if time.time() - start > timeout_sec:
+            raise TimeoutError(
+                f"Timed out waiting for shared index cache: {cache_path} "
+                f"(builder_active={builder_active})"
+            )
+        time.sleep(poll_sec)
+
+
+class SharedCacheBuildLock:
+    """Cross-host cache-build lock backed by an atomic shared-filesystem mkdir."""
+
+    def __init__(self, lock_dir, timeout_sec=3600, poll_sec=5):
+        self.lock_dir = os.path.abspath(lock_dir)
+        self.timeout_sec = int(timeout_sec)
+        self.poll_sec = float(poll_sec)
+        self.acquired = False
+
+    def try_acquire(self):
+        try:
+            os.makedirs(self.lock_dir)
+        except FileExistsError:
+            return False
+        owner_path = os.path.join(self.lock_dir, "owner.json")
+        self.acquired = True
+        try:
+            with open(owner_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "hostname": socket.gethostname(),
+                        "pid": os.getpid(),
+                        "created_unix": time.time(),
+                    },
+                    f,
+                    sort_keys=True,
+                )
+                f.write("\n")
+        except Exception:
+            self.release()
+            raise
+        return True
+
+    def release(self):
+        if not self.acquired:
+            return
+        owner_path = os.path.join(self.lock_dir, "owner.json")
+        try:
+            os.remove(owner_path)
+        except FileNotFoundError:
+            pass
+        try:
+            os.rmdir(self.lock_dir)
+        except FileNotFoundError:
+            pass
+        self.acquired = False
+
+    def owner_description(self):
+        owner_path = os.path.join(self.lock_dir, "owner.json")
+        try:
+            with open(owner_path, "r", encoding="utf-8") as f:
+                owner = json.load(f)
+            return f"host={owner.get('hostname')}, pid={owner.get('pid')}"
+        except Exception:
+            return "owner metadata unavailable"
+
+
 class OpenTouchTactileDataset(Dataset):
     def __init__(self, cfg: CfgNode, split: str = "train", 
                  data_dir: str = None, train: bool = True, index_workers: int = 1,
                  index_chunksize: int = 256, index_cache_dir: str = None,
                  rebuild_index: bool = False, index_cache_timeout: int = 3600,
-                 sample_records=None):
+                 index_backend: str = "process",
+                 sample_records=None, tactile_only: bool = False):
         super().__init__()
         self.cfg = cfg
         self.split = split
         self.train = train
+        self.tactile_only = bool(tactile_only)
         self.index_workers = max(1, int(index_workers))
         self.index_chunksize = max(1, int(index_chunksize))
+        self.index_backend = str(index_backend or "process").lower()
+        if self.index_backend not in ("process", "thread"):
+            raise ValueError(f"Unsupported index_backend: {index_backend!r}. Use 'process' or 'thread'.")
         self.index_cache_dir = index_cache_dir
         self.rebuild_index = bool(rebuild_index)
         self.index_cache_timeout = int(index_cache_timeout)
@@ -284,18 +362,37 @@ class OpenTouchTactileDataset(Dataset):
             return read_jsonl(cache_path)
 
         if rank == 0:
-            print(f"[{self.split}] Building index cache on rank 0: {cache_path}")
-            if self.rebuild_index:
-                for path in (cache_path, done_path):
-                    try:
-                        os.remove(path)
-                    except FileNotFoundError:
-                        pass
-            samples = self._build_index()
-            write_jsonl_atomic(cache_path, samples)
-            write_jsonl_atomic(done_path, [{"complete": True, "num_samples": len(samples)}])
-            print(f"[{self.split}] Wrote index cache: {cache_path}")
-            return samples
+            lock = SharedCacheBuildLock(f"{cache_path}.lock", timeout_sec=self.index_cache_timeout)
+            if lock.try_acquire():
+                print(f"[{self.split}] Building index cache under shared lock: {cache_path}")
+                try:
+                    if self.rebuild_index:
+                        for path in (cache_path, done_path):
+                            try:
+                                os.remove(path)
+                            except FileNotFoundError:
+                                pass
+                    elif os.path.exists(cache_path) and os.path.exists(done_path):
+                        return read_jsonl(cache_path)
+                    samples = self._build_index()
+                    write_jsonl_atomic(cache_path, samples)
+                    write_jsonl_atomic(done_path, [{"complete": True, "num_samples": len(samples)}])
+                    print(f"[{self.split}] Wrote index cache: {cache_path}")
+                    return samples
+                finally:
+                    lock.release()
+
+            print(
+                f"[{self.split}] Another host is building the shared index cache "
+                f"({lock.owner_description()}); waiting for {done_path}"
+            )
+            wait_for_shared_cache(
+                cache_path,
+                done_path,
+                lock.lock_dir,
+                timeout_sec=self.index_cache_timeout,
+            )
+            return read_jsonl(cache_path)
 
         print(f"[{self.split}] Rank {rank} waiting for index cache: {cache_path}")
         wait_for_file(done_path, timeout_sec=self.index_cache_timeout)
@@ -314,7 +411,7 @@ class OpenTouchTactileDataset(Dataset):
 
         print(
             f"[{self.split}] Index scan: {len(sample_dirs)} sample dirs with "
-            f"{self.index_workers} worker(s), chunksize={self.index_chunksize}"
+            f"{self.index_workers} {self.index_backend} worker(s), chunksize={self.index_chunksize}"
         )
         samples = []
         if self.index_workers == 1:
@@ -322,12 +419,17 @@ class OpenTouchTactileDataset(Dataset):
                 samples.extend(scan_sample_dir(sample_dir))
         else:
             done = 0
-            with ProcessPoolExecutor(max_workers=self.index_workers) as executor:
+            executor_cls = ProcessPoolExecutor if self.index_backend == "process" else ThreadPoolExecutor
+            with executor_cls(max_workers=self.index_workers) as executor:
                 for result in executor.map(scan_sample_dir, sample_dirs, chunksize=self.index_chunksize):
                     samples.extend(result)
                     done += 1
                     if done % 10000 == 0:
                         print(f"[{self.split}] Indexed {done}/{len(sample_dirs)} sample dirs...")
+            if done != len(sample_dirs):
+                print(f"[{self.split}] Indexed {done}/{len(sample_dirs)} sample dirs...")
+            print(f"[{self.split}] Index scan complete; collected {len(samples)} hand samples.")
+        print(f"[{self.split}] Sorting {len(samples)} hand samples...")
         samples.sort(key=lambda item: (item["sample_dir"], item["hand"]))
         return samples
 
@@ -395,12 +497,21 @@ class OpenTouchTactileDataset(Dataset):
                     f"expected ({self.tactile_dim},). Treating as no tactile data."
                 )
 
-        # 4. Format 3D keypoints for Hamer (N, 4)
-        keypoints_3d = np.zeros((21, 4), dtype=np.float32)
-        keypoints_3d[valid_mask, :3] = landmarks_cam[valid_mask]
-        keypoints_3d[valid_mask, 3] = 1.0
-        
-        # 5. Calculate bounding box parameters
+        if not self.tactile_only:
+            keypoints_3d = np.zeros((21, 4), dtype=np.float32)
+            keypoints_3d[valid_mask, :3] = landmarks_cam[valid_mask]
+            keypoints_3d[valid_mask, 3] = 1.0
+            keypoints_2d = np.zeros((21, 3), dtype=np.float32)
+            num_pose = 3 * (self.cfg.MANO.NUM_HAND_JOINTS + 1)
+            mano_params = {
+                'global_orient': np.zeros(3, dtype=np.float32),
+                'hand_pose': np.zeros(num_pose - 3, dtype=np.float32),
+                'betas': np.zeros(10, dtype=np.float32)
+            }
+            has_mano_params = {k: 0.0 for k in mano_params.keys()}
+            mano_params_is_axis_angle = {'global_orient': True, 'hand_pose': True, 'betas': False}
+
+        # Calculate bounding box parameters.
         if np.isnan(bbox).any() or len(bbox) < 4:
             return self.__getitem__(np.random.randint(0, len(self.samples)))
             
@@ -413,17 +524,6 @@ class OpenTouchTactileDataset(Dataset):
             
         bbox_size = self.rescale_factor * scale_pixels
         
-        # Placeholders
-        keypoints_2d = np.zeros((21, 3), dtype=np.float32)
-        num_pose = 3 * (self.cfg.MANO.NUM_HAND_JOINTS + 1)
-        mano_params = {
-            'global_orient': np.zeros(3, dtype=np.float32),
-            'hand_pose': np.zeros(num_pose - 3, dtype=np.float32),
-            'betas': np.zeros(10, dtype=np.float32)
-        }
-        has_mano_params = {k: 0.0 for k in mano_params.keys()}
-        mano_params_is_axis_angle = {'global_orient': True, 'hand_pose': True, 'betas': False}
-
         # Add basic augmentation during training
         if self.train:
             augm_config = self.cfg.DATASETS.CONFIG
@@ -453,29 +553,34 @@ class OpenTouchTactileDataset(Dataset):
         if is_right == 0:
             # Flip left hands to right hands for Hamer
             img_patch = cv2.flip(img_patch, 1)
-            keypoints_3d[:, 0] = -keypoints_3d[:, 0]
+            if not self.tactile_only:
+                keypoints_3d[:, 0] = -keypoints_3d[:, 0]
             # Continuous pressure is already generated on the canonical MANO topology.
             
         # Standard mean/std normalization
         img_patch = (img_patch - self.cfg.MODEL.IMAGE_MEAN) / self.cfg.MODEL.IMAGE_STD
         img_patch = img_patch.transpose(2, 0, 1)
         
-        img_size_array = np.array([img_bgr.shape[1], img_bgr.shape[0]])
-        
         item = {
             'dataset': dataset_name,
+            'sample_dir': sample_dir,
+            'hand': str(hand),
             'img': torch.from_numpy(img_patch).float(),
-            'keypoints_3d': torch.from_numpy(keypoints_3d).float(),
-            'keypoints_2d': torch.from_numpy(keypoints_2d).float(),
             'tactile_signal': torch.from_numpy(tactile_signal).float(),
             'has_tactile': torch.tensor(has_tactile).float(),
             'palm_mask': torch.from_numpy(self.palm_mask).float(),
-            'box_center': torch.tensor([center_x, center_y]).float(),
-            'box_size': torch.tensor(bbox_size).float(),
-            'img_size': torch.from_numpy(img_size_array).float(),
             'right': torch.tensor(float(is_right)).float(),
-            'mano_params': {k: torch.from_numpy(v).float() for k, v in mano_params.items()},
-            'has_mano_params': {k: torch.tensor(float(v)).float() for k, v in has_mano_params.items()},
-            'mano_params_is_axis_angle': {k: torch.tensor(v).bool() for k, v in mano_params_is_axis_angle.items()},
         }
+        if not self.tactile_only:
+            img_size_array = np.array([img_bgr.shape[1], img_bgr.shape[0]])
+            item.update({
+                'keypoints_3d': torch.from_numpy(keypoints_3d).float(),
+                'keypoints_2d': torch.from_numpy(keypoints_2d).float(),
+                'box_center': torch.tensor([center_x, center_y]).float(),
+                'box_size': torch.tensor(bbox_size).float(),
+                'img_size': torch.from_numpy(img_size_array).float(),
+                'mano_params': {k: torch.from_numpy(v).float() for k, v in mano_params.items()},
+                'has_mano_params': {k: torch.tensor(float(v)).float() for k, v in has_mano_params.items()},
+                'mano_params_is_axis_angle': {k: torch.tensor(v).bool() for k, v in mano_params_is_axis_angle.items()},
+            })
         return item

@@ -130,4 +130,8 @@ wandb/
 
 # others
 hamer_tactile_ft/eval_reports
+hamer_tactile_ft/eval_reports_*
 hamer_tactile_ft/eval_reports_baseline
+hamer_tactile_ft/index_cache
+hamer_tactile_ft/reports
+hamer_tactile_ft/amp_audits

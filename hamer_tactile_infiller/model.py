@@ -39,7 +39,13 @@ class TactileInfiller(nn.Module):
     ):
         super().__init__()
         self.cfg = cfg
-        self.frame_model = HAMER_Tactile(cfg, init_renderer=init_renderer)
+        self.frame_model = HAMER_Tactile(
+            cfg,
+            init_renderer=init_renderer,
+            tactile_head_type="mlp",
+            pool_layout="legacy5",
+            pool_grid_size=5,
+        )
         self.tactile_dim = count_obj_vertices()
         self.hidden_dim = int(hidden_dim)
 
