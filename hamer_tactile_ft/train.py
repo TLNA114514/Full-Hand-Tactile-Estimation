@@ -11,80 +11,11 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
-# ==========================================================================================
-# 🛑 核心黑魔法：源码感知 + 全局空间硬核注入补丁（地表最强终结版，完美解决一切 NameError）
-# ==========================================================================================
-_parser = argparse.ArgumentParser(add_help=False)
-_parser.add_argument('--render_platform', type=str, default='egl', choices=['egl', 'osmesa'], help='Rendering platform (egl or osmesa)')
-_args, _ = _parser.parse_known_args()
-
-os.environ['PYOPENGL_PLATFORM'] = _args.render_platform
-os.environ['PYRENDER_PLATFORM'] = _args.render_platform
-
-try:
-    import types
-    import builtins
-    import re
-    import sys
-
-    # 1. 定义一个全能通配符类：既是数字0，又是可任意调用的函数，还支持无限切片和属性延伸
-    class UltimateMagicMock(int):
-        def __call__(self, *args, **kwargs): return self
-        def __getattr__(self, name): return self
-        def __getitem__(self, item): return self
-        def __iter__(self): return iter([])
-
-    class PerfectMockModule(types.ModuleType):
-        def __getattr__(self, name):
-            if name.startswith('__'): raise AttributeError(name)
-            return UltimateMagicMock(0)
-
-    mock_obj = PerfectMockModule('OpenGL.GL')
-
-    # 2. 拦截系统的底层 __import__ 行为
-    orig_import = builtins.__import__
-    def custom_import(name, globals=None, locals=None, fromlist=(), level=0):
-        # 只要发现有任何文件在尝试染指 OpenGL/EGL/OSMesa
-        if name.startswith('OpenGL') or name in ['EGL', 'OSMesa']:
-            if globals is not None and '__file__' in globals:
-                try:
-                    # 【硬核注入】读取当前正在执行 import 的文件（如 texture.py）的源码
-                    with open(globals['__file__'], 'r', encoding='utf-8', errors='ignore') as f:
-                        content = f.read()
-                    
-                    # 抓取该文件里写的所有 OpenGL 相关的函数和常量（如 GL_TEXTURE_2D, glGenTextures 等）
-                    tokens = re.findall(r'\b([gG][lL][A-Za-z0-9_]+|[eE][gG][lL][A-Za-z0-9_]+|OSMesa[A-Za-z0-9_]+)\b', content)
-                    
-                    # 直接强行把这些变量塞进该文件的全局命名空间，彻底断绝 NameError 的可能
-                    for token in tokens:
-                        if token not in globals:
-                            globals[token] = UltimateMagicMock(0)
-                except Exception:
-                    pass
-            return mock_obj
-        return orig_import(name, globals, locals, fromlist, level)
-    
-    # 替换系统全局导入函数
-    builtins.__import__ = custom_import
-
-    # 3. 固化系统路由备份
-    sys.modules['EGL'] = mock_obj
-    sys.modules['OSMesa'] = mock_obj
-    sys.modules['OpenGL'] = mock_obj
-    sys.modules['OpenGL.GL'] = mock_obj
-    sys.modules['OpenGL.GL.shaders'] = mock_obj
-    
-    print("\n====== [Success] Hardcore Global Token Injector Activated! ======\n")
-except Exception as e:
-    print(f"Bypass failed: {e}")
-# ==========================================================================================
-
 sys.argv[0] = os.path.abspath(__file__)
 
 import faulthandler
 faulthandler.enable()
 
-import argparse
 import pytorch_lightning as pl
 import cv2
 
@@ -104,23 +35,27 @@ workspace_dir = os.path.abspath(os.path.join(ft_dir, ".."))
 sys.path.append(os.path.join(workspace_dir, "hamer"))
 sys.path.append(ft_dir)
 
-from dataset import OpenTouchTactileDataset
-from hamer_tactile import HAMER_Tactile
+from dataset import (
+    DATASET_ROOTS,
+    INDEX_CACHE_VERSION,
+    OpenTouchTactileDataset,
+    canonical_dataset_name,
+    canonical_dataset_filter,
+    ddp_global_rank,
+    release_unused_python_heap,
+)
+from hamer_tactile import DinoTactileModel
 from losses import TactileLossConfig
+from tactile_metrics import (
+    CompactTouchAnythingProtocolAccumulator,
+    TOUCHANYTHING_CONTACT_THRESHOLD,
+    TOUCHANYTHING_MIN_CONTACT_RATIO,
+    summarize_compact_touchanything_protocol,
+    touchanything_protocol_group_key,
+)
 
-DATASET_ROOTS = {
-    "opentouch": "/data1/jiangrui/OpenTouch Data/full_dataset",
-    "open_touch": "/data1/jiangrui/OpenTouch Data/full_dataset",
-    "ot": "/data1/jiangrui/OpenTouch Data/full_dataset",
-    "touchanything": "/data1/jiangrui/EgoTouch/extracted_frames",
-    "touch_anything": "/data1/jiangrui/EgoTouch/extracted_frames",
-    "egotouch": "/data1/jiangrui/EgoTouch/extracted_frames",
-    "ego_touch": "/data1/jiangrui/EgoTouch/extracted_frames",
-    "ta": "/data1/jiangrui/EgoTouch/extracted_frames",
-    "egotactile": "/data1/jiangrui/EgoTactile/Raw_data/extracted_frames",
-    "ego_tactile": "/data1/jiangrui/EgoTactile/Raw_data/extracted_frames",
-    "ego": "/data1/jiangrui/EgoTactile/Raw_data/extracted_frames",
-}
+CORE_LOCATION_DISTRIBUTION_POWER = 2.0
+CORE_LOCATION_MIN_GT_PEAK = 0.05
 
 def linear_scaled_learning_rate(base_lr, num_gpus):
     if int(num_gpus) < 1:
@@ -134,6 +69,7 @@ def gradient_clip_triggered(grad_norm, clip_value):
 
 class ValidationMetricsTextLogger(Callback):
     TRAIN_EPOCH_KEYS = {
+        "train/loss_epoch_global",
         "train/epoch_grad_norm_mean",
         "train/epoch_grad_norm_max",
         "train/grad_clip_trigger_rate_epoch",
@@ -161,7 +97,11 @@ class ValidationMetricsTextLogger(Callback):
 
         metrics = {}
         for name, value in trainer.callback_metrics.items():
-            if not str(name).startswith("val/") and str(name) not in self.TRAIN_EPOCH_KEYS:
+            if (
+                not str(name).startswith("val/")
+                and not str(name).startswith("train/loss_")
+                and str(name) not in self.TRAIN_EPOCH_KEYS
+            ):
                 continue
             if isinstance(value, torch.Tensor):
                 if value.numel() != 1:
@@ -175,7 +115,6 @@ class ValidationMetricsTextLogger(Callback):
 
         for name, value in getattr(pl_module, "_train_epoch_summary", {}).items():
             metrics[str(name)] = float(value)
-
         if not metrics:
             return
 
@@ -196,6 +135,69 @@ def _split_csv(value):
     if isinstance(value, (list, tuple)):
         return [str(item).strip() for item in value if str(item).strip()]
     return [item.strip() for item in str(value).split(",") if item.strip()]
+
+
+def optimizer_parameter_groups(named_parameters, weight_decay):
+    weight_decay = float(weight_decay)
+    decay_params = []
+    no_decay_params = []
+    for name, param in named_parameters:
+        if not param.requires_grad:
+            continue
+        if any(no_decay_name in name for no_decay_name in ("bias", "norm", "LayerNorm")):
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+    return [
+        {"params": decay_params, "weight_decay": weight_decay},
+        {"params": no_decay_params, "weight_decay": 0.0},
+    ]
+
+
+def lr_warmup_step_count(total_steps, max_epochs, warmup_epochs):
+    total_steps = int(total_steps)
+    max_epochs = max(int(max_epochs), 1)
+    warmup_steps = int(round(total_steps * max(int(warmup_epochs), 0) / max_epochs))
+    if warmup_steps > 0:
+        warmup_steps = min(warmup_steps, max(total_steps - 1, 1))
+    return warmup_steps
+
+
+def resolve_lr_decay_milestones(value, total_steps):
+    total_steps = int(total_steps)
+    if total_steps <= 1:
+        raise ValueError("Multistep scheduling requires at least two total training steps")
+    tokens = [item.strip() for item in str(value or "").split(",") if item.strip()]
+    if not tokens:
+        raise ValueError("--lr_decay_milestones must contain at least one fraction or step")
+
+    milestones = []
+    for token in tokens:
+        try:
+            numeric = float(token)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid --lr_decay_milestones value {token!r}; expected fractions or steps"
+            ) from exc
+        if not math.isfinite(numeric) or numeric <= 0.0:
+            raise ValueError("--lr_decay_milestones values must be finite and positive")
+        if numeric < 1.0:
+            step = int(round(numeric * total_steps))
+        elif numeric.is_integer():
+            step = int(numeric)
+        else:
+            raise ValueError(
+                f"Absolute LR milestone {token!r} must be an integer number of steps"
+            )
+        if not 0 < step < total_steps:
+            raise ValueError(
+                f"Resolved LR milestone {step} must lie strictly between 0 and {total_steps}"
+            )
+        milestones.append(step)
+
+    if milestones != sorted(set(milestones)):
+        raise ValueError("--lr_decay_milestones must resolve to unique increasing steps")
+    return milestones
 
 
 def resolve_data_dirs(args):
@@ -222,7 +224,7 @@ def resolve_data_dirs(args):
     return deduped
 
 
-class OpenTouchHAMER_TactileWrapper(HAMER_Tactile):
+class TactileTrainingModule(DinoTactileModel):
     def __init__(
         self,
         cfg,
@@ -234,14 +236,21 @@ class OpenTouchHAMER_TactileWrapper(HAMER_Tactile):
         frame_low_volume_thr=30.0,
         frame_high_volume_thr=150.0,
         sync_train_logs=False,
-        audit_nonfinite_grads=False,
-        nonfinite_audit_dir=None,
-        audit_checkpoint_path=None,
-        audit_seed=2029,
-        tactile_head_type="dense_v2",
-        backbone_feature_layers=(16, 24, 32),
-        visual_backbone="hamer",
+        tactile_head_type="dense_v2_dino_rezero",
+        backbone_feature_layers=(8, 16, 24, 32),
+        visual_backbone="dinov3_hplus",
         dino_weights="",
+        dino_rezero_source="multilevel",
+        dino_residual_max_scale=0.10,
+        dino_residual_rms_budget=0.50,
+        bbox_rescale_factor=2.0,
+        bbox_source_policy="sam3_only",
+        pool_layout="fullgrid32",
+        decoder_dropout_scale=1.0,
+        optimizer_weight_decay=1e-4,
+        lr_scheduler="cosine",
+        lr_decay_milestones="0.5,0.75",
+        lr_decay_gamma=0.1,
     ):
         # Initialize without loading rendering to save GPU memory
         super().__init__(
@@ -253,38 +262,34 @@ class OpenTouchHAMER_TactileWrapper(HAMER_Tactile):
             backbone_feature_layers=backbone_feature_layers,
             visual_backbone=visual_backbone,
             dino_weights=dino_weights,
+            dino_rezero_source=dino_rezero_source,
+            dino_residual_max_scale=dino_residual_max_scale,
+            dino_residual_rms_budget=dino_residual_rms_budget,
+            pool_layout=pool_layout,
+            decoder_dropout_scale=decoder_dropout_scale,
         )
         self.learning_rate = learning_rate
+        self.optimizer_weight_decay = float(optimizer_weight_decay)
+        self.lr_scheduler_name = str(lr_scheduler)
+        self.lr_decay_milestones = str(lr_decay_milestones)
+        self.lr_decay_milestones_resolved = []
+        self.lr_decay_gamma = float(lr_decay_gamma)
+        self.bbox_rescale_factor = float(bbox_rescale_factor)
+        self.bbox_source_policy = str(bbox_source_policy)
         self.lr_warmup_epochs = int(lr_warmup_epochs)
         self.sync_train_logs = bool(sync_train_logs)
         self.frame_low_volume_thr = float(frame_low_volume_thr)
         self.frame_high_volume_thr = float(frame_high_volume_thr)
-        self.audit_nonfinite_grads = bool(audit_nonfinite_grads)
-        self.nonfinite_audit_dir = str(nonfinite_audit_dir) if nonfinite_audit_dir else None
-        self.audit_checkpoint_path = str(audit_checkpoint_path) if audit_checkpoint_path else None
-        self.audit_seed = int(audit_seed)
-        self.visual_backbone_model_name = (
-            self.backbone.MODEL_NAME if self.visual_backbone == "dinov3_hplus" else "hamer_vit_h"
-        )
-        self.backbone_weights_path = (
-            str(dino_weights) if self.visual_backbone == "dinov3_hplus" else str(audit_checkpoint_path or "")
-        )
+        self.visual_backbone_model_name = self.backbone.MODEL_NAME
+        self.backbone_weights_path = str(dino_weights)
         self.backbone_weights_sha256 = ""
-        self._amp_audit_batch = None
-        self._amp_audit_replay_batch = None
-        self._amp_audit_cpu_rng_state = None
-        self._amp_audit_cuda_rng_state = None
-        self._pending_nonfinite_event = None
-        self._nonfinite_event_count = 0
         if tactile_loss_config is not None:
             self.set_tactile_loss_config(tactile_loss_config)
         
         self.automatic_optimization = True
         
         print("Freezing all non-tactile modules. Only training the tactile head...")
-        # HAMER also owns modules such as the adversarial discriminator. In
-        # tactile-only training they are intentionally skipped, so freeze the
-        # full model first to keep DDP from seeing unused trainable parameters.
+        # Freeze the DINO backbone and keep only the tactile head trainable.
         for param in self.parameters():
             param.requires_grad = False
 
@@ -293,6 +298,7 @@ class OpenTouchHAMER_TactileWrapper(HAMER_Tactile):
             param.requires_grad = True
 
         self._val_eval_stats = None
+        self._val_touchanything_protocol_stats = CompactTouchAnythingProtocolAccumulator()
         self._grad_clip_trigger_count = 0
         self._grad_clip_step_count = 0
         self._grad_norm_finite_step_count = 0
@@ -301,6 +307,10 @@ class OpenTouchHAMER_TactileWrapper(HAMER_Tactile):
         self._grad_norm_max = 0.0
         self._effective_lr_epoch_end = float(self.learning_rate)
         self._train_epoch_summary = {}
+        self._train_metric_sums = {}
+        self._train_metric_weight = 0
+        self._global_train_summary_epoch = None
+        self._global_train_summary_cache = None
 
     def on_train_epoch_start(self):
         self._grad_clip_trigger_count = 0
@@ -309,125 +319,13 @@ class OpenTouchHAMER_TactileWrapper(HAMER_Tactile):
         self._nonfinite_grad_step_count = 0
         self._grad_norm_sum = 0.0
         self._grad_norm_max = 0.0
-
-    def _amp_scaler_scale(self):
-        trainer = getattr(self, "_trainer", None)
-        plugin = getattr(trainer, "precision_plugin", None) if trainer is not None else None
-        scaler = getattr(plugin, "scaler", None)
-        if scaler is None:
-            return None
-        try:
-            return float(scaler.get_scale())
-        except Exception:
-            return None
-
-    @staticmethod
-    def _audit_tensor_stats(value):
-        if not isinstance(value, torch.Tensor):
-            return None
-        tensor = value.detach().float()
-        finite = torch.isfinite(tensor)
-        finite_values = tensor[finite]
-        return {
-            "shape": list(tensor.shape),
-            "nonfinite_count": int((~finite).sum().item()),
-            "min": float(finite_values.min().item()) if finite_values.numel() else None,
-            "max": float(finite_values.max().item()) if finite_values.numel() else None,
-            "abs_max": float(finite_values.abs().max().item()) if finite_values.numel() else None,
-        }
-
-    def _capture_amp_audit_batch(self, batch, output, batch_idx):
-        target = batch["tactile_signal"].detach().float()
-        palm = batch["palm_mask"].detach().float()
-        valid = batch["has_tactile"].detach().float()
-        palm_count = palm.sum(dim=-1).clamp_min(1.0)
-        volume = (target * palm).sum(dim=-1)
-        positive = (((target >= 0.005).float() * palm).sum(dim=-1) / palm_count)
-        active = (((target >= self.tactile_loss_config.active_pressure_thr).float() * palm).sum(dim=-1) / palm_count)
-        right = batch.get("right")
-        right_values = right.detach().cpu().tolist() if isinstance(right, torch.Tensor) else [None] * len(volume)
-        sample_dirs = list(batch.get("sample_dir", [None] * len(volume)))
-        hands = list(batch.get("hand", [None] * len(volume)))
-        datasets = list(batch.get("dataset", [None] * len(volume)))
-        samples = []
-        for index in range(len(volume)):
-            samples.append({
-                "sample_dir": sample_dirs[index],
-                "hand": hands[index],
-                "dataset": datasets[index],
-                "is_right": int(round(float(right_values[index]))) if right_values[index] is not None else None,
-                "gt_volume": float(volume[index].cpu()),
-                "positive_fraction": float(positive[index].cpu()),
-                "active_fraction": float(active[index].cpu()),
-                "has_tactile": float(valid[index].cpu()),
-            })
-        loss_values = {}
-        for name, value in output.get("losses", {}).items():
-            if isinstance(value, torch.Tensor) and value.numel() == 1:
-                loss_values[name] = float(value.detach().float().cpu())
-        tensor_stats = {
-            name: self._audit_tensor_stats(output.get(name))
-            for name in ("pred_logits", "pred_tactile")
-            if output.get(name) is not None
-        }
-        self._amp_audit_batch = {
-            "batch_idx": int(batch_idx),
-            "samples": samples,
-            "batch_mean_gt_volume": float(volume.mean().cpu()),
-            "batch_positive_fraction": float(positive.mean().cpu()),
-            "batch_active_fraction": float(active.mean().cpu()),
-            "losses": loss_values,
-            "tensor_stats": tensor_stats,
-        }
-        replay_keys = ("img", "tactile_signal", "has_tactile", "palm_mask")
-        self._amp_audit_replay_batch = {
-            key: batch[key].detach().cpu()
-            for key in replay_keys
-        }
-        self._amp_audit_replay_batch["dataset"] = datasets
-        self._amp_audit_replay_batch["sample_dir"] = sample_dirs
-        self._amp_audit_replay_batch["hand"] = hands
-        self._amp_audit_replay_batch["right"] = (
-            right.detach().cpu() if isinstance(right, torch.Tensor) else right_values
-        )
-        self._amp_audit_replay_batch["cpu_rng_state"] = self._amp_audit_cpu_rng_state
-        self._amp_audit_replay_batch["cuda_rng_state"] = self._amp_audit_cuda_rng_state
-
-    def _nonfinite_audit_path(self, filename):
-        if not self.nonfinite_audit_dir:
-            return None
-        path = Path(self.nonfinite_audit_dir)
-        path.mkdir(parents=True, exist_ok=True)
-        return path / filename
-
-    def _write_nonfinite_event(self, event):
-        rank = int(getattr(self, "global_rank", 0))
-        path = self._nonfinite_audit_path(f"nonfinite_grad_rank{rank}.jsonl")
-        if path is None:
-            return
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, sort_keys=True, allow_nan=False) + "\n")
-
-    def on_train_start(self):
-        if not self.audit_nonfinite_grads:
-            return
-        rank = int(getattr(self, "global_rank", 0))
-        path = self._nonfinite_audit_path(f"capture_config_rank{rank}.json")
-        if path is None:
-            return
-        payload = {
-            "rank": rank,
-            "world_size": int(getattr(self.trainer, "world_size", 1)),
-            "checkpoint": self.audit_checkpoint_path,
-            "seed": self.audit_seed,
-            "precision": str(getattr(self.trainer, "precision", "unknown")),
-        }
-        with path.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2, sort_keys=True)
+        self._train_metric_sums = {}
+        self._train_metric_weight = 0
+        self._global_train_summary_epoch = None
+        self._global_train_summary_cache = None
 
     def on_before_optimizer_step(self, optimizer):
         squared_norm = torch.zeros((), device=self.device)
-        branch_squared = {}
         first_nonfinite_parameter = None
         nonfinite_parameter_count = 0
         for name, parameter in self.tactile_head.named_parameters():
@@ -440,12 +338,6 @@ class OpenTouchHAMER_TactileWrapper(HAMER_Tactile):
                     nonfinite_parameter_count += 1
                     if first_nonfinite_parameter is None:
                         first_nonfinite_parameter = name
-                if self.audit_nonfinite_grads:
-                    branch = name.split(".", 1)[0]
-                    branch_squared[branch] = branch_squared.get(
-                        branch,
-                        torch.zeros((), device=self.device),
-                    ) + gradient_squared
         grad_norm = torch.sqrt(squared_norm)
         clip_value = float(getattr(self.trainer, "gradient_clip_val", 0.0) or 0.0)
         clip_trigger = gradient_clip_triggered(grad_norm.item(), clip_value)
@@ -459,36 +351,6 @@ class OpenTouchHAMER_TactileWrapper(HAMER_Tactile):
         else:
             self._nonfinite_grad_step_count += 1
         self._effective_lr_epoch_end = float(optimizer.param_groups[0]["lr"])
-        if self.audit_nonfinite_grads and first_nonfinite_parameter is not None:
-            self._nonfinite_event_count += 1
-            event = {
-                "event_index": self._nonfinite_event_count - 1,
-                "epoch": int(self.current_epoch),
-                "global_step": int(self.global_step),
-                "rank": int(getattr(self, "global_rank", 0)),
-                "world_size": int(getattr(self.trainer, "world_size", 1)),
-                "checkpoint": self.audit_checkpoint_path,
-                "seed": self.audit_seed,
-                "scaler_scale_before": self._amp_scaler_scale(),
-                "grad_norm_pre_clip": None,
-                "first_nonfinite_parameter": first_nonfinite_parameter,
-                "nonfinite_parameter_count": nonfinite_parameter_count,
-                "branch_grad_norms": {},
-                "batch": self._amp_audit_batch,
-            }
-            rank = int(getattr(self, "global_rank", 0))
-            payload_path = self._nonfinite_audit_path(
-                f"nonfinite_batch_rank{rank}_step{int(self.global_step)}.pt"
-            )
-            if payload_path is not None and self._amp_audit_replay_batch is not None:
-                torch.save(self._amp_audit_replay_batch, payload_path)
-                event["replay_batch_path"] = str(payload_path)
-            if math.isfinite(grad_norm_value):
-                event["grad_norm_pre_clip"] = grad_norm_value
-            for branch, value in branch_squared.items():
-                norm = float(torch.sqrt(value).item())
-                event["branch_grad_norms"][branch] = norm if math.isfinite(norm) else None
-            self._pending_nonfinite_event = event
         self.log(
             "train/grad_norm_pre_clip",
             grad_norm,
@@ -521,47 +383,33 @@ class OpenTouchHAMER_TactileWrapper(HAMER_Tactile):
             logger=True,
             sync_dist=False,
         )
-        if first_nonfinite_parameter is not None and not self.audit_nonfinite_grads:
+        if first_nonfinite_parameter is not None:
             raise FloatingPointError(
                 "Non-finite tactile-head gradient detected before optimizer step: "
                 f"parameter={first_nonfinite_parameter}, epoch={self.current_epoch}, "
-                f"global_step={self.global_step}, precision={self.trainer.precision}. "
-                "The optimizer step was aborted; rerun with --audit_nonfinite_grads "
-                "to capture the exact batch."
+                f"global_step={self.global_step}, precision={self.trainer.precision}."
             )
-
-    def on_train_batch_end(self, outputs, batch, batch_idx):
-        if not self.audit_nonfinite_grads or self._pending_nonfinite_event is None:
-            return
-        event = self._pending_nonfinite_event
-        scale_after = self._amp_scaler_scale()
-        scale_before = event.get("scaler_scale_before")
-        event["scaler_scale_after"] = scale_after
-        event["optimizer_step_skipped"] = bool(
-            scale_before is not None and scale_after is not None and scale_after < scale_before
-        )
-        self._write_nonfinite_event(event)
-        self._pending_nonfinite_event = None
-
-    def on_train_end(self):
-        if not self.audit_nonfinite_grads:
-            return
-        rank = int(getattr(self, "global_rank", 0))
-        path = self._nonfinite_audit_path(f"capture_summary_rank{rank}.json")
-        if path is None:
-            return
-        payload = {
-            "rank": rank,
-            "events": int(self._nonfinite_event_count),
-            "checkpoint": self.audit_checkpoint_path,
-            "seed": self.audit_seed,
-            "final_global_step": int(self.global_step),
-        }
-        with path.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2, sort_keys=True)
 
     def on_train_epoch_end(self):
         summary = self._current_train_epoch_summary()
+        summary_was_cached = (
+            self._global_train_summary_epoch == int(getattr(self, "current_epoch", 0))
+            and self._global_train_summary_cache is not None
+        )
+        global_summary = self._cached_global_train_epoch_summary()
+        self._train_epoch_summary = global_summary
+        if not summary_was_cached:
+            for name, value in global_summary.items():
+                if not name.startswith("train/loss_"):
+                    continue
+                self.log(
+                    name,
+                    value,
+                    on_step=False,
+                    on_epoch=True,
+                    logger=True,
+                    sync_dist=False,
+                )
         self.log(
             "train/epoch_grad_norm_mean",
             summary["train/epoch_grad_norm_mean"],
@@ -617,6 +465,11 @@ class OpenTouchHAMER_TactileWrapper(HAMER_Tactile):
         }
 
     def _global_train_epoch_summary(self):
+        metric_names = tuple(sorted(self._train_metric_sums))
+        metric_sums = [
+            self._train_metric_sums[name].to(device=self.device, dtype=torch.float64)
+            for name in metric_names
+        ]
         local = torch.tensor(
             [
                 self._grad_norm_sum,
@@ -626,37 +479,48 @@ class OpenTouchHAMER_TactileWrapper(HAMER_Tactile):
                 self._effective_lr_epoch_end,
                 float(self._nonfinite_grad_step_count),
                 float(self._grad_clip_step_count),
+                float(self._train_metric_weight),
             ],
             dtype=torch.float64,
             device=self.device,
         )
+        if metric_sums:
+            local = torch.cat([local, torch.stack(metric_sums)])
         if getattr(self.trainer, "world_size", 1) > 1:
             gathered = self.all_gather(local).reshape(-1, local.numel())
         else:
             gathered = local.unsqueeze(0)
         finite_steps = gathered[:, 1].sum().clamp_min(1.0)
         total_steps = gathered[:, 6].sum().clamp_min(1.0)
-        return {
+        train_metric_weight = gathered[:, 7].sum().clamp_min(1.0)
+        summary = {
             "train/epoch_grad_norm_mean": float((gathered[:, 0].sum() / finite_steps).item()),
             "train/epoch_grad_norm_max": float(gathered[:, 2].max().item()),
             "train/grad_clip_trigger_rate_epoch": float((gathered[:, 3].sum() / total_steps).item()),
             "train/nonfinite_grad_rate_epoch": float((gathered[:, 5].sum() / total_steps).item()),
             "train/effective_lr_epoch_end": float(gathered[:, 4].mean().item()),
         }
+        for index, name in enumerate(metric_names, start=8):
+            summary[name] = float((gathered[:, index].sum() / train_metric_weight).item())
+        # Compatibility alias for existing dashboards and report readers.
+        current_name = "train/loss_current_ramp_epoch_global"
+        if current_name in summary:
+            summary["train/loss_epoch_global"] = summary[current_name]
+        return summary
+
+    def _cached_global_train_epoch_summary(self):
+        epoch = int(getattr(self, "current_epoch", 0))
+        if self._global_train_summary_epoch != epoch or self._global_train_summary_cache is None:
+            self._global_train_summary_cache = self._global_train_epoch_summary()
+            self._global_train_summary_epoch = epoch
+        return dict(self._global_train_summary_cache)
 
     def train(self, mode=True):
         super().train(mode)
-        if self.tactile_only_forward:
-            self.backbone.eval()
-            self.mano_head.eval()
-            if hasattr(self, "discriminator"):
-                self.discriminator.eval()
+        self.backbone.eval()
         return self
                 
     def training_step(self, batch, batch_idx):
-        if self.audit_nonfinite_grads:
-            self._amp_audit_cpu_rng_state = torch.get_rng_state().cpu()
-            self._amp_audit_cuda_rng_state = torch.cuda.get_rng_state(self.device).cpu()
         output = self.forward_step(batch, train=True)
         loss = self.compute_loss(batch, output, train=True)
         if not bool(torch.isfinite(loss.detach()).all().item()):
@@ -665,8 +529,41 @@ class OpenTouchHAMER_TactileWrapper(HAMER_Tactile):
                 f"epoch={self.current_epoch}, global_step={self.global_step}, "
                 f"batch_idx={batch_idx}, precision={self.trainer.precision}."
             )
-        if self.audit_nonfinite_grads:
-            self._capture_amp_audit_batch(batch, output, batch_idx)
+        batch_size = int(batch["img"].shape[0])
+        metric_values = {
+            "train/loss_current_ramp_epoch_global": loss.detach(),
+            "train/loss_full_ramp_reference_epoch_global": output["losses"].get(
+                "loss_full_ramp_reference", loss.detach()
+            ),
+            "train/loss_direct_raw_epoch_global": output["losses"].get(
+                "loss_direct_raw", loss.detach()
+            ),
+            "train/loss_smooth_l1_raw_epoch_global": output["losses"].get(
+                "loss_smooth_l1_raw", loss.detach().new_zeros(())
+            ),
+            "train/loss_logit_bce_raw_epoch_global": output["losses"].get(
+                "loss_logit_bce_raw", loss.detach().new_zeros(())
+            ),
+            "train/loss_location_raw_epoch_global": output["losses"].get(
+                "loss_location_raw", loss.detach().new_zeros(())
+            ),
+            "train/loss_location_weighted_epoch_global": output["losses"].get(
+                "loss_location_weighted", loss.detach().new_zeros(())
+            ),
+            "train/loss_contact_raw_epoch_global": output["losses"].get(
+                "loss_contact_raw", loss.detach().new_zeros(())
+            ),
+            "train/loss_contact_weighted_epoch_global": output["losses"].get(
+                "loss_contact_weighted", loss.detach().new_zeros(())
+            ),
+        }
+        for name, value in metric_values.items():
+            weighted = value.detach().to(dtype=torch.float64) * float(batch_size)
+            if name not in self._train_metric_sums:
+                self._train_metric_sums[name] = weighted.clone()
+            else:
+                self._train_metric_sums[name].add_(weighted)
+        self._train_metric_weight += batch_size
         
         self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=self.sync_train_logs)
         self._log_tactile_loss_breakdown("train", output, on_step=True)
@@ -689,24 +586,42 @@ class OpenTouchHAMER_TactileWrapper(HAMER_Tactile):
 
         self.log('val/loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
         self._log_tactile_loss_breakdown("val", output, on_step=False)
-        if self.tactile_head_type == "dense_v2_multilevel_concat":
-            diagnostics = self.tactile_head.feature_diagnostics()
-            projected_rms = diagnostics.get("projected_rms")
-            if projected_rms is not None:
-                for layer, value in zip(self.backbone_feature_layers, projected_rms):
-                    self.log(
-                        f"val/feature_projected_rms_layer_{layer}",
-                        value,
-                        on_step=False,
-                        on_epoch=True,
-                        logger=True,
-                        sync_dist=True,
-                    )
-            fusion_rms = diagnostics.get("fusion_rms")
-            if fusion_rms is not None:
+        diagnostics = self.tactile_head.feature_diagnostics()
+        layer_indices = self.tactile_head.refinement_layer_indices
+        for diagnostic_key, metric_name in (
+            ("level_weight", "rezero_level_weight"),
+            ("projected_rms", "rezero_projected_rms"),
+            ("raw_residual_rms", "rezero_raw_residual_rms"),
+            ("residual_saturation", "rezero_residual_saturation"),
+            ("effective_contribution", "rezero_effective_contribution"),
+        ):
+            values = diagnostics.get(diagnostic_key)
+            if values is None:
+                continue
+            for layer, value in zip(layer_indices, values):
                 self.log(
-                    "val/feature_fusion_rms",
-                    fusion_rms,
+                    f"val/{metric_name}_{layer}",
+                    value,
+                    on_step=False,
+                    on_epoch=True,
+                    logger=True,
+                    sync_dist=True,
+                )
+        for diagnostic_key, metric_name in (
+            ("gate_raw", "rezero_gate_raw"),
+            ("gate_effective", "rezero_gate_effective"),
+            ("delta_rms_pre_budget", "rezero_delta_rms_pre_budget"),
+            ("delta_rms_post_budget", "rezero_delta_rms_post_budget"),
+            ("delta_to_base_rms", "rezero_delta_to_base_rms"),
+            ("budget_clip_rate", "rezero_budget_clip_rate"),
+            ("base_rms", "rezero_base_rms"),
+            ("final_rms", "rezero_final_rms"),
+        ):
+            value = diagnostics.get(diagnostic_key)
+            if value is not None:
+                self.log(
+                    f"val/{metric_name}",
+                    value,
                     on_step=False,
                     on_epoch=True,
                     logger=True,
@@ -717,12 +632,32 @@ class OpenTouchHAMER_TactileWrapper(HAMER_Tactile):
             gt_tactile,
             has_tactile,
             palm_mask,
+            sequence_keys=batch.get("sequence_key"),
+            query_aliases=batch.get("query_alias"),
+            frame_indices=batch.get("frame_idx"),
+            datasets=batch.get("dataset"),
         )
         return loss
 
     def on_validation_epoch_start(self):
-        self._train_epoch_summary = self._global_train_epoch_summary()
+        if self.trainer.sanity_checking:
+            self._train_epoch_summary = {}
+        else:
+            self._train_epoch_summary = self._cached_global_train_epoch_summary()
+            for name, value in self._train_epoch_summary.items():
+                if not name.startswith("train/loss_"):
+                    continue
+                self.log(
+                    name,
+                    value,
+                    on_step=False,
+                    on_epoch=True,
+                    logger=True,
+                    sync_dist=False,
+                )
         self._val_eval_stats = None
+        self._val_eval_stats_by_domain = {}
+        self._val_touchanything_protocol_stats = CompactTouchAnythingProtocolAccumulator()
 
     def _accumulate_val_eval_stats(
         self,
@@ -730,7 +665,51 @@ class OpenTouchHAMER_TactileWrapper(HAMER_Tactile):
         gt_tactile,
         has_tactile,
         palm_mask,
+        sequence_keys=None,
+        query_aliases=None,
+        frame_indices=None,
+        datasets=None,
+        accumulator_name=None,
+        touchanything_protocol=False,
     ):
+        if datasets is not None and accumulator_name is None:
+            self._accumulate_val_eval_stats(
+                pred_tactile,
+                gt_tactile,
+                has_tactile,
+                palm_mask,
+                sequence_keys=sequence_keys,
+                query_aliases=query_aliases,
+                frame_indices=frame_indices,
+                datasets=None,
+                accumulator_name="__overall__",
+                touchanything_protocol=False,
+            )
+            canonical_domains = [canonical_dataset_name(value) for value in datasets]
+            for domain_name, metric_name in (
+                ("OpenTouch", "opentouch"),
+                ("TouchAnything", "touchanything"),
+            ):
+                domain_mask = torch.as_tensor(
+                    [value == domain_name for value in canonical_domains],
+                    dtype=has_tactile.dtype,
+                    device=has_tactile.device,
+                )
+                if bool((domain_mask > 0.5).any().item()):
+                    self._accumulate_val_eval_stats(
+                        pred_tactile,
+                        gt_tactile,
+                        has_tactile * domain_mask,
+                        palm_mask,
+                        sequence_keys=sequence_keys,
+                        query_aliases=query_aliases,
+                        frame_indices=frame_indices,
+                        datasets=None,
+                        accumulator_name=metric_name,
+                        touchanything_protocol=metric_name == "touchanything",
+                    )
+            return
+
         valid = has_tactile > 0.5
         if valid.sum() == 0:
             return
@@ -744,28 +723,118 @@ class OpenTouchHAMER_TactileWrapper(HAMER_Tactile):
         active_thr = float(self.tactile_loss_config.active_pressure_thr)
         background_thr = 0.02
 
+        if touchanything_protocol and (
+            sequence_keys is None or query_aliases is None or frame_indices is None
+        ):
+            raise ValueError(
+                "TouchAnything-compatible validation metrics require sequence_key, query_alias, and frame_idx"
+            )
+
         diff = (pred - gt) * palm
         palm_values = palm.sum()
         active_mask = ((gt > active_thr).float() * palm)
         background_mask = ((gt <= background_thr).float() * palm)
         pred_active = ((pred > active_thr).float() * palm)
         contact_eval_mask = ((((gt >= active_thr) | (gt <= background_thr)).float()) * palm)
-        contact_pred = ((contact > 0.5).float() * contact_eval_mask)
+        contact_pred = ((contact > active_thr).float() * contact_eval_mask)
         contact_tp = (contact_pred * active_mask).sum()
         contact_pred_count = contact_pred.sum()
 
         pred_bin = pred_active
         gt_bin = active_mask
         intersection = (pred_bin * gt_bin).sum(dim=1)
-        union = torch.clamp(((pred_bin + gt_bin) > 0).float().sum(dim=1), min=1.0)
-        contact_iou_sum = (intersection / union).sum()
+        union = ((pred_bin + gt_bin) > 0).float().sum(dim=1)
+        contact_iou = torch.where(
+            union > 0,
+            intersection / union.clamp_min(1.0),
+            torch.ones_like(union),
+        )
+        contact_iou_sum = contact_iou.sum()
+
+        if touchanything_protocol:
+            valid_flags = valid.detach().cpu().tolist()
+            valid_sequence_keys = [
+                touchanything_protocol_group_key(key, alias)
+                for key, alias, is_valid in zip(sequence_keys, query_aliases, valid_flags)
+                if is_valid
+            ]
+            touch_pred_binary = ((pred > TOUCHANYTHING_CONTACT_THRESHOLD).float() * palm)
+            touch_gt_binary = ((gt > TOUCHANYTHING_CONTACT_THRESHOLD).float() * palm)
+            touch_frame_stats = torch.stack(
+                (
+                    diff.abs().sum(dim=1),
+                    palm.sum(dim=1),
+                    (torch.minimum(pred, gt) * palm).sum(dim=1),
+                    (torch.maximum(pred, gt) * palm).sum(dim=1),
+                    (touch_pred_binary * touch_gt_binary).sum(dim=1),
+                    ((touch_pred_binary + touch_gt_binary) > 0).float().sum(dim=1),
+                    touch_pred_binary.sum(dim=1),
+                    touch_gt_binary.sum(dim=1),
+                ),
+                dim=1,
+            )
+            self._val_touchanything_protocol_stats.add(
+                valid_sequence_keys,
+                [
+                    int(index)
+                    for index, is_valid in zip(frame_indices.detach().cpu().tolist(), valid_flags)
+                    if is_valid
+                ],
+                touch_frame_stats.detach().cpu().numpy(),
+            )
 
         vol_intersection = (torch.minimum(pred, gt) * palm).sum(dim=1)
-        vol_union = torch.clamp((torch.maximum(pred, gt) * palm).sum(dim=1), min=1e-6)
-        volumetric_iou = vol_intersection / vol_union
+        vol_union = (torch.maximum(pred, gt) * palm).sum(dim=1)
+        volumetric_iou = torch.where(
+            vol_union > 1e-6,
+            vol_intersection / vol_union.clamp_min(1e-6),
+            torch.ones_like(vol_union),
+        )
         volumetric_iou_sum = volumetric_iou.sum()
         pred_volume_frame = (pred * palm).sum(dim=1)
         gt_volume_frame = (gt * palm).sum(dim=1)
+        location_eligible = gt_volume_frame >= 1.0
+        pred_dist = (pred * palm) / pred_volume_frame.unsqueeze(1).clamp_min(1e-12)
+        gt_dist = (gt * palm) / gt_volume_frame.unsqueeze(1).clamp_min(1e-12)
+        distribution_intersection = torch.minimum(pred_dist, gt_dist).sum(dim=1)
+        distribution_union = torch.maximum(pred_dist, gt_dist).sum(dim=1)
+        distribution_viou = torch.where(
+            distribution_union > 1e-12,
+            distribution_intersection / distribution_union.clamp_min(1e-12),
+            torch.zeros_like(distribution_union),
+        )
+        gt_location_support = ((gt >= 0.05).float() * palm)
+        pred_location_support = ((pred >= 0.05).float() * palm)
+        pred_mass_on_gt_support = (
+            pred * gt_location_support
+        ).sum(dim=1) / pred_volume_frame.clamp_min(1e-12)
+        gt_mass_in_pred_support = (
+            gt * pred_location_support
+        ).sum(dim=1) / gt_volume_frame.clamp_min(1e-12)
+        core_location_eligible = location_eligible & (
+            (gt * palm).amax(dim=1) >= CORE_LOCATION_MIN_GT_PEAK
+        )
+        pred_core_mass = pred.clamp_min(0.0).pow(CORE_LOCATION_DISTRIBUTION_POWER) * palm
+        gt_core_mass = gt.clamp_min(0.0).pow(CORE_LOCATION_DISTRIBUTION_POWER) * palm
+        pred_core_volume = pred_core_mass.sum(dim=1)
+        gt_core_volume = gt_core_mass.sum(dim=1)
+        pred_core_dist = pred_core_mass / pred_core_volume.unsqueeze(1).clamp_min(1e-12)
+        gt_core_dist = gt_core_mass / gt_core_volume.unsqueeze(1).clamp_min(1e-12)
+        core_distribution_intersection = torch.minimum(pred_core_dist, gt_core_dist).sum(dim=1)
+        core_distribution_union = torch.maximum(pred_core_dist, gt_core_dist).sum(dim=1)
+        core_distribution_viou = torch.where(
+            core_distribution_union > 1e-12,
+            core_distribution_intersection / core_distribution_union.clamp_min(1e-12),
+            torch.zeros_like(core_distribution_union),
+        )
+        gt_core_support = ((gt >= CORE_LOCATION_MIN_GT_PEAK).float() * palm)
+        pred_core_support = ((pred >= CORE_LOCATION_MIN_GT_PEAK).float() * palm)
+        core_pred_mass_on_gt_support = (
+            pred_core_mass * gt_core_support
+        ).sum(dim=1) / pred_core_volume.clamp_min(1e-12)
+        core_gt_mass_in_pred_support = (
+            gt_core_mass * pred_core_support
+        ).sum(dim=1) / gt_core_volume.clamp_min(1e-12)
         frame_volume_norm = 150.0
         frame_volume_target = torch.clamp(gt_volume_frame / frame_volume_norm, min=0.0, max=1.0)
         frame_volume_pred = torch.clamp(
@@ -783,6 +852,7 @@ class OpenTouchHAMER_TactileWrapper(HAMER_Tactile):
         weak_pressure_mask = (((gt >= 0.02) & (gt < active_thr)).float() * palm)
         mid_pressure_mask = (((gt >= 0.1) & (gt < 0.3)).float() * palm)
         high_pressure_mask = ((gt >= 0.3).float() * palm)
+        tail_masks = [((gt >= threshold).float() * palm) for threshold in (0.2, 0.3, 0.5, 0.7)]
 
         stats = torch.stack([
             valid.sum().float(),
@@ -851,21 +921,37 @@ class OpenTouchHAMER_TactileWrapper(HAMER_Tactile):
             (((gt < 0.05) & (pred >= 0.3)).float() * palm).sum(),
             (((gt < 0.05).float()) * palm).sum(),
             (torch.clamp(pred - gt, min=0.0) * ((gt < 0.05) & (pred >= 0.3)).float() * palm).sum(),
+            *[
+                value
+                for tail_mask in tail_masks
+                for value in (
+                    (diff.abs() * tail_mask).sum(),
+                    (pred * tail_mask).sum(),
+                    tail_mask.sum(),
+                )
+            ],
+            vol_intersection.sum(),
+            vol_union.sum(),
+            (distribution_viou * location_eligible).sum(),
+            (pred_mass_on_gt_support * location_eligible).sum(),
+            (gt_mass_in_pred_support * location_eligible).sum(),
+            location_eligible.sum().float(),
+            (core_distribution_viou * core_location_eligible).sum(),
+            (core_pred_mass_on_gt_support * core_location_eligible).sum(),
+            (core_gt_mass_in_pred_support * core_location_eligible).sum(),
+            core_location_eligible.sum().float(),
         ]).to(pred_tactile.device)
 
-        if self._val_eval_stats is None:
-            self._val_eval_stats = stats
+        if accumulator_name in (None, "__overall__"):
+            current = self._val_eval_stats
+            self._val_eval_stats = stats if current is None else current + stats
         else:
-            self._val_eval_stats = self._val_eval_stats + stats
+            current = self._val_eval_stats_by_domain.get(accumulator_name)
+            self._val_eval_stats_by_domain[accumulator_name] = (
+                stats if current is None else current + stats
+            )
 
-    def on_validation_epoch_end(self):
-        if self._val_eval_stats is None:
-            return
-        stats = self._val_eval_stats
-        if self.trainer.world_size > 1:
-            gathered = self.all_gather(stats)
-            stats = gathered.reshape(-1, stats.numel()).sum(dim=0)
-
+    def _metrics_from_eval_stats(self, stats, prefix, touch_summary=None):
         frames = stats[0].clamp_min(1.0)
         values = stats[1].clamp_min(1.0)
         gt_volume = stats[5].clamp_min(1e-6)
@@ -876,57 +962,172 @@ class OpenTouchHAMER_TactileWrapper(HAMER_Tactile):
         weak_pressure_count = stats[18].clamp_min(1.0)
         mid_pressure_count = stats[20].clamp_min(1.0)
         high_pressure_count = stats[22].clamp_min(1.0)
-        contact_tp = stats[23]
-        contact_pred_count = stats[24].clamp_min(1.0)
-        contact_precision = contact_tp / contact_pred_count
-        contact_recall = contact_tp / active_gt_count
-        contact_f1 = 2.0 * contact_precision * contact_recall / (contact_precision + contact_recall).clamp_min(1e-6)
-        corr_n = frames
-        corr_num = corr_n * stats[35] - stats[5] * stats[4]
-        corr_gt_var = (corr_n * stats[33] - stats[5].pow(2)).clamp_min(0.0)
-        corr_pred_var = (corr_n * stats[34] - stats[4].pow(2)).clamp_min(0.0)
-        corr_den = torch.sqrt(corr_gt_var * corr_pred_var).clamp_min(1e-6)
-        frame_volume_corr = torch.clamp(corr_num / corr_den, min=-1.0, max=1.0)
+        contact_precision = stats[23] / stats[24].clamp_min(1.0)
+        contact_recall = stats[23] / active_gt_count
+        contact_f1 = (
+            2.0 * contact_precision * contact_recall
+            / (contact_precision + contact_recall).clamp_min(1e-6)
+        )
+        corr_num = frames * stats[35] - stats[5] * stats[4]
+        corr_gt_var = (frames * stats[33] - stats[5].pow(2)).clamp_min(0.0)
+        corr_pred_var = (frames * stats[34] - stats[4].pow(2)).clamp_min(0.0)
+        frame_volume_corr = torch.clamp(
+            corr_num / torch.sqrt(corr_gt_var * corr_pred_var).clamp_min(1e-6),
+            min=-1.0,
+            max=1.0,
+        )
         low_volume_count = stats[39].clamp_min(1.0)
         high_volume_count = stats[43].clamp_min(1.0)
         empty_frame_count = stats[46].clamp_min(1.0)
-
-        eval_metrics = {
-            "val/eval_mae": stats[2] / values,
-            "val/eval_rmse": torch.sqrt(stats[3] / values),
-            "val/eval_pred_gt_volume_ratio": stats[4] / gt_volume,
-            "val/eval_frame_volume_corr": frame_volume_corr,
-            "val/eval_low_volume_pred_gt_ratio": stats[36] / stats[37].clamp_min(1e-6),
-            "val/eval_high_volume_pred_gt_ratio": stats[40] / stats[41].clamp_min(1e-6),
-            "val/eval_low_volume_pred_volume": stats[36] / low_volume_count,
-            "val/eval_high_volume_pred_volume": stats[40] / high_volume_count,
-            "val/eval_low_volume_volumetric_iou": stats[38] / low_volume_count,
-            "val/eval_high_volume_volumetric_iou": stats[42] / high_volume_count,
-            "val/eval_empty_frame_pred_volume": stats[44] / empty_frame_count,
-            "val/eval_empty_frame_pred_active_vertices": stats[45] / empty_frame_count,
-            "val/eval_weak_zone_pred_active_rate": stats[47] / weak_pressure_count,
-            "val/eval_active_mae": stats[6] / active_count,
-            "val/eval_background_mae": stats[8] / background_count,
-            "val/eval_active_recall": stats[10] / active_gt_count,
-            "val/eval_bg_false_positive": stats[12] / background_count,
-            "val/eval_contact_iou_active_thr": stats[13] / frames,
-            "val/eval_volumetric_iou": stats[14] / frames,
-            "val/eval_contact_precision": contact_precision,
-            "val/eval_contact_recall": contact_recall,
-            "val/eval_contact_f1": contact_f1,
-            "val/eval_low_pressure_mean_pred": stats[15] / low_pressure_count,
-            "val/eval_weak_pressure_mean_pred": stats[17] / weak_pressure_count,
-            "val/eval_mid_pressure_mean_pred": stats[19] / mid_pressure_count,
-            "val/eval_high_pressure_mean_pred": stats[21] / high_pressure_count,
-            "val/eval_low_pressure_pred_active_rate": stats[53] / low_pressure_count,
-            "val/eval_catastrophic_over_rate": stats[54] / stats[55].clamp_min(1.0),
-            "val/eval_catastrophic_under_rate": stats[56] / stats[57].clamp_min(1.0),
-            "val/eval_false_high_gt005_pred03_rate": stats[58] / stats[59].clamp_min(1.0),
-            "val/eval_false_high_gt005_pred03_excess_volume_fraction": stats[60] / stats[4].clamp_min(1e-6),
-            "val/eval_false_high_gt005_pred05_rate": stats[61] / stats[59].clamp_min(1.0),
-            "val/eval_false_high_gt05_pred03_rate": stats[63] / stats[64].clamp_min(1.0),
-            "val/eval_false_high_gt05_pred03_excess_volume_fraction": stats[65] / stats[4].clamp_min(1e-6),
+        volumetric_iou_frame_macro = stats[14] / frames
+        volumetric_iou_split_micro = torch.where(
+            stats[79] > 1e-6,
+            stats[78] / stats[79].clamp_min(1e-6),
+            stats.new_tensor(1.0),
+        )
+        location_frame_count = stats[83].clamp_min(1.0)
+        core_location_frame_count = stats[87].clamp_min(1.0)
+        metrics = {
+            f"{prefix}/eval_mae": stats[2] / values,
+            f"{prefix}/eval_rmse": torch.sqrt(stats[3] / values),
+            f"{prefix}/eval_pred_volume_mean": stats[4] / frames,
+            f"{prefix}/eval_gt_volume_mean": stats[5] / frames,
+            f"{prefix}/eval_pred_gt_volume_ratio": stats[4] / gt_volume,
+            f"{prefix}/eval_frame_volume_corr": frame_volume_corr,
+            f"{prefix}/eval_low_volume_pred_gt_ratio": stats[36] / stats[37].clamp_min(1e-6),
+            f"{prefix}/eval_high_volume_pred_gt_ratio": stats[40] / stats[41].clamp_min(1e-6),
+            f"{prefix}/eval_low_volume_pred_volume": stats[36] / low_volume_count,
+            f"{prefix}/eval_high_volume_pred_volume": stats[40] / high_volume_count,
+            f"{prefix}/eval_low_volume_volumetric_iou": stats[38] / low_volume_count,
+            f"{prefix}/eval_high_volume_volumetric_iou": stats[42] / high_volume_count,
+            f"{prefix}/eval_empty_frame_pred_volume": stats[44] / empty_frame_count,
+            f"{prefix}/eval_empty_frame_pred_active_vertices": stats[45] / empty_frame_count,
+            f"{prefix}/eval_weak_zone_pred_active_rate": stats[47] / weak_pressure_count,
+            f"{prefix}/eval_active_mae": stats[6] / active_count,
+            f"{prefix}/eval_background_mae": stats[8] / background_count,
+            f"{prefix}/eval_active_recall": stats[10] / active_gt_count,
+            f"{prefix}/eval_bg_false_positive": stats[12] / background_count,
+            f"{prefix}/eval_contact_iou_active_thr": stats[13] / frames,
+            f"{prefix}/eval_volumetric_iou": volumetric_iou_frame_macro,
+            f"{prefix}/eval_volumetric_iou_frame_macro": volumetric_iou_frame_macro,
+            f"{prefix}/eval_volumetric_iou_split_micro": volumetric_iou_split_micro,
+            f"{prefix}/eval_distribution_viou": stats[80] / location_frame_count,
+            f"{prefix}/eval_volume_matched_viou": stats[80] / location_frame_count,
+            f"{prefix}/eval_pred_mass_on_gt_support": stats[81] / location_frame_count,
+            f"{prefix}/eval_gt_mass_in_pred_support": stats[82] / location_frame_count,
+            f"{prefix}/eval_nonempty_location_frame_count": stats[83],
+            f"{prefix}/eval_core_distribution_viou": stats[84] / core_location_frame_count,
+            f"{prefix}/eval_core_pred_mass_on_gt_support": stats[85] / core_location_frame_count,
+            f"{prefix}/eval_core_gt_mass_in_pred_support": stats[86] / core_location_frame_count,
+            f"{prefix}/eval_core_location_frame_count": stats[87],
+            f"{prefix}/eval_contact_precision": contact_precision,
+            f"{prefix}/eval_contact_recall": contact_recall,
+            f"{prefix}/eval_contact_f1": contact_f1,
+            f"{prefix}/eval_low_pressure_mean_pred": stats[15] / low_pressure_count,
+            f"{prefix}/eval_weak_pressure_mean_pred": stats[17] / weak_pressure_count,
+            f"{prefix}/eval_mid_pressure_mean_pred": stats[19] / mid_pressure_count,
+            f"{prefix}/eval_high_pressure_mean_pred": stats[21] / high_pressure_count,
+            f"{prefix}/eval_low_pressure_pred_active_rate": stats[53] / low_pressure_count,
+            f"{prefix}/eval_catastrophic_over_rate": stats[54] / stats[55].clamp_min(1.0),
+            f"{prefix}/eval_catastrophic_under_rate": stats[56] / stats[57].clamp_min(1.0),
+            f"{prefix}/eval_false_high_gt005_pred03_rate": stats[58] / stats[59].clamp_min(1.0),
+            f"{prefix}/eval_false_high_gt005_pred03_excess_volume_fraction": stats[60] / stats[4].clamp_min(1e-6),
+            f"{prefix}/eval_false_high_gt005_pred05_rate": stats[61] / stats[59].clamp_min(1.0),
+            f"{prefix}/eval_false_high_gt05_pred03_rate": stats[63] / stats[64].clamp_min(1.0),
+            f"{prefix}/eval_false_high_gt05_pred03_excess_volume_fraction": stats[65] / stats[4].clamp_min(1e-6),
         }
+        for offset, label in enumerate(("02", "03", "05", "07")):
+            base_index = 66 + offset * 3
+            tail_count = stats[base_index + 2].clamp_min(1.0)
+            metrics[f"{prefix}/eval_tail_mae_gt{label}"] = stats[base_index] / tail_count
+            metrics[f"{prefix}/eval_tail_mean_pred_gt{label}"] = stats[base_index + 1] / tail_count
+        if touch_summary is not None:
+            metrics.update({
+                f"{prefix}/touchanything_protocol_volumetric_iou": stats.new_tensor(
+                    touch_summary["volumetric_iou"]
+                ),
+                f"{prefix}/touchanything_protocol_mae": stats.new_tensor(touch_summary["mae"]),
+                f"{prefix}/touchanything_protocol_contact_iou": stats.new_tensor(
+                    touch_summary["contact_iou"]
+                ),
+                f"{prefix}/touchanything_protocol_temporal_accuracy": stats.new_tensor(
+                    touch_summary["temporal_accuracy"]
+                ),
+                f"{prefix}/touchanything_protocol_temporal_f1": stats.new_tensor(
+                    touch_summary["temporal_f1"]
+                ),
+                f"{prefix}/touchanything_protocol_sequence_count": stats.new_tensor(
+                    float(touch_summary["sequence_count"])
+                ),
+            })
+        return metrics
+
+    def on_validation_epoch_end(self):
+        if self._val_eval_stats is None:
+            return
+        stats = self._val_eval_stats
+        if self.trainer.world_size > 1:
+            gathered = self.all_gather(stats)
+            stats = gathered.reshape(-1, stats.numel()).sum(dim=0)
+
+        local_touch_stats = self._val_touchanything_protocol_stats.pack()
+        if self.trainer.world_size > 1:
+            touch_items = (
+                [None for _ in range(self.trainer.world_size)]
+                if self.global_rank == 0
+                else None
+            )
+            torch.distributed.gather_object(local_touch_stats, touch_items, dst=0)
+            summary_box = [
+                summarize_compact_touchanything_protocol(touch_items, include_rows=False)
+                if self.global_rank == 0
+                else None
+            ]
+            torch.distributed.broadcast_object_list(summary_box, src=0)
+            touch_summary = summary_box[0]
+        else:
+            touch_summary = summarize_compact_touchanything_protocol(
+                [local_touch_stats], include_rows=False
+            )
+        self._val_touchanything_protocol_stats = CompactTouchAnythingProtocolAccumulator()
+        del local_touch_stats
+        if self.global_rank == 0 and self.trainer.world_size > 1:
+            del touch_items
+        release_unused_python_heap()
+        eval_metrics = self._metrics_from_eval_stats(stats, "val", touch_summary=touch_summary)
+        domain_metrics = {}
+        domain_core_metrics = []
+        for domain_name in ("opentouch", "touchanything"):
+            domain_stats = self._val_eval_stats_by_domain.get(domain_name)
+            if domain_stats is None:
+                domain_stats = torch.zeros_like(stats)
+            if self.trainer.world_size > 1:
+                gathered = self.all_gather(domain_stats)
+                domain_stats = gathered.reshape(-1, domain_stats.numel()).sum(dim=0)
+            if float(domain_stats[0].item()) <= 0.0:
+                continue
+            metrics = self._metrics_from_eval_stats(
+                domain_stats,
+                f"val/{domain_name}",
+                touch_summary=touch_summary if domain_name == "touchanything" else None,
+            )
+            domain_metrics.update(metrics)
+            domain_core_metrics.append((
+                metrics[f"val/{domain_name}/eval_rmse"],
+                metrics[f"val/{domain_name}/eval_volumetric_iou"],
+                metrics[f"val/{domain_name}/eval_core_distribution_viou"],
+            ))
+        if domain_core_metrics:
+            eval_metrics["val/domain_macro/eval_rmse"] = torch.stack(
+                [item[0] for item in domain_core_metrics]
+            ).mean()
+            eval_metrics["val/domain_macro/eval_volumetric_iou"] = torch.stack(
+                [item[1] for item in domain_core_metrics]
+            ).mean()
+            eval_metrics["val/domain_macro/eval_core_distribution_viou"] = torch.stack(
+                [item[2] for item in domain_core_metrics]
+            ).mean()
+        eval_metrics.update(domain_metrics)
         for name, value in eval_metrics.items():
             self.log(
                 name,
@@ -937,39 +1138,6 @@ class OpenTouchHAMER_TactileWrapper(HAMER_Tactile):
                 logger=True,
                 sync_dist=True,
             )
-        if self.tactile_head_type == "dense_v2_multilevel":
-            fusion_weights = self.tactile_head.fusion_weights()
-            fusion_entropy = -(fusion_weights * fusion_weights.clamp_min(1e-8).log()).sum()
-            for layer, weight in zip(self.backbone_feature_layers, fusion_weights):
-                self.log(
-                    f"val/feature_fusion_weight_layer_{layer}",
-                    weight,
-                    on_step=False,
-                    on_epoch=True,
-                    logger=True,
-                    sync_dist=False,
-                )
-            self.log(
-                "val/feature_fusion_entropy",
-                fusion_entropy,
-                on_step=False,
-                on_epoch=True,
-                logger=True,
-                sync_dist=False,
-            )
-        elif self.tactile_head_type == "dense_v2_multilevel_concat":
-            for layer, value in zip(
-                self.backbone_feature_layers,
-                self.tactile_head.fusion_group_contributions(),
-            ):
-                self.log(
-                    f"val/feature_fusion_kernel_contribution_layer_{layer}",
-                    value,
-                    on_step=False,
-                    on_epoch=True,
-                    logger=True,
-                    sync_dist=False,
-                )
 
     def _log_tactile_loss_breakdown(self, prefix, output, on_step):
         mapping = {
@@ -978,9 +1146,23 @@ class OpenTouchHAMER_TactileWrapper(HAMER_Tactile):
             "loss_base_tactile": "loss/base_tactile",
             "loss_weighted_tactile": "loss/weighted_tactile",
             "loss_background": "loss/background",
+            "loss_tail_l1_raw": "loss/tail_l1_raw",
+            "loss_tail_l1_weighted": "loss/tail_l1_weighted",
+            "loss_location_raw": "loss/location_raw",
+            "loss_location_weighted": "loss/location_weighted",
+            "loss_contact_raw": "loss/contact_raw",
+            "loss_contact_weighted": "loss/contact_weighted",
+            "diagnostics_tail_fraction": "diagnostics/tail_fraction",
+            "diagnostics_location_eligible_fraction": "diagnostics/location_eligible_fraction",
             "loss_tactile": "loss/total",
             "loss_ramp": "schedule/loss_ramp",
+            "loss_full_ramp_reference": "loss_full_ramp_reference",
         }
+        if prefix == "val":
+            mapping.update({
+                "loss_current_ramp": "loss_current_ramp",
+                "loss_direct_raw": "loss_direct_raw",
+            })
         for key, name in mapping.items():
             if key in output["losses"]:
                 self.log(
@@ -992,64 +1174,82 @@ class OpenTouchHAMER_TactileWrapper(HAMER_Tactile):
                     sync_dist=self.sync_train_logs if prefix == "train" else True,
                 )
         
-    def tensorboard_logging(self, *args, **kwargs):
-        # Override to be a no-op to prevent WebGL/OpenGL/Renderer crashes during training
-        pass
-
     def configure_optimizers(self):
-        # Separate parameters into decay and no_decay groups
-        decay_params = []
-        no_decay_params = []
-        for name, param in self.named_parameters():
-            if param.requires_grad:
-                if any(nd in name for nd in ["bias", "norm", "LayerNorm"]):
-                    no_decay_params.append(param)
-                else:
-                    decay_params.append(param)
-                    
-        optim_groups = [
-            {"params": decay_params, "weight_decay": 1e-4},
-            {"params": no_decay_params, "weight_decay": 0.0}
-        ]
+        optim_groups = optimizer_parameter_groups(
+            self.named_parameters(),
+            self.optimizer_weight_decay,
+        )
                     
         optimizer = torch.optim.AdamW(
             optim_groups,
             lr=self.learning_rate
         )
-        
+
         total_steps = self.trainer.estimated_stepping_batches
         print(f"Total training steps for LR Scheduler: {total_steps}")
         
         max_epochs = max(int(getattr(self.trainer, "max_epochs", 1)), 1)
-        warmup_steps = int(round(total_steps * max(self.lr_warmup_epochs, 0) / max_epochs))
+        warmup_steps = lr_warmup_step_count(
+            total_steps,
+            max_epochs,
+            self.lr_warmup_epochs,
+        )
+        warmup = None
         if warmup_steps > 0:
-            warmup_steps = min(warmup_steps, max(total_steps - 1, 1))
             warmup = torch.optim.lr_scheduler.LinearLR(
                 optimizer,
                 start_factor=1.0 / float(max(warmup_steps, 1)),
                 end_factor=1.0,
                 total_iters=warmup_steps,
             )
-            cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+
+        if self.lr_scheduler_name == "cosine":
+            self.lr_decay_milestones_resolved = []
+            decay_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer,
-                T_max=max(total_steps - warmup_steps, 1),
+                T_max=max(total_steps - warmup_steps, 1) if warmup_steps > 0 else total_steps,
                 eta_min=self.learning_rate * 0.01,
             )
+        elif self.lr_scheduler_name == "constant":
+            self.lr_decay_milestones_resolved = []
+            decay_scheduler = torch.optim.lr_scheduler.LambdaLR(
+                optimizer,
+                lr_lambda=lambda _step: 1.0,
+            )
+        elif self.lr_scheduler_name == "multistep":
+            milestones = resolve_lr_decay_milestones(
+                self.lr_decay_milestones,
+                total_steps,
+            )
+            self.lr_decay_milestones_resolved = list(milestones)
+            scheduler_milestones = [step - warmup_steps for step in milestones]
+            if any(step <= 0 for step in scheduler_milestones):
+                raise ValueError(
+                    "Resolved --lr_decay_milestones must occur after LR warmup; "
+                    f"warmup ends at step {warmup_steps}, milestones={milestones}"
+                )
+            decay_scheduler = torch.optim.lr_scheduler.MultiStepLR(
+                optimizer,
+                milestones=scheduler_milestones,
+                gamma=self.lr_decay_gamma,
+            )
+        else:
+            raise ValueError(f"Unsupported LR scheduler: {self.lr_scheduler_name}")
+
+        if warmup_steps > 0:
             scheduler = torch.optim.lr_scheduler.SequentialLR(
                 optimizer,
-                schedulers=[warmup, cosine],
+                schedulers=[warmup, decay_scheduler],
                 milestones=[warmup_steps],
             )
             print(
                 f"LR schedule: linear warmup for {warmup_steps} steps "
-                f"({self.lr_warmup_epochs} epoch(s)), then cosine for {total_steps - warmup_steps} steps"
+                f"({self.lr_warmup_epochs} epoch(s)), then {self.lr_scheduler_name} "
+                f"for {total_steps - warmup_steps} steps"
             )
         else:
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer,
-                T_max=total_steps,
-                eta_min=self.learning_rate * 0.01,
-            )
+            scheduler = decay_scheduler
+            print(f"LR schedule: {self.lr_scheduler_name} for {total_steps} steps")
         
         return {
             "optimizer": optimizer,
@@ -1061,124 +1261,82 @@ class OpenTouchHAMER_TactileWrapper(HAMER_Tactile):
         }
 
 
-def _install_legacy_lightning_attribute_dict():
-    """Restore a class path used by checkpoints from older Lightning releases."""
-    import lightning_fabric.utilities.data as fabric_data
-
-    if hasattr(fabric_data, "AttributeDict"):
-        return
-
-    try:
-        from pytorch_lightning.utilities.parsing import AttributeDict
-    except ImportError:
-        class AttributeDict(dict):
-            def __getattr__(self, key):
-                try:
-                    return self[key]
-                except KeyError as error:
-                    raise AttributeError(key) from error
-
-            def __setattr__(self, key, value):
-                self[key] = value
-
-    fabric_data.AttributeDict = AttributeDict
-    print("Installed legacy Lightning AttributeDict checkpoint compatibility shim.")
-
-
 def _load_checkpoint(checkpoint_path):
-    _install_legacy_lightning_attribute_dict()
     return torch.load(checkpoint_path, map_location="cpu")
 
 
-def load_compatible_state_dict(model, checkpoint_path, load_backbone=True):
-    checkpoint = _load_checkpoint(checkpoint_path)
-    state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
-    compact_format = checkpoint.get("format") if isinstance(checkpoint, dict) else None
-    if compact_format in {"tactile_head_only_v1", "tactile_trainable_v2"}:
-        checkpoint_visual_backbone = str(checkpoint.get("visual_backbone", "hamer") or "hamer")
-        model_visual_backbone = str(getattr(model, "visual_backbone", "hamer"))
-        if checkpoint_visual_backbone != model_visual_backbone:
-            raise ValueError(
-                f"Checkpoint visual_backbone={checkpoint_visual_backbone} does not match model={model_visual_backbone}"
-            )
-        checkpoint_head = str(checkpoint.get("tactile_head_type", "") or "")
-        if checkpoint_head and checkpoint_head != str(getattr(model, "tactile_head_type", "")):
-            raise ValueError(
-                f"Checkpoint tactile_head_type={checkpoint_head} does not match model={model.tactile_head_type}"
-            )
-        expected_hash = str(checkpoint.get("backbone_sha256", "") or "")
-        actual_hash = str(getattr(model, "backbone_weights_sha256", "") or "")
-        if expected_hash and actual_hash and expected_hash != actual_hash:
-            raise ValueError(
-                f"Backbone SHA256 mismatch: checkpoint={expected_hash}, actual={actual_hash}"
-            )
-
-        raw_base_path = str(
-            checkpoint.get("backbone_weights", "")
-            or checkpoint.get("base_checkpoint", "")
-            or ""
-        )
-        base_candidates = []
-        if raw_base_path and checkpoint_visual_backbone == "hamer":
-            base_path = Path(raw_base_path).expanduser()
-            if not base_path.is_absolute():
-                base_path = Path(checkpoint_path).expanduser().resolve().parent / base_path
-            base_candidates.append(base_path)
-        if checkpoint_visual_backbone == "hamer":
-            base_candidates.append(
-                Path(workspace_dir) / "hamer/_DATA/hamer_ckpts/checkpoints/hamer.ckpt"
-            )
-            base_path = next((path for path in base_candidates if path.is_file()), None)
-            if base_path is None:
-                raise FileNotFoundError(
-                    "Compact tactile checkpoint requires its frozen HaMeR base checkpoint. "
-                    f"Tried: {[str(path) for path in base_candidates]}"
+def _migrate_tactile_head_state_keys(head_state, expected_state):
+    """Apply narrowly scoped parameter renames while preserving strict loading."""
+    migrated = dict(head_state)
+    renamed = []
+    prefix_aliases = (
+        ("decoder.0.project.", "decoder.0.projection."),
+    )
+    for old_prefix, new_prefix in prefix_aliases:
+        for old_key in tuple(migrated):
+            if not old_key.startswith(old_prefix):
+                continue
+            new_key = new_prefix + old_key[len(old_prefix):]
+            if new_key not in expected_state:
+                continue
+            if new_key in migrated:
+                raise RuntimeError(
+                    f"Checkpoint contains both legacy and current tactile-head keys: "
+                    f"{old_key!r}, {new_key!r}"
                 )
-            base_checkpoint = _load_checkpoint(base_path)
-            base_state = (
-                base_checkpoint["state_dict"]
-                if isinstance(base_checkpoint, dict) and "state_dict" in base_checkpoint
-                else base_checkpoint
-            )
-            state_dict = dict(base_state)
-            state_dict.update(checkpoint["state_dict"])
-            if hasattr(model, "audit_checkpoint_path"):
-                model.audit_checkpoint_path = str(base_path)
-        else:
-            base_path = Path(raw_base_path) if raw_base_path else None
-            state_dict = dict(checkpoint["state_dict"])
-        print(
-            "Loading compact tactile checkpoint: "
-            f"backbone={checkpoint_visual_backbone}:{base_path}, head={checkpoint_path}, "
-            f"epoch={checkpoint.get('epoch')}, global_step={checkpoint.get('global_step')}"
+            old_shape = tuple(migrated[old_key].shape)
+            expected_shape = tuple(expected_state[new_key].shape)
+            if old_shape != expected_shape:
+                raise RuntimeError(
+                    f"Cannot migrate tactile-head key {old_key!r} to {new_key!r}: "
+                    f"checkpoint shape={old_shape}, expected shape={expected_shape}"
+                )
+            migrated[new_key] = migrated.pop(old_key)
+            renamed.append((old_key, new_key))
+    return migrated, renamed
+
+
+def load_compatible_state_dict(model, checkpoint_path, load_backbone=False):
+    checkpoint = _load_checkpoint(checkpoint_path)
+    if not isinstance(checkpoint, dict) or checkpoint.get("format") != "tactile_trainable_v2":
+        raise ValueError("Only compact format=tactile_trainable_v2 checkpoints are supported")
+    if checkpoint.get("visual_backbone") != "dinov3_hplus":
+        raise ValueError("Checkpoint must use visual_backbone=dinov3_hplus")
+    if checkpoint.get("tactile_head_type") != "dense_v2_dino_rezero":
+        raise ValueError("Checkpoint must use tactile_head_type=dense_v2_dino_rezero")
+    expected_hash = str(checkpoint.get("backbone_sha256", "") or "")
+    actual_hash = str(getattr(model, "backbone_weights_sha256", "") or "")
+    if expected_hash and actual_hash and expected_hash != actual_hash:
+        raise ValueError(
+            f"Backbone SHA256 mismatch: checkpoint={expected_hash}, actual={actual_hash}"
         )
-    model_state = model.state_dict()
-
-    compatible_state = {}
-    skipped = []
-    for key, value in state_dict.items():
-        if not load_backbone and (key.startswith("backbone.") or key.startswith("model.backbone.")):
-            continue
-        if key not in model_state:
-            compatible_state[key] = value
-            continue
-        if tuple(model_state[key].shape) == tuple(value.shape):
-            compatible_state[key] = value
-        else:
-            skipped.append((key, tuple(value.shape), tuple(model_state[key].shape)))
-
-    missing, unexpected = model.load_state_dict(compatible_state, strict=False)
-    if skipped:
-        print("Skipped incompatible checkpoint tensors:")
-        for key, old_shape, new_shape in skipped:
-            print(f"  {key}: checkpoint {old_shape} -> model {new_shape}")
-    return missing, unexpected
+    prefix = "tactile_head."
+    head_state = {
+        key[len(prefix):]: value
+        for key, value in checkpoint.get("state_dict", {}).items()
+        if key.startswith(prefix)
+    }
+    if not head_state:
+        raise ValueError("Compact checkpoint does not contain tactile_head parameters")
+    head_state, renamed = _migrate_tactile_head_state_keys(
+        head_state,
+        model.tactile_head.state_dict(),
+    )
+    if renamed:
+        print(
+            "Migrated legacy tactile-head checkpoint keys: "
+            + ", ".join(f"{old} -> {new}" for old, new in renamed)
+        )
+    model.tactile_head.load_state_dict(head_state, strict=True)
+    print(
+        f"Loaded compact tactile checkpoint: {checkpoint_path} "
+        f"(epoch={checkpoint.get('epoch')}, global_step={checkpoint.get('global_step')})"
+    )
+    return [], []
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Fine-tune Hamer Tactile Head")
-    # Default to the fine-tuned checkpoint!
-    parser.add_argument("--checkpoint", type=str, default=os.path.join(workspace_dir, "opentouch_hamer_ft/checkpoints/regression_wocam_60/best_ft_model.ckpt"), help="Path to fine-tuned Hamer checkpoint")
+    parser = argparse.ArgumentParser(description="Train the frozen-DINO tactile regressor")
     parser.add_argument(
         "--data_dir",
         type=str,
@@ -1202,40 +1360,145 @@ def parse_args():
     
     parser.add_argument("--gpus", type=str, default="4", help="GPU indices (comma-separated, e.g. 4,5)")
     parser.add_argument("--lr", type=float, default=1e-4, help="Base learning rate (per GPU)")
+    parser.add_argument(
+        "--optimizer_weight_decay",
+        type=float,
+        default=1e-4,
+        help="AdamW weight decay for non-bias/non-normalization parameters.",
+    )
+    parser.add_argument(
+        "--lr_scheduler",
+        choices=("cosine", "constant", "multistep"),
+        default="cosine",
+    )
+    parser.add_argument(
+        "--lr_decay_milestones",
+        type=str,
+        default="0.5,0.75",
+        help="Comma-separated LR decay points: values below 1 are total-step fractions; integers are steps.",
+    )
+    parser.add_argument("--lr_decay_gamma", type=float, default=0.1)
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size per GPU")
     parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of workers for DataLoader")
     parser.add_argument("--val_num_workers", type=int, default=None, help="Workers for validation DataLoader; defaults to --num_workers")
-    parser.add_argument("--persistent_workers", action=argparse.BooleanOptionalAction, default=True, help="Keep DataLoader workers alive between epochs")
+    parser.add_argument(
+        "--persistent_workers",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Keep DataLoader workers alive between epochs; disabled by default to bound worker memory growth.",
+    )
     parser.add_argument("--prefetch_factor", type=int, default=4, help="DataLoader prefetch factor when num_workers > 0")
     parser.add_argument("--index_workers", type=int, default=1, help="Workers for initial meta.json index scanning")
     parser.add_argument("--index_backend", type=str, default="process", choices=["process", "thread"], help="Parallel backend for initial index scanning")
     parser.add_argument("--index_chunksize", type=int, default=256, help="Chunk size for parallel index scanning")
+    parser.add_argument(
+        "--index_process_worker_cap",
+        type=int,
+        default=64,
+        help="Maximum process workers used for shared-filesystem index scans; 0 disables the cap.",
+    )
+    parser.add_argument(
+        "--index_manifest",
+        type=str,
+        default=os.path.join(
+            ft_dir,
+            "data_integrity_audits",
+            "mixed_v2_input",
+            "data_integrity_samples.csv",
+        ),
+        help="Verified data-integrity CSV used to build compact indexes without rescanning sample dirs.",
+    )
+    parser.add_argument(
+        "--expected_datasets",
+        type=str,
+        default="",
+        help=(
+            "Hard dataset-content contract for strict/single-domain runs. The dataset constructor "
+            "fails if an unexpected domain is present or an expected domain is absent."
+        ),
+    )
     parser.add_argument("--index_cache_dir", type=str, default=os.path.join(ft_dir, "index_cache"), help="Shared JSONL cache for scanned dataset indices")
+    parser.add_argument(
+        "--bbox_source_policy",
+        choices=("any", "sam3_only"),
+        default="sam3_only",
+        help=(
+            "sam3_only admits only per-query bboxes carrying schema=sam3_bbox_source_v1; "
+            "legacy boxes are never used as fallback."
+        ),
+    )
+    parser.add_argument(
+        "--bbox_manifests",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated reviewed SAM3 bbox JSONL manifests. When set, index "
+            "construction reads candidate sample_dir values from these manifests and "
+            "skips expensive flat-directory discovery."
+        ),
+    )
+    parser.add_argument(
+        "--lazy_index_records",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Memory-map the compact JSONL index instead of retaining millions of "
+            "Python dictionaries in every DataLoader worker. Intended for frame-uniform "
+            "training on very large datasets."
+        ),
+    )
     parser.add_argument("--rebuild_index", action="store_true", help="Force rank 0 to rebuild the index cache")
     parser.add_argument("--index_cache_timeout", type=int, default=3600, help="Seconds nonzero ranks wait for index cache")
     parser.add_argument("--use_wandb", action="store_true", help="Enable Weights & Biases logging")
-    parser.add_argument("--exp_name", type=str, default="mixed_dense_v2_repro", help="Experiment name")
-    parser.add_argument("--checkpoint_monitor", type=str, default="val/eval_rmse", help="Legacy provenance field; training always saves mixed-val RMSE-best and V-IoU-best checkpoints")
-    parser.add_argument("--checkpoint_mode", type=str, default="min", choices=["min", "max"], help="Legacy provenance field retained for command compatibility")
+    parser.add_argument(
+        "--exp_name",
+        type=str,
+        default="mixed_dense_v2_dinov3_rezero_fullgrid32",
+        help="Experiment name",
+    )
     parser.add_argument("--quick_test", action="store_true", help="Run a quick test training")
-    parser.add_argument("--render_platform", type=str, default="egl", choices=["egl", "osmesa"], help="Rendering platform (egl or osmesa)")
-    parser.add_argument("--tactile_only_forward", action=argparse.BooleanOptionalAction, default=True, help="Skip MANO/base forward and train only the tactile path")
     parser.add_argument(
         "--tactile_head_type",
-        choices=("dense_v2", "dense_v2_multilevel", "dense_v2_multilevel_concat"),
-        default="dense_v2",
+        choices=("dense_v2_dino_rezero",),
+        default="dense_v2_dino_rezero",
     )
     parser.add_argument(
         "--backbone_feature_layers",
         type=str,
-        default="16,24,32",
-        help="Comma-separated 1-based ViT block indices used by dense_v2_multilevel.",
+        default="8,16,24,32",
+        help="Comma-separated 1-based DINO block indices used by ReZero fusion.",
+    )
+    parser.add_argument("--dino_residual_max_scale", type=float, default=0.10)
+    parser.add_argument("--dino_residual_rms_budget", type=float, default=0.50)
+    parser.add_argument(
+        "--pool_layout",
+        choices=("fullgrid32",),
+        default="fullgrid32",
+        help="Preserve the complete 16x12 DINO grid before the dense decoder.",
+    )
+    parser.add_argument(
+        "--decoder_dropout_scale",
+        type=float,
+        default=1.0,
+        help="Multiply all three Dense V2 decoder dropout probabilities by this value.",
+    )
+    parser.add_argument(
+        "--train_augmentation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable bbox scale/translation augmentation for training samples.",
+    )
+    parser.add_argument(
+        "--bbox_rescale_factor",
+        type=float,
+        default=2.0,
+        help="Square crop side relative to the query bbox longest side; must lie in [1.0, 4.0].",
     )
     parser.add_argument(
         "--visual_backbone",
-        choices=("hamer", "dinov3_hplus"),
-        default="hamer",
+        choices=("dinov3_hplus",),
+        default="dinov3_hplus",
     )
     parser.add_argument(
         "--dino_weights",
@@ -1251,8 +1514,6 @@ def parse_args():
     parser.add_argument("--max_steps", type=int, default=-1)
     parser.add_argument("--skip_validation", action="store_true")
     parser.add_argument("--skip_checkpointing", action="store_true")
-    parser.add_argument("--audit_nonfinite_grads", action="store_true")
-    parser.add_argument("--nonfinite_audit_dir", type=str, default=None)
     parser.add_argument("--ddp_find_unused_parameters", action="store_true", help="Use DDP unused-parameter detection")
     parser.add_argument("--sync_train_logs", action="store_true", help="Synchronize train logs across distributed workers")
     parser.add_argument("--check_val_every_n_epoch", type=int, default=1, help="Validation frequency in epochs")
@@ -1265,11 +1526,25 @@ def parse_args():
     parser.add_argument("--active_pressure_gamma", type=float, default=1.0)
     parser.add_argument("--background_loss_weight", type=float, default=1.0)
     parser.add_argument("--logit_bce_weight", type=float, default=0.1)
-    parser.add_argument("--loss_ramp_epochs", type=int, default=10)
+    parser.add_argument("--loss_ramp_epochs", type=int, default=5)
     parser.add_argument("--frame_low_volume_thr", type=float, default=30.0, help="GT frame volume threshold for low-volume validation diagnostics")
     parser.add_argument("--frame_high_volume_thr", type=float, default=150.0, help="GT frame volume threshold for high-volume validation diagnostics")
     parser.add_argument("--opentouch_high_pressure_thr", type=float, default=0.9)
     parser.add_argument("--opentouch_high_pressure_weight", type=float, default=0.3)
+    parser.add_argument("--tail_pressure_thr", type=float, default=0.2)
+    parser.add_argument("--tail_l1_weight", type=float, default=0.0)
+    parser.add_argument("--location_loss_weight", type=float, default=0.0)
+    parser.add_argument("--location_gt_volume_thr", type=float, default=1.0)
+    parser.add_argument("--location_distribution_power", type=float, default=1.0)
+    parser.add_argument("--location_min_gt_peak", type=float, default=0.0)
+    parser.add_argument(
+        "--contact_loss_type",
+        choices=("none", "soft_jaccard", "lovasz"),
+        default="none",
+    )
+    parser.add_argument("--contact_loss_weight", type=float, default=0.0)
+    parser.add_argument("--contact_pressure_thr", type=float, default=0.1)
+    parser.add_argument("--contact_temperature", type=float, default=0.025)
     return parser.parse_args()
 
 
@@ -1288,6 +1563,16 @@ def tactile_loss_config_from_args(args):
         loss_ramp_epochs=args.loss_ramp_epochs,
         opentouch_high_pressure_thr=args.opentouch_high_pressure_thr,
         opentouch_high_pressure_weight=args.opentouch_high_pressure_weight,
+        tail_pressure_thr=args.tail_pressure_thr,
+        tail_l1_weight=args.tail_l1_weight,
+        location_loss_weight=args.location_loss_weight,
+        location_gt_volume_thr=args.location_gt_volume_thr,
+        location_distribution_power=args.location_distribution_power,
+        location_min_gt_peak=args.location_min_gt_peak,
+        contact_loss_type=args.contact_loss_type,
+        contact_loss_weight=args.contact_loss_weight,
+        contact_pressure_thr=args.contact_pressure_thr,
+        contact_temperature=args.contact_temperature,
     )
 
 
@@ -1329,19 +1614,23 @@ def model_summary(model):
     sections = {
         "total": model,
         "backbone": model.backbone,
-        "mano_head": model.mano_head,
         "tactile_head": model.tactile_head,
     }
     lines = [
-        "HAMER tactile fine-tuning model summary",
+        "DINO tactile model summary",
         f"tactile_dim: {model.tactile_dim}",
         f"tactile_head_type: {model.tactile_head_type}",
         f"pool_layout: {getattr(model, 'pool_layout', None)}",
         f"pool_grid_size: {getattr(model, 'pool_grid_size', None)}",
         f"pool_valid_tokens: {getattr(model, 'pool_valid_tokens', None)}",
+        f"decoder_dropout_scale: {getattr(model, 'decoder_dropout_scale', None)}",
+        f"dino_rezero_source: {getattr(model, 'dino_rezero_source', None)}",
+        f"dino_residual_max_scale: {getattr(model, 'dino_residual_max_scale', None)}",
+        f"dino_residual_rms_budget: {getattr(model, 'dino_residual_rms_budget', None)}",
+        f"bbox_rescale_factor: {getattr(model, 'bbox_rescale_factor', None)}",
+        f"bbox_source_policy: {getattr(model, 'bbox_source_policy', None)}",
         f"frame_low_volume_thr: {getattr(model, 'frame_low_volume_thr', None)}",
         f"frame_high_volume_thr: {getattr(model, 'frame_high_volume_thr', None)}",
-        f"tactile_only_forward: {model.tactile_only_forward}",
         f"tactile_loss_scale: {model.tactile_loss_scale}",
         "",
     ]
@@ -1365,10 +1654,19 @@ def write_run_provenance(args, data_dirs, tactile_loss_config, model, ckpt_dir, 
     os.makedirs(ckpt_dir, exist_ok=True)
     git_info = git_snapshot()
     model_counts, model_summary_text = model_summary(model)
+    args_config = dict(vars(args))
+    checkpoint_monitors = {
+        "loss-best": {"metric": "val/loss_full_ramp_reference", "mode": "min"},
+    }
+    requested_datasets = set(getattr(model, "dataset_filter", ()))
+    if "TouchAnything" in requested_datasets:
+        checkpoint_monitors["contact-best"] = {
+            "metric": "val/touchanything/touchanything_protocol_contact_iou",
+            "mode": "max",
+        }
     run_config = {
-        "args": vars(args),
+        "args": args_config,
         "resolved_data_dirs": data_dirs,
-        "checkpoint": args.checkpoint,
         "visual_backbone": model.visual_backbone,
         "backbone_weights": model.backbone_weights_path,
         "backbone_sha256": model.backbone_weights_sha256,
@@ -1376,11 +1674,27 @@ def write_run_provenance(args, data_dirs, tactile_loss_config, model, ckpt_dir, 
         "base_lr": args.lr,
         "effective_lr": lr_scaled,
         "lr_scaled": lr_scaled,
-        "checkpoint_monitor": args.checkpoint_monitor,
-        "checkpoint_mode": args.checkpoint_mode,
-        "checkpoint_monitors": {
-            "rmse-best": {"metric": "val/eval_rmse", "mode": "min"},
-            "viou-best": {"metric": "val/eval_volumetric_iou", "mode": "max"},
+        "optimizer_config": {
+            "name": "AdamW",
+            "weight_decay": float(args.optimizer_weight_decay),
+            "no_decay_weight_decay": 0.0,
+        },
+        "lr_scheduler_config": {
+            "name": str(args.lr_scheduler),
+            "warmup_epochs": int(args.lr_warmup_epochs),
+            "decay_milestones": str(args.lr_decay_milestones),
+            "decay_gamma": float(args.lr_decay_gamma),
+        },
+        "checkpoint_monitors": checkpoint_monitors,
+        "metric_protocols": {
+            "volumetric_iou_frame_macro": "per-frame min/max ratio, then frame mean",
+            "volumetric_iou_split_micro": "min/max pressure mass over the complete validation split",
+            "touchanything_canonical_query": {
+                "aggregation": "source-trajectory micro across canonical queries, then unweighted trajectory mean",
+                "contact_threshold": TOUCHANYTHING_CONTACT_THRESHOLD,
+                "min_contact_ratio": TOUCHANYTHING_MIN_CONTACT_RATIO,
+                "bend_sensor_mask": "not_applicable_to_canonical_mesh",
+            },
         },
         "command": " ".join(shlex.quote(arg) for arg in sys.argv),
     }
@@ -1394,14 +1708,45 @@ def write_run_provenance(args, data_dirs, tactile_loss_config, model, ckpt_dir, 
         "backbone_weights": str(model.backbone_weights_path),
         "backbone_sha256": str(model.backbone_weights_sha256),
         "pool_layout": str(getattr(model, "pool_layout", "")),
-        "pool_grid_size": int(getattr(model, "pool_grid_size", 0)),
+        "pool_grid_size": (
+            list(getattr(model, "pool_grid_size", ()))
+            if isinstance(getattr(model, "pool_grid_size", 0), (tuple, list))
+            else int(getattr(model, "pool_grid_size", 0))
+        ),
         "pool_valid_tokens": int(getattr(model, "pool_valid_tokens", 0)),
+        "decoder_dropout_scale": float(getattr(model, "decoder_dropout_scale", 1.0)),
         "backbone_feature_layers": list(getattr(model, "backbone_feature_layers", ())),
+        "dino_rezero_source": str(getattr(model, "dino_rezero_source", "multilevel")),
+        "dino_residual_max_scale": float(getattr(model, "dino_residual_max_scale", 0.10)),
+        "dino_residual_rms_budget": float(getattr(model, "dino_residual_rms_budget", 0.50)),
+        "index_schema_version": int(getattr(model, "index_schema_version", INDEX_CACHE_VERSION)),
+        "index_cache_key": str(getattr(model, "index_cache_key", "")),
+        "indexed_sample_count": int(getattr(model, "indexed_sample_count", 0)),
+        "index_manifest_sha256": str(getattr(model, "index_manifest_sha256", "")),
+        "bbox_manifest_sha256": dict(getattr(model, "bbox_manifest_sha256", {})),
+        "lazy_index_records": bool(getattr(model, "lazy_index_records", False)),
+        "dataset_filter": list(getattr(model, "dataset_filter", ())),
+        "train_augmentation": bool(getattr(model, "train_augmentation", True)),
+        "bbox_rescale_factor": float(getattr(model, "bbox_rescale_factor", 2.0)),
+        "bbox_source_policy": str(getattr(model, "bbox_source_policy", "any")),
+        "tail_pressure_thr": float(tactile_loss_config.tail_pressure_thr),
+        "tail_l1_weight": float(tactile_loss_config.tail_l1_weight),
+        "location_loss_weight": float(tactile_loss_config.location_loss_weight),
+        "location_gt_volume_thr": float(tactile_loss_config.location_gt_volume_thr),
+        "location_distribution_power": float(tactile_loss_config.location_distribution_power),
+        "location_min_gt_peak": float(tactile_loss_config.location_min_gt_peak),
+        "contact_loss_type": str(tactile_loss_config.contact_loss_type),
+        "contact_loss_weight": float(tactile_loss_config.contact_loss_weight),
+        "contact_pressure_thr": float(tactile_loss_config.contact_pressure_thr),
+        "contact_temperature": float(tactile_loss_config.contact_temperature),
+        "optimizer_weight_decay": float(getattr(model, "optimizer_weight_decay", 1e-4)),
+        "lr_scheduler": str(getattr(model, "lr_scheduler_name", "cosine")),
+        "lr_decay_milestones": str(getattr(model, "lr_decay_milestones", "0.5,0.75")),
+        "lr_decay_gamma": float(getattr(model, "lr_decay_gamma", 0.1)),
         "lr_warmup_epochs": int(getattr(model, "lr_warmup_epochs", 0)),
         "frame_low_volume_thr": float(getattr(model, "frame_low_volume_thr", 0.0)),
         "frame_high_volume_thr": float(getattr(model, "frame_high_volume_thr", 0.0)),
         "tactile_loss_scale": float(model.tactile_loss_scale),
-        "skip_mano_base_loss": bool(model.tactile_only_forward),
         "parameter_counts": model_counts,
     }
     write_json(os.path.join(ckpt_dir, "run_config.json"), run_config)
@@ -1420,11 +1765,20 @@ def write_run_provenance(args, data_dirs, tactile_loss_config, model, ckpt_dir, 
     }
 
 
-def make_dataloader(dataset, batch_size, shuffle, num_workers, persistent_workers, prefetch_factor):
+def make_dataloader(
+    dataset,
+    batch_size,
+    shuffle,
+    num_workers,
+    persistent_workers,
+    prefetch_factor,
+    sampler=None,
+):
     num_workers = int(num_workers)
     kwargs = {
         "batch_size": batch_size,
-        "shuffle": shuffle,
+        "shuffle": bool(shuffle and sampler is None),
+        "sampler": sampler,
         "num_workers": num_workers,
         "pin_memory": True,
     }
@@ -1493,19 +1847,92 @@ def _compact_checkpoint_payload(module, epoch, global_step, reason, monitor=None
     return {
         "format": "tactile_trainable_v2",
         "state_dict": head_state,
-        "visual_backbone": str(getattr(module, "visual_backbone", "hamer")),
+        "visual_backbone": str(getattr(module, "visual_backbone", "dinov3_hplus")),
         "visual_backbone_model_name": str(getattr(module, "visual_backbone_model_name", "")),
         "backbone_weights": str(getattr(module, "backbone_weights_path", "") or ""),
         "backbone_sha256": str(getattr(module, "backbone_weights_sha256", "") or ""),
-        "base_checkpoint": str(getattr(module, "audit_checkpoint_path", "") or ""),
         "tactile_head_type": str(getattr(module, "tactile_head_type", "")),
         "backbone_feature_layers": list(getattr(module, "backbone_feature_layers", ())),
+        "dino_rezero_source": str(getattr(module, "dino_rezero_source", "multilevel")),
+        "dino_residual_max_scale": float(getattr(module, "dino_residual_max_scale", 0.10)),
+        "dino_residual_rms_budget": float(getattr(module, "dino_residual_rms_budget", 0.50)),
+        "pool_layout": str(getattr(module, "pool_layout", "fullgrid32")),
+        "decoder_dropout_scale": float(getattr(module, "decoder_dropout_scale", 1.0)),
+        "index_schema_version": int(getattr(module, "index_schema_version", INDEX_CACHE_VERSION)),
+        "index_cache_key": str(getattr(module, "index_cache_key", "")),
+        "indexed_sample_count": int(getattr(module, "indexed_sample_count", 0)),
+        "index_manifest_sha256": str(getattr(module, "index_manifest_sha256", "")),
+        "bbox_manifest_sha256": dict(getattr(module, "bbox_manifest_sha256", {})),
+        "lazy_index_records": bool(getattr(module, "lazy_index_records", False)),
+        "dataset_filter": list(getattr(module, "dataset_filter", ())),
+        "train_augmentation": bool(getattr(module, "train_augmentation", True)),
+        "bbox_rescale_factor": float(getattr(module, "bbox_rescale_factor", 2.0)),
+        "bbox_source_policy": str(getattr(module, "bbox_source_policy", "any")),
+        "tail_pressure_thr": float(module.tactile_loss_config.tail_pressure_thr),
+        "tail_l1_weight": float(module.tactile_loss_config.tail_l1_weight),
+        "location_loss_weight": float(module.tactile_loss_config.location_loss_weight),
+        "location_gt_volume_thr": float(module.tactile_loss_config.location_gt_volume_thr),
+        "location_distribution_power": float(
+            module.tactile_loss_config.location_distribution_power
+        ),
+        "location_min_gt_peak": float(module.tactile_loss_config.location_min_gt_peak),
+        "contact_loss_type": str(module.tactile_loss_config.contact_loss_type),
+        "contact_loss_weight": float(module.tactile_loss_config.contact_loss_weight),
+        "contact_pressure_thr": float(module.tactile_loss_config.contact_pressure_thr),
+        "contact_temperature": float(module.tactile_loss_config.contact_temperature),
+        "optimizer_weight_decay": float(getattr(module, "optimizer_weight_decay", 1e-4)),
+        "lr_scheduler": str(getattr(module, "lr_scheduler_name", "cosine")),
+        "lr_decay_milestones": str(getattr(module, "lr_decay_milestones", "0.5,0.75")),
+        "lr_decay_milestones_resolved": list(
+            getattr(module, "lr_decay_milestones_resolved", ())
+        ),
+        "lr_decay_gamma": float(getattr(module, "lr_decay_gamma", 0.1)),
+        "lr_warmup_epochs": int(getattr(module, "lr_warmup_epochs", 0)),
         "loss_config": asdict(module.tactile_loss_config),
         "model_config": {
             "tactile_head_type": str(getattr(module, "tactile_head_type", "")),
-            "visual_backbone": str(getattr(module, "visual_backbone", "hamer")),
+            "visual_backbone": str(getattr(module, "visual_backbone", "dinov3_hplus")),
             "visual_backbone_model_name": str(getattr(module, "visual_backbone_model_name", "")),
             "backbone_feature_layers": list(getattr(module, "backbone_feature_layers", ())),
+            "dino_rezero_source": str(getattr(module, "dino_rezero_source", "multilevel")),
+            "dino_residual_max_scale": float(getattr(module, "dino_residual_max_scale", 0.10)),
+            "dino_residual_rms_budget": float(getattr(module, "dino_residual_rms_budget", 0.50)),
+            "pool_layout": str(getattr(module, "pool_layout", "fullgrid32")),
+            "decoder_dropout_scale": float(getattr(module, "decoder_dropout_scale", 1.0)),
+            "index_schema_version": int(getattr(module, "index_schema_version", INDEX_CACHE_VERSION)),
+            "index_cache_key": str(getattr(module, "index_cache_key", "")),
+            "indexed_sample_count": int(getattr(module, "indexed_sample_count", 0)),
+            "index_manifest_sha256": str(getattr(module, "index_manifest_sha256", "")),
+            "bbox_manifest_sha256": dict(getattr(module, "bbox_manifest_sha256", {})),
+            "lazy_index_records": bool(getattr(module, "lazy_index_records", False)),
+            "dataset_filter": list(getattr(module, "dataset_filter", ())),
+            "train_augmentation": bool(getattr(module, "train_augmentation", True)),
+            "bbox_rescale_factor": float(getattr(module, "bbox_rescale_factor", 2.0)),
+            "bbox_source_policy": str(getattr(module, "bbox_source_policy", "any")),
+            "tail_pressure_thr": float(module.tactile_loss_config.tail_pressure_thr),
+            "tail_l1_weight": float(module.tactile_loss_config.tail_l1_weight),
+            "location_loss_weight": float(module.tactile_loss_config.location_loss_weight),
+            "location_gt_volume_thr": float(module.tactile_loss_config.location_gt_volume_thr),
+            "location_distribution_power": float(
+                module.tactile_loss_config.location_distribution_power
+            ),
+            "location_min_gt_peak": float(module.tactile_loss_config.location_min_gt_peak),
+            "contact_loss_type": str(module.tactile_loss_config.contact_loss_type),
+            "contact_loss_weight": float(module.tactile_loss_config.contact_loss_weight),
+            "contact_pressure_thr": float(module.tactile_loss_config.contact_pressure_thr),
+            "contact_temperature": float(module.tactile_loss_config.contact_temperature),
+            "optimizer_weight_decay": float(
+                getattr(module, "optimizer_weight_decay", 1e-4)
+            ),
+            "lr_scheduler": str(getattr(module, "lr_scheduler_name", "cosine")),
+            "lr_decay_milestones": str(
+                getattr(module, "lr_decay_milestones", "0.5,0.75")
+            ),
+            "lr_decay_milestones_resolved": list(
+                getattr(module, "lr_decay_milestones_resolved", ())
+            ),
+            "lr_decay_gamma": float(getattr(module, "lr_decay_gamma", 0.1)),
+            "lr_warmup_epochs": int(getattr(module, "lr_warmup_epochs", 0)),
             "backbone_weights": str(getattr(module, "backbone_weights_path", "") or ""),
             "backbone_sha256": str(getattr(module, "backbone_weights_sha256", "") or ""),
             "tactile_dim": int(getattr(module, "tactile_dim", 0)),
@@ -1597,7 +2024,6 @@ def save_materialized_last_checkpoint(
         "last_checkpoint": str(last_path),
         "last_checkpoint_is_symlink": bool(last_path.is_symlink()),
         "checkpoint_format": checkpoint["format"],
-        "base_checkpoint": checkpoint["base_checkpoint"],
         "visual_backbone": checkpoint["visual_backbone"],
         "backbone_weights": checkpoint["backbone_weights"],
         "backbone_sha256": checkpoint["backbone_sha256"],
@@ -1673,26 +2099,26 @@ class MaterializedLastCheckpointCallback(Callback):
 def main():
     args = parse_args()
     pl.seed_everything(args.seed, workers=True)
-    args.checkpoint = str(Path(args.checkpoint).expanduser().resolve(strict=False))
-    if args.visual_backbone == "dinov3_hplus":
-        if not args.dino_weights:
-            raise ValueError("--dino_weights is required for --visual_backbone=dinov3_hplus")
-        args.dino_weights = str(Path(args.dino_weights).expanduser().resolve(strict=False))
-        if not Path(args.dino_weights).is_file():
-            raise FileNotFoundError(f"DINOv3 weights not found: {args.dino_weights}")
-    elif args.dino_weights:
-        args.dino_weights = str(Path(args.dino_weights).expanduser().resolve(strict=False))
-    if args.audit_nonfinite_grads and not args.nonfinite_audit_dir:
-        args.nonfinite_audit_dir = os.path.join(ft_dir, "amp_audits", args.exp_name, "capture")
-    if args.nonfinite_audit_dir:
-        args.nonfinite_audit_dir = os.path.abspath(os.path.expanduser(args.nonfinite_audit_dir))
+    if float(args.optimizer_weight_decay) < 0.0:
+        raise ValueError("--optimizer_weight_decay must be nonnegative")
+    if float(args.lr_decay_gamma) <= 0.0:
+        raise ValueError("--lr_decay_gamma must be positive")
+    if not 0.0 <= float(args.decoder_dropout_scale) <= 1.0:
+        raise ValueError("--decoder_dropout_scale must lie in [0, 1]")
+    if not 1.0 <= float(args.bbox_rescale_factor) <= 4.0:
+        raise ValueError("--bbox_rescale_factor must lie in [1.0, 4.0]")
+    if args.index_manifest:
+        args.index_manifest = str(Path(args.index_manifest).expanduser().resolve(strict=False))
+    args.expected_datasets = list(canonical_dataset_filter(args.expected_datasets))
+    if not args.dino_weights:
+        raise ValueError("--dino_weights is required")
+    args.dino_weights = str(Path(args.dino_weights).expanduser().resolve(strict=False))
+    if not Path(args.dino_weights).is_file():
+        raise FileNotFoundError(f"DINOv3 weights not found: {args.dino_weights}")
     data_dirs = resolve_data_dirs(args)
     print("Resolved training data roots:")
     for data_dir in data_dirs:
         print(f"  - {data_dir}")
-    
-    hamer_root = os.path.join(workspace_dir, "hamer")
-    os.chdir(hamer_root)
     
     gpu_ids = [value.strip() for value in args.gpus.split(",") if value.strip()]
     if not gpu_ids:
@@ -1707,10 +2133,6 @@ def main():
         "(linear scaling)"
     )
     
-    print(f"Loading finetuned Hamer weights from: {args.checkpoint}")
-    if not os.path.exists(args.checkpoint):
-        raise FileNotFoundError(f"Checkpoint not found at: {args.checkpoint}")
-        
     from hamer.configs import get_config
     
     # We can use the original model_config.yaml from hamer
@@ -1726,51 +2148,9 @@ def main():
         model_cfg.defrost()
         model_cfg.MODEL.BACKBONE.pop('PRETRAINED_WEIGHTS')
         model_cfg.freeze()
-        
-    print("Initializing HAMER_Tactile Wrapper...")
-    tactile_loss_config = tactile_loss_config_from_args(args)
-    backbone_feature_layers = tuple(int(layer) for layer in _split_csv(args.backbone_feature_layers))
-    model = OpenTouchHAMER_TactileWrapper(
-        cfg=model_cfg,
-        learning_rate=lr_scaled,
-        tactile_loss_config=tactile_loss_config,
-        tactile_only_forward=args.tactile_only_forward,
-        tactile_loss_scale=args.tactile_loss_scale,
-        lr_warmup_epochs=args.lr_warmup_epochs,
-        frame_low_volume_thr=args.frame_low_volume_thr,
-        frame_high_volume_thr=args.frame_high_volume_thr,
-        sync_train_logs=args.sync_train_logs,
-        audit_nonfinite_grads=args.audit_nonfinite_grads,
-        nonfinite_audit_dir=args.nonfinite_audit_dir,
-        audit_checkpoint_path=args.checkpoint,
-        audit_seed=args.seed,
-        tactile_head_type=args.tactile_head_type,
-        backbone_feature_layers=backbone_feature_layers,
-        visual_backbone=args.visual_backbone,
-        dino_weights=args.dino_weights or "",
-    )
-    model.visual_backbone_model_name = (
-        model.backbone.MODEL_NAME if args.visual_backbone == "dinov3_hplus" else "hamer_vit_h"
-    )
-    model.backbone_weights_path = args.dino_weights if args.visual_backbone == "dinov3_hplus" else args.checkpoint
-    print(f"Computing backbone SHA256: {model.backbone_weights_path}")
-    model.backbone_weights_sha256 = file_sha256(model.backbone_weights_path)
-    
-    # Do a dummy forward pass to initialize lazy layers before shape-aware loading.
-    dummy_input = torch.zeros(1, 3, model_cfg.MODEL.IMAGE_SIZE, model_cfg.MODEL.IMAGE_SIZE)
-    with torch.no_grad():
-        dummy_feat = model._extract_tactile_features(dummy_input[:, :, :, 32:-32])
-        model.tactile_head(dummy_feat)
-        print(f"Tactile head initialized with output dim: {model.tactile_dim}")
 
-    print("Loading compatible weights from fine-tuned model...")
-    missing, unexpected = load_compatible_state_dict(
-        model,
-        args.checkpoint,
-        load_backbone=args.visual_backbone == "hamer",
-    )
-    print(f"Missing keys during load: {len(missing)}")
-        
+    # Build/load the filesystem index before constructing the large DINO model.
+    # Forking an already multithreaded torch/timm process is prone to process-pool stalls.
     train_dataset = OpenTouchTactileDataset(
         cfg=model_cfg,
         split="train",
@@ -1779,12 +2159,21 @@ def main():
         index_workers=args.index_workers,
         index_chunksize=args.index_chunksize,
         index_backend=args.index_backend,
+        index_process_worker_cap=args.index_process_worker_cap,
+        index_manifest=args.index_manifest,
+        expected_datasets=args.expected_datasets,
         index_cache_dir=args.index_cache_dir,
         rebuild_index=args.rebuild_index,
         index_cache_timeout=args.index_cache_timeout,
-        tactile_only=args.tactile_only_forward,
+        tactile_only=True,
+        bbox_rescale_factor=args.bbox_rescale_factor,
+        bbox_source_policy=args.bbox_source_policy,
+        bbox_manifests=args.bbox_manifests,
+        lazy_index_records=args.lazy_index_records,
+        augmentation_enabled=args.train_augmentation,
     )
-    
+    index_metadata = train_dataset.index_cache_metadata()
+
     val_dataset = None
     if not args.skip_validation:
         val_dataset = OpenTouchTactileDataset(
@@ -1795,12 +2184,70 @@ def main():
             index_workers=args.index_workers,
             index_chunksize=args.index_chunksize,
             index_backend=args.index_backend,
+            index_process_worker_cap=args.index_process_worker_cap,
+            index_manifest=args.index_manifest,
+            expected_datasets=args.expected_datasets,
             index_cache_dir=args.index_cache_dir,
             rebuild_index=args.rebuild_index,
             index_cache_timeout=args.index_cache_timeout,
-            tactile_only=args.tactile_only_forward,
+            tactile_only=True,
+            bbox_rescale_factor=args.bbox_rescale_factor,
+            bbox_source_policy=args.bbox_source_policy,
+            bbox_manifests=args.bbox_manifests,
+            lazy_index_records=args.lazy_index_records,
+            augmentation_enabled=False,
         )
+
+    print("Initializing standalone DINO tactile model...")
+    tactile_loss_config = tactile_loss_config_from_args(args)
+    backbone_feature_layers = tuple(int(layer) for layer in _split_csv(args.backbone_feature_layers))
+    model = TactileTrainingModule(
+        cfg=model_cfg,
+        learning_rate=lr_scaled,
+        tactile_loss_config=tactile_loss_config,
+        tactile_only_forward=True,
+        tactile_loss_scale=args.tactile_loss_scale,
+        lr_warmup_epochs=args.lr_warmup_epochs,
+        frame_low_volume_thr=args.frame_low_volume_thr,
+        frame_high_volume_thr=args.frame_high_volume_thr,
+        sync_train_logs=args.sync_train_logs,
+        tactile_head_type=args.tactile_head_type,
+        backbone_feature_layers=backbone_feature_layers,
+        visual_backbone=args.visual_backbone,
+        dino_weights=args.dino_weights or "",
+        dino_rezero_source="multilevel",
+        dino_residual_max_scale=args.dino_residual_max_scale,
+        dino_residual_rms_budget=args.dino_residual_rms_budget,
+        bbox_rescale_factor=args.bbox_rescale_factor,
+        bbox_source_policy=args.bbox_source_policy,
+        pool_layout=args.pool_layout,
+        decoder_dropout_scale=args.decoder_dropout_scale,
+        optimizer_weight_decay=args.optimizer_weight_decay,
+        lr_scheduler=args.lr_scheduler,
+        lr_decay_milestones=args.lr_decay_milestones,
+        lr_decay_gamma=args.lr_decay_gamma,
+    )
+    model.visual_backbone_model_name = model.backbone.MODEL_NAME
+    model.backbone_weights_path = args.dino_weights
+    print(f"Computing backbone SHA256: {model.backbone_weights_path}")
+    model.backbone_weights_sha256 = file_sha256(model.backbone_weights_path)
+    model.index_schema_version = int(index_metadata["index_schema_version"])
+    model.bbox_source_policy = str(index_metadata["bbox_source_policy"])
+    model.index_cache_key = str(index_metadata["index_cache_key"])
+    model.indexed_sample_count = int(index_metadata["indexed_sample_count"])
+    model.index_manifest_sha256 = str(index_metadata.get("index_manifest_sha256", ""))
+    model.bbox_manifest_sha256 = dict(index_metadata.get("bbox_manifest_sha256", {}))
+    model.lazy_index_records = bool(index_metadata.get("lazy_index_records", False))
+    model.dataset_filter = tuple(index_metadata.get("dataset_filter", ()))
+    model.train_augmentation = bool(args.train_augmentation)
     
+    # Validate the complete feature/head shape before allocating DataLoader workers.
+    dummy_input = torch.zeros(1, 3, model_cfg.MODEL.IMAGE_SIZE, model_cfg.MODEL.IMAGE_SIZE)
+    with torch.no_grad():
+        dummy_feat = model._extract_tactile_features(dummy_input[:, :, :, 32:-32])
+        model.tactile_head(dummy_feat)
+        print(f"Tactile head initialized with output dim: {model.tactile_dim}")
+
     if args.quick_test:
         train_dataset.samples = train_dataset.samples[:64]
         if val_dataset is not None:
@@ -1816,6 +2263,17 @@ def main():
         )
 
     val_num_workers = args.num_workers if args.val_num_workers is None else args.val_num_workers
+    total_loader_workers = num_gpus * (int(args.num_workers) + int(val_num_workers))
+    if total_loader_workers > 256 and ddp_global_rank() == 0:
+        print(
+            "WARNING: requested DataLoader worker count is very high: "
+            f"train={args.num_workers}/rank, val={val_num_workers}/rank, "
+            f"aggregate={total_loader_workers}. The dataset owns millions of Python "
+            "index records; forked workers progressively copy those pages as records "
+            "are accessed, so host RAM can grow throughout the first epoch. Prefer "
+            "16 train and 8 val workers per rank before increasing this further.",
+            flush=True,
+        )
     train_loader = make_dataloader(
         train_dataset,
         batch_size=args.batch_size,
@@ -1844,19 +2302,25 @@ def main():
     val_metrics_text_logger = ValidationMetricsTextLogger(os.path.join(ckpt_dir, "val_metrics.txt"), config_record=provenance)
     checkpoint_callbacks = {}
     if val_loader is not None and not args.skip_checkpointing:
-        print("Best checkpoint monitors: val/eval_rmse (min), val/eval_volumetric_iou (max)")
-        checkpoint_callbacks["rmse-best"] = CompactBestCheckpoint(
+        print("Primary checkpoint monitor: val/loss_full_ramp_reference (min)")
+        checkpoint_callbacks["loss-best"] = CompactBestCheckpoint(
             dirpath=ckpt_dir,
-            filename="best_rmse",
-            monitor="val/eval_rmse",
+            filename="best_loss",
+            monitor="val/loss_full_ramp_reference",
             mode="min",
         )
-        checkpoint_callbacks["viou-best"] = CompactBestCheckpoint(
-            dirpath=ckpt_dir,
-            filename="best_viou",
-            monitor="val/eval_volumetric_iou",
-            mode="max",
-        )
+        requested_datasets = set(model.dataset_filter)
+        if "TouchAnything" in requested_datasets:
+            print(
+                "Secondary checkpoint monitor: "
+                "val/touchanything/touchanything_protocol_contact_iou (max)"
+            )
+            checkpoint_callbacks["contact-best"] = CompactBestCheckpoint(
+                dirpath=ckpt_dir,
+                filename="best_contact",
+                monitor="val/touchanything/touchanything_protocol_contact_iou",
+                mode="max",
+            )
     lr_monitor = LearningRateMonitor(logging_interval="step")
     materialized_last_callback = None
     if not args.skip_checkpointing:
@@ -1899,6 +2363,7 @@ def main():
         check_val_every_n_epoch=args.check_val_every_n_epoch,
         gradient_clip_val=args.gradient_clip_val,
         gradient_clip_algorithm="norm",
+        use_distributed_sampler=True,
     )
     
     if val_loader is None:

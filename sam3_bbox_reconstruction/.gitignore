@@ -1,0 +1,12 @@
+outputs/
+results/
+inputs/
+manifests/
+reports/
+pilot_manifest.jsonl
+pilot_manifest.recovered.json
+index.html
+association_index.html
+third_party/
+__pycache__/
+*.pyc

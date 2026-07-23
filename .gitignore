@@ -56,6 +56,7 @@ logs*/
 results/
 outputs/
 demo_out/
+demo_output/
 out_demo_video/
 hamer_tactile_ft/full_bboxes_cache
 
@@ -132,6 +133,8 @@ wandb/
 hamer_tactile_ft/eval_reports
 hamer_tactile_ft/eval_reports_*
 hamer_tactile_ft/eval_reports_baseline
+hamer_tactile_ft/data_integrity_audits/
 hamer_tactile_ft/index_cache
 hamer_tactile_ft/reports
 hamer_tactile_ft/amp_audits
+hamer_tactile_ft/memorization

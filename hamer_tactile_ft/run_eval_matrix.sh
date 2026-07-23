@@ -9,26 +9,38 @@ WORKSPACE_DIR="$(dirname "$SCRIPT_DIR")"
 #   bash hamer_tactile_ft/run_eval_matrix.sh [EXP_NAME] [CKPT ...]
 #
 # Examples:
-#   bash hamer_tactile_ft/run_eval_matrix.sh
-#   bash hamer_tactile_ft/run_eval_matrix.sh mixed_dense_v2_repro rmse-best viou-best last
+#   bash hamer_tactile_ft/run_eval_matrix.sh \
+#     touchanything_dense_v2_dinov3_rezero_fullgrid32_coreloc_sam3_crop16 \
+#     loss-best contact-best
 
-EXP_NAME="${1:-mixed_dense_v2_repro}"
-if (( $# > 0 )); then
-    shift
+if (( $# == 0 )); then
+    echo "Usage: $0 EXP_NAME [loss-best|contact-best|last ...]" >&2
+    exit 2
 fi
+EXP_NAME="$1"
+shift
 
 if (( $# > 0 )); then
     CKPT_SELECTORS=("$@")
+elif [[ -f "$SCRIPT_DIR/checkpoints/$EXP_NAME/best_contact.ckpt" ]]; then
+    CKPT_SELECTORS=(loss-best contact-best)
 else
-    CKPT_SELECTORS=(rmse-best)
+    # OpenTouch-only runs do not produce a TouchAnything contact checkpoint.
+    CKPT_SELECTORS=(loss-best last)
 fi
 
-# Each entry is DATASET:SPLIT. Add or remove entries to change the eval matrix.
-EVAL_TASKS=(
-    "opentouch:test"
-    "touchanything:test_seen"
-    "touchanything:test_unseen"
-)
+# Each entry is DATASET:SPLIT. DATASET may itself be comma-separated.
+# Override with semicolon-separated EVAL_TASKS_SPEC, for example:
+#   EVAL_TASKS_SPEC='opentouch,touchanything:train'
+if [[ -n "${EVAL_TASKS_SPEC:-}" ]]; then
+    IFS=';' read -r -a EVAL_TASKS <<< "$EVAL_TASKS_SPEC"
+else
+    EVAL_TASKS=(
+        "opentouch:test"
+        "touchanything:test_seen"
+        "touchanything:test_unseen"
+    )
+fi
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 GPUS="${GPUS:-0,1,2,3,4,5,6,7}"
@@ -36,6 +48,21 @@ BATCH_SIZE="${BATCH_SIZE:-64}"
 INDEX_WORKERS="${INDEX_WORKERS:-128}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 DINO_WEIGHTS="${DINO_WEIGHTS:-}"
+BBOX_MANIFESTS="${BBOX_MANIFESTS:-}"
+SAVE_DIAGNOSTICS="${SAVE_DIAGNOSTICS:-0}"
+RUN_SEQUENCE_AUDIT="${RUN_SEQUENCE_AUDIT:-0}"
+
+for flag_name in SAVE_DIAGNOSTICS RUN_SEQUENCE_AUDIT; do
+    flag_value="${!flag_name}"
+    if [[ "$flag_value" != "0" && "$flag_value" != "1" ]]; then
+        echo "$flag_name must be 0 or 1 (got '$flag_value')." >&2
+        exit 2
+    fi
+done
+if [[ "$RUN_SEQUENCE_AUDIT" == "1" && "$SAVE_DIAGNOSTICS" != "1" ]]; then
+    echo "RUN_SEQUENCE_AUDIT=1 requires SAVE_DIAGNOSTICS=1." >&2
+    exit 2
+fi
 
 safe_name() {
     local value="${1,,}"
@@ -51,6 +78,7 @@ mkdir -p "$LOG_DIR"
 PIDS=()
 LABELS=()
 LOG_FILES=()
+DIAGNOSTIC_DIRS=()
 
 stop_children() {
     local pid
@@ -74,14 +102,17 @@ echo "Experiment: $EXP_NAME"
 echo "Tactile head: loaded from experiment model_config.json"
 echo "Checkpoints: ${CKPT_SELECTORS[*]}"
 echo "GPUs per eval: $GPUS"
+echo "Evaluation tasks: ${EVAL_TASKS[*]}"
+echo "Save diagnostics: $SAVE_DIAGNOSTICS"
+echo "Run sequence audit: $RUN_SEQUENCE_AUDIT"
 echo "Output root: $OUTPUT_ROOT"
 echo
 
 for ckpt in "${CKPT_SELECTORS[@]}"; do
     case "$ckpt" in
-        rmse-best|viou-best|last|best) ;;
+        loss-best|contact-best|last) ;;
         *)
-            echo "Invalid checkpoint selector '$ckpt'. Use rmse-best, viou-best, last, or best." >&2
+            echo "Invalid checkpoint selector '$ckpt'. Use loss-best, contact-best, or last." >&2
             exit 2
             ;;
     esac
@@ -100,15 +131,20 @@ for ckpt in "${CKPT_SELECTORS[@]}"; do
             --gpus "$GPUS"
             --num_workers "$NUM_WORKERS"
             --index_workers "$INDEX_WORKERS"
-            --save_diagnostics
             --exp_name "$EXP_NAME"
             --ckpt "$ckpt"
             --datasets "$dataset"
             --split "$split"
             --report_dir "$task_dir"
         )
+        if [[ "$SAVE_DIAGNOSTICS" == "1" ]]; then
+            command+=(--save_diagnostics)
+        fi
         if [[ -n "$DINO_WEIGHTS" ]]; then
             command+=(--dino_weights "$DINO_WEIGHTS")
+        fi
+        if [[ -n "$BBOX_MANIFESTS" ]]; then
+            command+=(--bbox_manifests "$BBOX_MANIFESTS")
         fi
 
         echo "Starting $label"
@@ -117,6 +153,9 @@ for ckpt in "${CKPT_SELECTORS[@]}"; do
         PIDS+=("$!")
         LABELS+=("$label")
         LOG_FILES+=("$log_file")
+        if [[ "$SAVE_DIAGNOSTICS" == "1" ]]; then
+            DIAGNOSTIC_DIRS+=("$task_dir/eval_${dataset}_${split}_diagnostics")
+        fi
     done
 done
 
@@ -141,6 +180,28 @@ trap - INT TERM
 
 if (( failures > 0 )); then
     echo "$failures eval process(es) failed. See logs under $LOG_DIR." >&2
+    exit 1
+fi
+
+if [[ "$RUN_SEQUENCE_AUDIT" == "1" ]]; then
+    echo
+    echo "Running sequence failure audits..."
+    for index in "${!DIAGNOSTIC_DIRS[@]}"; do
+        diagnostics_dir="${DIAGNOSTIC_DIRS[$index]}"
+        label="${LABELS[$index]}"
+        audit_log="$LOG_DIR/$(safe_name "sequence_audit_${label}").log"
+        if "$PYTHON_BIN" hamer_tactile_ft/audit_sequence_failures.py \
+            --diagnostics_dir "$diagnostics_dir" >"$audit_log" 2>&1; then
+            echo "[AUDIT]  $label"
+        else
+            echo "[FAILED] sequence audit $label (log: $audit_log)" >&2
+            ((failures += 1))
+        fi
+    done
+fi
+
+if (( failures > 0 )); then
+    echo "$failures eval or audit process(es) failed. See logs under $LOG_DIR." >&2
     exit 1
 fi
 

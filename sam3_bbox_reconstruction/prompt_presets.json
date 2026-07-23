@@ -1,0 +1,50 @@
+{
+  "gloved": {
+    "primary": "gloved hand",
+    "candidates": [
+      "gloved hand",
+      "black glove",
+      "black gloved hand",
+      "hand wearing a black glove",
+      "hand wearing a glove",
+      "human hand wearing a glove",
+      "fingerless gloved hand",
+      "tactile sensing glove"
+    ],
+    "verifiers": {
+      "glove": [
+        "black glove",
+        "black gloved hand",
+        "hand wearing a black glove",
+        "hand wearing a glove",
+        "human hand wearing a glove"
+      ],
+      "bare_diagnostic": [
+        "bare hand",
+        "human bare hand"
+      ]
+    },
+    "note": "Use the primary prompt first. Color-specific prompts are fallbacks only when the dataset glove color is known."
+  },
+  "bare": {
+    "primary": "bare human hand",
+    "candidates": [
+      "bare hand",
+      "human bare hand",
+      "bare human hand with visible fingers",
+      "human palm and fingers",
+      "human hand"
+    ],
+    "verifiers": {
+      "positive": [
+        "bare human hand with visible fingers",
+        "human palm and fingers"
+      ],
+      "negative_diagnostic": [
+        "cardboard product box",
+        "earphone or headphone case"
+      ]
+    },
+    "note": "Bare-hand demo preset. Positive anatomy and held-object prompts are independently replayed and spatially matched; left/right remains a later association concern."
+  }
+}

@@ -61,6 +61,7 @@ def concat_videos(
     crf: int | float = 23,
     preset: str = "medium",
     scale_height: int | None = None,
+    scale_width: int | None = None,
     layout: str = "horizontal",
 ) -> None:
     """Concatenate two or more videos into a single output using FFmpeg."""
@@ -83,9 +84,11 @@ def concat_videos(
     layout = layout.lower()
     if layout not in {"horizontal", "vertical"}:
         raise ValueError("layout must be 'horizontal' or 'vertical'")
+    if scale_height is not None and scale_width is not None:
+        raise ValueError("Specify at most one of scale_height and scale_width")
 
     heights = [probe_height(path) for path in inputs]
-    if scale_height is None and len({h for h in heights if h}) > 1:
+    if scale_height is None and scale_width is None and len({h for h in heights if h}) > 1:
         valid_heights = [h for h in heights if h]
         scale_height = min(valid_heights) if valid_heights else None
 
@@ -95,7 +98,9 @@ def concat_videos(
     for idx, _ in enumerate(inputs):
         src_label = f"[{idx}:v]"
         dst_label = f"v{idx}"
-        if scale_height:
+        if scale_width:
+            filter_parts.append(f"{src_label}scale={int(scale_width)}:-2,setsar=1[{dst_label}]")
+        elif scale_height:
             filter_parts.append(f"{src_label}scale=-2:{int(scale_height)},setsar=1[{dst_label}]")
         else:
             filter_parts.append(f"{src_label}setsar=1[{dst_label}]")
@@ -139,6 +144,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("-o", "--output", default="concatenated_output.mp4", help="Output video path")
     parser.add_argument("--layout", choices=["horizontal", "vertical"], default="horizontal", help="Stack direction")
     parser.add_argument("--scale-height", type=int, help="Force common output height before stacking")
+    parser.add_argument("--scale-width", type=int, help="Force common output width before stacking")
     parser.add_argument("--crf", type=float, default=23.0, help="libx264 CRF value (lower = higher quality)")
     parser.add_argument("--preset", default="medium", help="libx264 preset (ultrafast..veryslow)")
     parser.add_argument("--copy-audio", action="store_true", help="Copy audio from the middle input if present")
@@ -164,6 +170,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             crf=args.crf,
             preset=args.preset,
             scale_height=args.scale_height,
+            scale_width=args.scale_width,
             layout=args.layout,
         )
         print(f"✓ Video saved to: {args.output}")

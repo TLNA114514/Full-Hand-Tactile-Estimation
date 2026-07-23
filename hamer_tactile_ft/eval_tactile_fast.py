@@ -20,87 +20,42 @@ for i, arg in enumerate(sys.argv):
 if _gpus:
     os.environ["CUDA_VISIBLE_DEVICES"] = _gpus
 
-# ==========================================================================================
-# 🛑 核心黑魔法：源码感知 + 全局空间硬核注入补丁（地表最强终结版，完美解决一切 NameError）
-# ==========================================================================================
-_parser = argparse.ArgumentParser(add_help=False)
-_parser.add_argument('--render_platform', type=str, default='egl', choices=['egl', 'osmesa'], help='Rendering platform (egl or osmesa)')
-_args, _ = _parser.parse_known_args()
-
-os.environ['PYOPENGL_PLATFORM'] = _args.render_platform
-os.environ['PYRENDER_PLATFORM'] = _args.render_platform
-
-try:
-    import types
-    import builtins
-    import re
-    import sys
-
-    # 1. 定义一个全能通配符类：既是数字0，又是可任意调用的函数，还支持无限切片和属性延伸
-    class UltimateMagicMock(int):
-        def __call__(self, *args, **kwargs): return self
-        def __getattr__(self, name): return self
-        def __getitem__(self, item): return self
-        def __iter__(self): return iter([])
-
-    class PerfectMockModule(types.ModuleType):
-        def __getattr__(self, name):
-            if name.startswith('__'): raise AttributeError(name)
-            return UltimateMagicMock(0)
-
-    mock_obj = PerfectMockModule('OpenGL.GL')
-
-    # 2. 拦截系统的底层 __import__ 行为
-    orig_import = builtins.__import__
-    def custom_import(name, globals=None, locals=None, fromlist=(), level=0):
-        # 只要发现有任何文件在尝试染指 OpenGL/EGL/OSMesa
-        if name.startswith('OpenGL') or name in ['EGL', 'OSMesa']:
-            if globals is not None and '__file__' in globals:
-                try:
-                    # 【硬核注入】读取当前正在执行 import 的文件（如 texture.py）的源码
-                    with open(globals['__file__'], 'r', encoding='utf-8', errors='ignore') as f:
-                        content = f.read()
-                    
-                    # 抓取该文件里写的所有 OpenGL 相关的函数和常量（如 GL_TEXTURE_2D, glGenTextures 等）
-                    tokens = re.findall(r'\b([gG][lL][A-Za-z0-9_]+|[eE][gG][lL][A-Za-z0-9_]+|OSMesa[A-Za-z0-9_]+)\b', content)
-                    
-                    # 直接强行把这些变量塞进该文件的全局命名空间，彻底断绝 NameError 的可能
-                    for token in tokens:
-                        if token not in globals:
-                            globals[token] = UltimateMagicMock(0)
-                except Exception:
-                    pass
-            return mock_obj
-        return orig_import(name, globals, locals, fromlist, level)
-    
-    # 替换系统全局导入函数
-    builtins.__import__ = custom_import
-
-    # 3. 固化系统路由备份
-    sys.modules['EGL'] = mock_obj
-    sys.modules['OSMesa'] = mock_obj
-    sys.modules['OpenGL'] = mock_obj
-    sys.modules['OpenGL.GL'] = mock_obj
-    sys.modules['OpenGL.GL.shaders'] = mock_obj
-    
-    print("\n====== [Success] Hardcore Global Token Injector Activated! ======\n")
-except Exception as e:
-    print(f"Bypass failed: {e}")
-# ==========================================================================================
-
 base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.append(os.path.join(base_dir, 'hamer'))
 sys.path.append(os.path.join(base_dir, 'evaluation'))
 sys.path.append(os.path.join(base_dir, 'hamer_tactile_ft'))
 
 from hamer.configs import get_config
-from train import OpenTouchHAMER_TactileWrapper
+from train import TactileTrainingModule
 from train import _load_checkpoint
 from train import file_sha256
 from train import load_compatible_state_dict
 from train import resolve_data_dirs
-from dataset import OpenTouchTactileDataset
-from hamer.utils import recursive_to
+from dataset import OpenTouchTactileDataset, canonical_dataset_filter
+from tactile_metrics import (
+    CompactTouchAnythingProtocolAccumulator,
+    TOUCHANYTHING_CONTACT_THRESHOLD,
+    TOUCHANYTHING_MIN_CONTACT_RATIO,
+    TOUCHANYTHING_SCENE_CATEGORIES,
+    location_distribution_stats,
+    merge_compact_touchanything_protocol_stats,
+    summarize_compact_touchanything_protocol,
+    touchanything_protocol_group_key,
+    touchanything_protocol_frame_stats,
+    volumetric_iou_stats,
+)
+
+
+def recursive_to(value, target):
+    if isinstance(value, dict):
+        return {key: recursive_to(item, target) for key, item in value.items()}
+    if isinstance(value, torch.Tensor):
+        return value.to(target)
+    if isinstance(value, list):
+        return [recursive_to(item, target) for item in value]
+    if isinstance(value, tuple):
+        return tuple(recursive_to(item, target) for item in value)
+    return value
 
 
 DIAG_VALUE_BINS = np.linspace(0.0, 1.0, 101, dtype=np.float32)
@@ -113,6 +68,8 @@ DIAG_PRED_TAIL_THRESHOLDS = np.array(
     [0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.70],
     dtype=np.float32,
 )
+CORE_LOCATION_DISTRIBUTION_POWER = 2.0
+CORE_LOCATION_MIN_GT_PEAK = 0.05
 FRAME_DIAG_KEYS = (
     "gt_volume",
     "pred_volume",
@@ -122,12 +79,30 @@ FRAME_DIAG_KEYS = (
     "gt_active_vertices",
     "pred_active_vertices",
     "frame_mae",
+    "distribution_viou",
+    "volume_matched_viou",
+    "pred_mass_on_gt_support",
+    "gt_mass_in_pred_support",
+    "location_eligible",
+    "core_distribution_viou",
+    "core_pred_mass_on_gt_support",
+    "core_gt_mass_in_pred_support",
+    "core_location_eligible",
     "false_high_gt005_pred03_count",
     "false_high_gt005_pred03_excess_volume",
     "false_high_gt005_pred05_count",
     "false_high_gt005_pred05_excess_volume",
     "false_high_gt05_pred03_count",
     "false_high_gt05_pred03_excess_volume",
+    "base_prediction_available",
+    "base_pred_volume",
+    "base_false_high_gt005_pred03_count",
+    "base_false_high_gt005_pred03_excess_volume",
+    "base_false_high_gt05_pred03_count",
+    "base_false_high_gt05_pred03_excess_volume",
+    "base_catastrophic_over",
+    "residual_created_catastrophic_over",
+    "residual_corrected_catastrophic_over",
 )
 FRAME_PROVENANCE_KEYS = ("sample_dir", "dataset", "hand", "worker_rank")
 CATASTROPHIC_OVER_GT_MAX = 10.0
@@ -199,47 +174,6 @@ def _validate_checkpoint_candidate(path: Path, label: str) -> str:
     return str(path)
 
 
-def _raise_if_last_aliases_best(exp_dir: Path, last_ckpt: Path):
-    """Reject ambiguous historical runs where `last.ckpt` is the best file."""
-    if not last_ckpt.is_symlink():
-        return
-
-    last_target = last_ckpt.resolve(strict=False)
-    best_candidates = []
-    for pattern in ("best_rmse.ckpt", "best_viou.ckpt", "best_tactile_model*.ckpt", "*best*.ckpt"):
-        best_candidates.extend(exp_dir.glob(pattern))
-    for best_ckpt in best_candidates:
-        if _checkpoint_exists(best_ckpt) and best_ckpt.resolve(strict=False) == last_target:
-            raise RuntimeError(
-                "--ckpt last is not a final-epoch checkpoint for this experiment: "
-                f"{last_ckpt} is a symlink to best checkpoint {best_ckpt}. "
-                "Refusing to create a misleading 'last' report. Retrain with the current "
-                "train.py final-checkpoint fix, or pass an independently saved final checkpoint "
-                "via --checkpoint."
-            )
-
-
-def _canonical_checkpoint_selector(selector):
-    return "rmse-best" if selector == "best" else selector
-
-
-def _select_unique_legacy_checkpoint(exp_dir: Path, patterns, label):
-    candidates = []
-    seen = set()
-    for pattern in patterns:
-        for candidate in sorted(exp_dir.glob(pattern)):
-            candidate_key = candidate.resolve(strict=False) if candidate.is_symlink() else candidate
-            if candidate.is_file() and candidate_key not in seen:
-                seen.add(candidate_key)
-                candidates.append(candidate)
-    if len(candidates) > 1:
-        raise RuntimeError(
-            f"Ambiguous legacy {label} checkpoints under {exp_dir}: "
-            f"{[path.name for path in candidates]}. Pass --checkpoint explicitly."
-        )
-    return candidates[0] if candidates else None
-
-
 def _resolve_checkpoint_path(args):
     if args.checkpoint:
         ckpt_path = Path(args.checkpoint).expanduser()
@@ -253,7 +187,8 @@ def _resolve_checkpoint_path(args):
     if not args.exp_name:
         raise ValueError(
             "Please provide either --checkpoint /path/to/model.ckpt or "
-            "--exp_name <experiment_name> with --ckpt rmse-best|viou-best|last."
+            "--exp_name <experiment_name> with --ckpt "
+            "loss-best|contact-best|last."
         )
 
     checkpoint_root = Path(args.checkpoint_root).expanduser()
@@ -265,39 +200,15 @@ def _resolve_checkpoint_path(args):
         suffix = f" Available experiments: {', '.join(existing[:20])}" if existing else ""
         raise FileNotFoundError(f"Checkpoint experiment directory not found: {exp_dir}.{suffix}")
 
-    selector = _canonical_checkpoint_selector(args.ckpt)
-    if args.ckpt == "best":
-        print("Checkpoint selector --ckpt best is a compatibility alias for --ckpt rmse-best.")
-
     canonical_names = {
-        "rmse-best": "best_rmse.ckpt",
-        "viou-best": "best_viou.ckpt",
+        "loss-best": "best_loss.ckpt",
+        "contact-best": "best_contact.ckpt",
         "last": "last.ckpt",
     }
-    canonical_path = exp_dir / canonical_names[selector]
+    canonical_path = exp_dir / canonical_names[args.ckpt]
     if _checkpoint_exists(canonical_path):
-        if selector == "last":
-            _raise_if_last_aliases_best(exp_dir, canonical_path)
-        selected = _validate_checkpoint_candidate(canonical_path, selector)
+        selected = _validate_checkpoint_candidate(canonical_path, args.ckpt)
         print(f"Checkpoint selector: --ckpt {args.ckpt}; selected canonical checkpoint: {selected}")
-        return selected
-
-    if selector == "last":
-        legacy = _select_unique_legacy_checkpoint(exp_dir, ("*last*.ckpt",), "last")
-    elif selector == "rmse-best":
-        legacy = _select_unique_legacy_checkpoint(
-            exp_dir,
-            ("best_tactile_model.ckpt", "best_tactile_model*.ckpt"),
-            "RMSE-best",
-        )
-    else:
-        legacy = None
-
-    if legacy is not None:
-        if selector == "last":
-            _raise_if_last_aliases_best(exp_dir, legacy)
-        selected = _validate_checkpoint_candidate(legacy, f"Legacy {selector}")
-        print(f"Checkpoint selector: --ckpt {args.ckpt}; selected legacy checkpoint: {selected}")
         return selected
 
     available = sorted(path.name for path in exp_dir.glob("*.ckpt"))
@@ -322,20 +233,30 @@ def _load_model_cfg():
 def _load_model(args, model_cfg, device):
     print(f"🚀 初始化模型 (使用设备: {device})...")
     experiment_model_config = dict(getattr(args, "model_metadata", {}) or {})
-    tactile_head_type = experiment_model_config.get("tactile_head_type", "dense_v2")
-    backbone_feature_layers = experiment_model_config.get("backbone_feature_layers", [16, 24, 32])
-    visual_backbone = experiment_model_config.get("visual_backbone", "hamer")
-    dino_weights = getattr(args, "resolved_backbone_weights", "") if visual_backbone == "dinov3_hplus" else ""
+    tactile_head_type = experiment_model_config.get("tactile_head_type", "dense_v2_dino_rezero")
+    backbone_feature_layers = experiment_model_config.get("backbone_feature_layers", [8, 16, 24, 32])
+    dino_residual_max_scale = float(experiment_model_config.get("dino_residual_max_scale", 0.10))
+    dino_residual_rms_budget = float(experiment_model_config.get("dino_residual_rms_budget", 0.50))
+    pool_layout = str(experiment_model_config.get("pool_layout", "fullgrid32"))
+    decoder_dropout_scale = float(experiment_model_config.get("decoder_dropout_scale", 1.0))
+    visual_backbone = experiment_model_config.get("visual_backbone", "dinov3_hplus")
+    dino_weights = getattr(args, "resolved_backbone_weights", "")
     print(
         f"Tactile config: head={tactile_head_type}, visual_backbone={visual_backbone}, "
-        f"backbone_feature_layers={backbone_feature_layers}"
+        f"backbone_feature_layers={backbone_feature_layers}, "
+        "dino_rezero_source=multilevel"
     )
-    model = OpenTouchHAMER_TactileWrapper(
+    model = TactileTrainingModule(
         cfg=model_cfg,
         tactile_head_type=tactile_head_type,
         backbone_feature_layers=backbone_feature_layers,
         visual_backbone=visual_backbone,
         dino_weights=dino_weights,
+        dino_rezero_source="multilevel",
+        dino_residual_max_scale=dino_residual_max_scale,
+        dino_residual_rms_budget=dino_residual_rms_budget,
+        pool_layout=pool_layout,
+        decoder_dropout_scale=decoder_dropout_scale,
     )
     model.visual_backbone_model_name = experiment_model_config.get("visual_backbone_model_name", "")
     model.backbone_weights_path = getattr(args, "resolved_backbone_weights", "")
@@ -347,7 +268,7 @@ def _load_model(args, model_cfg, device):
         print(f"Tactile head initialized with output dim: {model.tactile_dim}")
 
     print(f"📦 Loading checkpoint from: {args.checkpoint}")
-    load_compatible_state_dict(model, args.checkpoint, load_backbone=visual_backbone == "hamer")
+    load_compatible_state_dict(model, args.checkpoint, load_backbone=False)
     model = model.to(device)
     model.eval()
     return model
@@ -371,20 +292,31 @@ def _resolve_experiment_model_metadata(args):
                 "backbone_sha256",
                 "tactile_head_type",
                 "backbone_feature_layers",
+                "dino_rezero_source",
+                "dino_residual_max_scale",
+                "dino_residual_rms_budget",
+                "pool_layout",
+                "decoder_dropout_scale",
+                "index_schema_version",
+                "index_cache_key",
+                "indexed_sample_count",
+                "index_manifest_sha256",
+                "bbox_manifest_sha256",
+                "dataset_filter",
+                "bbox_rescale_factor",
+                "bbox_source_policy",
+                "train_augmentation",
             ):
                 if checkpoint.get(key) not in (None, "", []):
                     metadata[key] = checkpoint[key]
 
-    visual_backbone = str(metadata.get("visual_backbone", "hamer"))
-    if visual_backbone == "dinov3_hplus":
-        weights_value = args.dino_weights or metadata.get("backbone_weights")
-        if not weights_value:
-            raise ValueError(
-                "DINOv3 evaluation requires --dino_weights or backbone_weights in the compact checkpoint"
-            )
-    else:
-        weights_value = metadata.get("backbone_weights") or os.path.join(
-            base_dir, "hamer/_DATA/hamer_ckpts/checkpoints/hamer.ckpt"
+    visual_backbone = str(metadata.get("visual_backbone", "dinov3_hplus"))
+    if visual_backbone != "dinov3_hplus":
+        raise ValueError("Only visual_backbone=dinov3_hplus is supported")
+    weights_value = args.dino_weights or metadata.get("backbone_weights")
+    if not weights_value:
+        raise ValueError(
+            "DINOv3 evaluation requires --dino_weights or backbone_weights in the compact checkpoint"
         )
 
     weights_path = Path(weights_value).expanduser()
@@ -401,6 +333,44 @@ def _resolve_experiment_model_metadata(args):
 
     metadata["visual_backbone"] = visual_backbone
     metadata["backbone_weights"] = str(weights_path)
+    bbox_rescale_factor = (
+        args.bbox_rescale_factor
+        if args.bbox_rescale_factor is not None
+        else metadata.get("bbox_rescale_factor", 2.0)
+    )
+    bbox_rescale_factor = float(bbox_rescale_factor)
+    if not 1.0 <= bbox_rescale_factor <= 4.0:
+        raise ValueError("bbox_rescale_factor must lie in [1.0, 4.0]")
+    args.bbox_rescale_factor = bbox_rescale_factor
+    metadata["bbox_rescale_factor"] = bbox_rescale_factor
+    bbox_source_policy = (
+        args.bbox_source_policy
+        if args.bbox_source_policy is not None
+        else metadata.get("bbox_source_policy", "any")
+    )
+    bbox_source_policy = str(bbox_source_policy)
+    if bbox_source_policy not in ("any", "sam3_only"):
+        raise ValueError(f"Unsupported bbox_source_policy: {bbox_source_policy!r}")
+    args.bbox_source_policy = bbox_source_policy
+    metadata["bbox_source_policy"] = bbox_source_policy
+    bbox_manifest_hashes = metadata.get("bbox_manifest_sha256") or {}
+    if args.bbox_manifests is None and isinstance(bbox_manifest_hashes, dict):
+        args.bbox_manifests = ",".join(str(path) for path in bbox_manifest_hashes)
+    if args.bbox_manifests:
+        resolved_manifests = [
+            str(Path(path).expanduser().resolve(strict=False))
+            for path in str(args.bbox_manifests).split(",")
+            if path.strip()
+        ]
+        missing = [path for path in resolved_manifests if not Path(path).is_file()]
+        if missing:
+            raise FileNotFoundError(
+                "Evaluation SAM3 bbox manifest(s) are missing: " + ", ".join(missing)
+            )
+        args.bbox_manifests = ",".join(resolved_manifests)
+        # The current SAM3 manifests define the evaluated sample universe. An old
+        # audit CSV must not silently override it.
+        args.index_manifest = None
     args.model_metadata = metadata
     args.resolved_backbone_weights = str(weights_path)
     args.resolved_backbone_sha256 = actual_hash or expected_hash
@@ -417,6 +387,8 @@ def _empty_stats():
         "temporal_correct": 0,
         "contact_iou_sum": 0.0,
         "vol_iou_sum": 0.0,
+        "vol_intersection_sum": 0.0,
+        "vol_union_sum": 0.0,
         "tactile_dim": 0,
         "pred_volume": 0.0,
         "gt_volume": 0.0,
@@ -431,28 +403,77 @@ def _empty_stats():
         "catastrophic_over_denominator": 0,
         "catastrophic_under_count": 0,
         "catastrophic_under_denominator": 0,
+        "distribution_viou_sum": 0.0,
+        "pred_mass_on_gt_support_sum": 0.0,
+        "gt_mass_in_pred_support_sum": 0.0,
+        "nonempty_location_frame_count": 0,
+        "core_distribution_viou_sum": 0.0,
+        "core_pred_mass_on_gt_support_sum": 0.0,
+        "core_gt_mass_in_pred_support_sum": 0.0,
+        "core_location_frame_count": 0,
     }
 
 
-def _stats_summary(stats):
+def _stats_summary(
+    stats,
+    touchanything_protocol_stats=None,
+    touchanything_min_contact_ratio=TOUCHANYTHING_MIN_CONTACT_RATIO,
+):
     if stats["total_frames"] == 0 or stats["total_values"] == 0:
         return None
     total_values = max(stats["total_values"], 1)
     total_frames = max(stats["total_frames"], 1)
+    touch_summary = summarize_compact_touchanything_protocol(
+        [touchanything_protocol_stats or {}],
+        min_contact_ratio=touchanything_min_contact_ratio,
+    )
     return {
         "mae": stats["abs_sum"] / total_values,
         "rmse": float(np.sqrt(stats["sq_sum"] / total_values)),
         "pcc": stats["pcc_sum"] / max(stats["pcc_count"], 1),
         "contact_iou": stats["contact_iou_sum"] / total_frames,
         "volumetric_iou": stats["vol_iou_sum"] / total_frames,
+        "volumetric_iou_frame_macro": stats["vol_iou_sum"] / total_frames,
+        "volumetric_iou_split_micro": (
+            stats["vol_intersection_sum"] / stats["vol_union_sum"]
+            if stats["vol_union_sum"] > 1e-12
+            else 1.0
+        ),
+        "volumetric_iou_touchanything_trajectory": touch_summary["volumetric_iou"],
+        "touchanything_protocol": {key: value for key, value in touch_summary.items() if key != "rows"},
         "pred_gt_volume_ratio": stats["pred_volume"] / max(stats["gt_volume"], 1e-6),
         "active_recall": stats["active_true_positive"] / max(stats["active_gt_count"], 1),
         "bg_false_positive": stats["background_false_positive"] / max(stats["background_count"], 1),
+        "distribution_viou": (
+            stats["distribution_viou_sum"] / max(stats["nonempty_location_frame_count"], 1)
+        ),
+        "volume_matched_viou": (
+            stats["distribution_viou_sum"] / max(stats["nonempty_location_frame_count"], 1)
+        ),
+        "pred_mass_on_gt_support": (
+            stats["pred_mass_on_gt_support_sum"] / max(stats["nonempty_location_frame_count"], 1)
+        ),
+        "gt_mass_in_pred_support": (
+            stats["gt_mass_in_pred_support_sum"] / max(stats["nonempty_location_frame_count"], 1)
+        ),
+        "nonempty_location_frame_count": stats["nonempty_location_frame_count"],
+        "core_distribution_viou": (
+            stats["core_distribution_viou_sum"] / max(stats["core_location_frame_count"], 1)
+        ),
+        "core_pred_mass_on_gt_support": (
+            stats["core_pred_mass_on_gt_support_sum"]
+            / max(stats["core_location_frame_count"], 1)
+        ),
+        "core_gt_mass_in_pred_support": (
+            stats["core_gt_mass_in_pred_support_sum"]
+            / max(stats["core_location_frame_count"], 1)
+        ),
+        "core_location_frame_count": stats["core_location_frame_count"],
     }
 
 
 def _resolve_invocation_path(path):
-    """Resolve user-supplied paths before eval changes into the HaMeR directory."""
+    """Resolve user-supplied paths before worker processes are spawned."""
     if not path:
         return None
     return str(Path(path).expanduser().resolve(strict=False))
@@ -488,6 +509,7 @@ def _empty_eval_result():
     return {
         "stats": _empty_stats(),
         "diagnostics": _empty_diagnostics(),
+        "touchanything_protocol_stats": {},
     }
 
 
@@ -581,7 +603,14 @@ def _trim_frame_diagnostics(diag, max_frames, seed=2026):
 def _merge_eval_results(items, max_frames):
     stats = _merge_stats([item["stats"] for item in items])
     diagnostics = _merge_diagnostics([item["diagnostics"] for item in items], max_frames)
-    return {"stats": stats, "diagnostics": diagnostics}
+    touchanything_protocol_stats = merge_compact_touchanything_protocol_stats(
+        [item.get("touchanything_protocol_stats", {}) for item in items]
+    )
+    return {
+        "stats": stats,
+        "diagnostics": diagnostics,
+        "touchanything_protocol_stats": touchanything_protocol_stats,
+    }
 
 
 def _update_stats(stats, pred_tactile, gt_tactile, palm_mask, contact_thr, active_thr=0.05, background_thr=0.02):
@@ -648,15 +677,51 @@ def _update_stats(stats, pred_tactile, gt_tactile, palm_mask, contact_thr, activ
     contact_iou_per_frame[non_zero_mask] = intersection[non_zero_mask] / union[non_zero_mask]
     stats["contact_iou_sum"] += float(contact_iou_per_frame.sum())
 
-    vol_intersection = np.sum(np.minimum(pred, gt), axis=1)
-    vol_union = np.sum(np.maximum(pred, gt), axis=1)
-    vol_iou_per_frame = np.ones(len(vol_union), dtype=np.float32)
-    vol_non_zero_mask = vol_union != 0
-    vol_iou_per_frame[vol_non_zero_mask] = vol_intersection[vol_non_zero_mask] / vol_union[vol_non_zero_mask]
-    stats["vol_iou_sum"] += float(vol_iou_per_frame.sum())
+    vol_iou = volumetric_iou_stats(pred, gt, value_axis=1)
+    stats["vol_iou_sum"] += float(vol_iou.per_frame.sum())
+    stats["vol_intersection_sum"] += vol_iou.intersection_sum
+    stats["vol_union_sum"] += vol_iou.union_sum
+    location = location_distribution_stats(
+        pred,
+        gt,
+        value_axis=1,
+        support_threshold=active_thr,
+        min_gt_volume=1.0,
+    )
+    eligible = location.eligible
+    stats["nonempty_location_frame_count"] += int(eligible.sum())
+    if np.any(eligible):
+        stats["distribution_viou_sum"] += float(np.nansum(location.distribution_viou))
+        stats["pred_mass_on_gt_support_sum"] += float(
+            np.nansum(location.pred_mass_on_gt_support)
+        )
+        stats["gt_mass_in_pred_support_sum"] += float(
+            np.nansum(location.gt_mass_in_pred_support)
+        )
+    core_location = location_distribution_stats(
+        pred,
+        gt,
+        value_axis=1,
+        support_threshold=CORE_LOCATION_MIN_GT_PEAK,
+        min_gt_volume=1.0,
+        distribution_power=CORE_LOCATION_DISTRIBUTION_POWER,
+        min_gt_peak=CORE_LOCATION_MIN_GT_PEAK,
+    )
+    core_eligible = core_location.eligible
+    stats["core_location_frame_count"] += int(core_eligible.sum())
+    if np.any(core_eligible):
+        stats["core_distribution_viou_sum"] += float(
+            np.nansum(core_location.distribution_viou)
+        )
+        stats["core_pred_mass_on_gt_support_sum"] += float(
+            np.nansum(core_location.pred_mass_on_gt_support)
+        )
+        stats["core_gt_mass_in_pred_support_sum"] += float(
+            np.nansum(core_location.gt_mass_in_pred_support)
+        )
 
 
-def _frame_metrics(pred, gt, contact_thr, active_thr=0.05):
+def _frame_metrics(pred, gt, contact_thr, active_thr=0.05, base_pred=None):
     pred_bin = pred > contact_thr
     gt_bin = gt > contact_thr
     intersection = float(np.sum(pred_bin & gt_bin))
@@ -679,6 +744,35 @@ def _frame_metrics(pred, gt, contact_thr, active_thr=0.05):
         "pred_active_vertices": float(np.sum(pred > active_thr)),
         "frame_mae": float(np.mean(np.abs(pred - gt))) if pred.size else 0.0,
     }
+    location = location_distribution_stats(
+        pred[None, :],
+        gt[None, :],
+        value_axis=1,
+        support_threshold=active_thr,
+        min_gt_volume=1.0,
+    )
+    metrics.update({
+        "distribution_viou": float(location.distribution_viou[0]),
+        "volume_matched_viou": float(location.distribution_viou[0]),
+        "pred_mass_on_gt_support": float(location.pred_mass_on_gt_support[0]),
+        "gt_mass_in_pred_support": float(location.gt_mass_in_pred_support[0]),
+        "location_eligible": float(location.eligible[0]),
+    })
+    core_location = location_distribution_stats(
+        pred[None, :],
+        gt[None, :],
+        value_axis=1,
+        support_threshold=CORE_LOCATION_MIN_GT_PEAK,
+        min_gt_volume=1.0,
+        distribution_power=CORE_LOCATION_DISTRIBUTION_POWER,
+        min_gt_peak=CORE_LOCATION_MIN_GT_PEAK,
+    )
+    metrics.update({
+        "core_distribution_viou": float(core_location.distribution_viou[0]),
+        "core_pred_mass_on_gt_support": float(core_location.pred_mass_on_gt_support[0]),
+        "core_gt_mass_in_pred_support": float(core_location.gt_mass_in_pred_support[0]),
+        "core_location_eligible": float(core_location.eligible[0]),
+    })
     for label, gt_max, pred_min in (
         ("gt005_pred03", 0.005, 0.3),
         ("gt005_pred05", 0.005, 0.5),
@@ -687,6 +781,41 @@ def _frame_metrics(pred, gt, contact_thr, active_thr=0.05):
         mask = (gt < gt_max) & (pred >= pred_min)
         metrics[f"false_high_{label}_count"] = float(np.sum(mask))
         metrics[f"false_high_{label}_excess_volume"] = float(np.maximum(pred - gt, 0.0)[mask].sum())
+    metrics.update(
+        {
+            "base_prediction_available": 0.0,
+            "base_pred_volume": -1.0,
+            "base_false_high_gt005_pred03_count": 0.0,
+            "base_false_high_gt005_pred03_excess_volume": 0.0,
+            "base_false_high_gt05_pred03_count": 0.0,
+            "base_false_high_gt05_pred03_excess_volume": 0.0,
+            "base_catastrophic_over": 0.0,
+            "residual_created_catastrophic_over": 0.0,
+            "residual_corrected_catastrophic_over": 0.0,
+        }
+    )
+    if base_pred is not None:
+        base_volume = float(base_pred.sum())
+        fused_catastrophic = gt_volume < CATASTROPHIC_OVER_GT_MAX and pred_volume > CATASTROPHIC_OVER_PRED_MIN
+        base_catastrophic = gt_volume < CATASTROPHIC_OVER_GT_MAX and base_volume > CATASTROPHIC_OVER_PRED_MIN
+        metrics["base_prediction_available"] = 1.0
+        metrics["base_pred_volume"] = base_volume
+        for label, gt_max, pred_min in (
+            ("gt005_pred03", 0.005, 0.3),
+            ("gt05_pred03", 0.05, 0.3),
+        ):
+            mask = (gt < gt_max) & (base_pred >= pred_min)
+            metrics[f"base_false_high_{label}_count"] = float(np.sum(mask))
+            metrics[f"base_false_high_{label}_excess_volume"] = float(
+                np.maximum(base_pred - gt, 0.0)[mask].sum()
+            )
+        metrics["base_catastrophic_over"] = float(base_catastrophic)
+        metrics["residual_created_catastrophic_over"] = float(
+            fused_catastrophic and not base_catastrophic
+        )
+        metrics["residual_corrected_catastrophic_over"] = float(
+            base_catastrophic and not fused_catastrophic
+        )
     return metrics
 
 
@@ -700,12 +829,16 @@ def _update_diagnostics(
     max_frames,
     frame_records,
     worker_rank,
+    base_pred_tactile=None,
 ):
     if pred_tactile.shape[0] == 0:
         return
 
     pred = pred_tactile[:, palm_mask] if palm_mask is not None else pred_tactile
     gt = gt_tactile[:, palm_mask] if palm_mask is not None else gt_tactile
+    base_pred = None
+    if base_pred_tactile is not None:
+        base_pred = base_pred_tactile[:, palm_mask] if palm_mask is not None else base_pred_tactile
     flat_pred = np.clip(pred.reshape(-1).astype(np.float32), 0.0, 1.0)
     flat_gt = np.clip(gt.reshape(-1).astype(np.float32), 0.0, 1.0)
     flat_err = flat_pred - flat_gt
@@ -749,7 +882,13 @@ def _update_diagnostics(
                 bin_idx[tail], weights=gt_values[tail], minlength=n_bins
             )
 
-    frame_metrics = [_frame_metrics(p, g, contact_thr, active_thr=active_thr) for p, g in zip(pred, gt)]
+    if base_pred is None:
+        frame_metrics = [_frame_metrics(p, g, contact_thr, active_thr=active_thr) for p, g in zip(pred, gt)]
+    else:
+        frame_metrics = [
+            _frame_metrics(p, g, contact_thr, active_thr=active_thr, base_pred=b)
+            for p, g, b in zip(pred, gt, base_pred)
+        ]
     for key in FRAME_DIAG_KEYS:
         diagnostics["frame"][key].append(np.asarray([item[key] for item in frame_metrics], dtype=np.float32))
     if len(frame_records) != len(frame_metrics):
@@ -806,6 +945,65 @@ def _write_diagnostic_outputs(args, result):
     out_dir = _diagnostic_dir(args)
     os.makedirs(out_dir, exist_ok=True)
     diag = result["diagnostics"]
+    touch_summary = summarize_compact_touchanything_protocol(
+        [result.get("touchanything_protocol_stats", {})],
+        min_contact_ratio=args.touchanything_min_contact_ratio,
+    )
+    touch_rows = touch_summary["rows"]
+    _write_csv(
+        os.path.join(out_dir, "touchanything_protocol_sequence_metrics.csv"),
+        [
+            "sequence_key",
+            "scene_category",
+            "frame_count",
+            "mae",
+            "volumetric_iou",
+            "contact_iou",
+            "temporal_accuracy",
+            "temporal_precision",
+            "temporal_recall",
+            "temporal_f1",
+        ],
+        [
+            [
+                row["sequence_key"],
+                row["scene_category"],
+                row["frame_count"],
+                row["mae"],
+                row["volumetric_iou"],
+                row["contact_iou"],
+                row["temporal_accuracy"],
+                row["temporal_precision"],
+                row["temporal_recall"],
+                row["temporal_f1"],
+            ]
+            for row in touch_rows
+        ],
+    )
+    _write_csv(
+        os.path.join(out_dir, "touchanything_protocol_scene_metrics.csv"),
+        [
+            "scene_category",
+            "sequence_count",
+            "frame_count",
+            "T.Acc",
+            "C.IoU",
+            "V.IoU",
+            "MAE",
+        ],
+        [
+            [
+                scene,
+                touch_summary["by_scene"][scene]["sequence_count"],
+                touch_summary["by_scene"][scene]["frame_count"],
+                touch_summary["by_scene"][scene]["temporal_accuracy"],
+                touch_summary["by_scene"][scene]["contact_iou"],
+                touch_summary["by_scene"][scene]["volumetric_iou"],
+                touch_summary["by_scene"][scene]["mae"],
+            ]
+            for scene in TOUCHANYTHING_SCENE_CATEGORIES
+        ],
+    )
 
     pressure_rows = []
     denom = np.maximum(diag["pressure_count"], 1.0)
@@ -1060,6 +1258,12 @@ def _write_frame_binned_outputs(out_dir, frame, provenance, args):
     contact_means = []
     frame_mae_means = []
     active_ratio_medians = []
+    distribution_viou_means = []
+    pred_mass_support_means = []
+    gt_mass_support_means = []
+    core_distribution_viou_means = []
+    core_pred_mass_support_means = []
+    core_gt_mass_support_means = []
     empty_bins = []
 
     def add_frame_bin(low, high, mask):
@@ -1073,6 +1277,34 @@ def _write_frame_binned_outputs(out_dir, frame, provenance, args):
         frame_mae_means.append(float(np.mean(frame["frame_mae"][mask])))
         active_ratio = frame["pred_active_vertices"][mask] / np.maximum(frame["gt_active_vertices"][mask], 1.0)
         active_ratio_medians.append(float(np.median(active_ratio)))
+        location_mask = mask & (frame["location_eligible"] > 0.5)
+        location_count = int(np.sum(location_mask))
+        distribution_viou_means.append(
+            float(np.nanmean(frame["distribution_viou"][location_mask]))
+            if location_count else float("nan")
+        )
+        pred_mass_support_means.append(
+            float(np.nanmean(frame["pred_mass_on_gt_support"][location_mask]))
+            if location_count else float("nan")
+        )
+        gt_mass_support_means.append(
+            float(np.nanmean(frame["gt_mass_in_pred_support"][location_mask]))
+            if location_count else float("nan")
+        )
+        core_location_mask = mask & (frame["core_location_eligible"] > 0.5)
+        core_location_count = int(np.sum(core_location_mask))
+        core_distribution_viou_means.append(
+            float(np.nanmean(frame["core_distribution_viou"][core_location_mask]))
+            if core_location_count else float("nan")
+        )
+        core_pred_mass_support_means.append(
+            float(np.nanmean(frame["core_pred_mass_on_gt_support"][core_location_mask]))
+            if core_location_count else float("nan")
+        )
+        core_gt_mass_support_means.append(
+            float(np.nanmean(frame["core_gt_mass_in_pred_support"][core_location_mask]))
+            if core_location_count else float("nan")
+        )
         rows.append([
             float(low),
             float(high),
@@ -1084,6 +1316,14 @@ def _write_frame_binned_outputs(out_dir, frame, provenance, args):
             contact_means[-1],
             frame_mae_means[-1],
             active_ratio_medians[-1],
+            location_count,
+            distribution_viou_means[-1],
+            pred_mass_support_means[-1],
+            gt_mass_support_means[-1],
+            core_location_count,
+            core_distribution_viou_means[-1],
+            core_pred_mass_support_means[-1],
+            core_gt_mass_support_means[-1],
         ])
 
     zero_mask = gt_volume <= 1e-8
@@ -1115,8 +1355,64 @@ def _write_frame_binned_outputs(out_dir, frame, provenance, args):
             "mean_contact_iou",
             "mean_frame_mae",
             "median_pred_gt_active_vertex_ratio",
+            "location_frame_count",
+            "mean_distribution_viou",
+            "mean_pred_mass_on_gt_support",
+            "mean_gt_mass_in_pred_support",
+            "core_location_frame_count",
+            "mean_core_distribution_viou",
+            "mean_core_pred_mass_on_gt_support",
+            "mean_core_gt_mass_in_pred_support",
         ],
         rows,
+    )
+
+    dataset_values = np.asarray(provenance.get("dataset", [""] * len(gt_volume)), dtype=object)
+    domain_rows = []
+    domain_masks = [("overall", np.ones(len(gt_volume), dtype=bool))]
+    domain_masks.extend(
+        (str(dataset), dataset_values == dataset)
+        for dataset in sorted(set(dataset_values.tolist()))
+        if str(dataset)
+    )
+    for dataset, domain_mask in domain_masks:
+        eligible = domain_mask & (frame["location_eligible"] > 0.5)
+        eligible_count = int(np.sum(eligible))
+        core_eligible = domain_mask & (frame["core_location_eligible"] > 0.5)
+        core_eligible_count = int(np.sum(core_eligible))
+        domain_rows.append([
+            dataset,
+            int(np.sum(domain_mask)),
+            eligible_count,
+            float(np.nanmean(frame["distribution_viou"][eligible]))
+            if eligible_count else float("nan"),
+            float(np.nanmean(frame["pred_mass_on_gt_support"][eligible]))
+            if eligible_count else float("nan"),
+            float(np.nanmean(frame["gt_mass_in_pred_support"][eligible]))
+            if eligible_count else float("nan"),
+            core_eligible_count,
+            float(np.nanmean(frame["core_distribution_viou"][core_eligible]))
+            if core_eligible_count else float("nan"),
+            float(np.nanmean(frame["core_pred_mass_on_gt_support"][core_eligible]))
+            if core_eligible_count else float("nan"),
+            float(np.nanmean(frame["core_gt_mass_in_pred_support"][core_eligible]))
+            if core_eligible_count else float("nan"),
+        ])
+    _write_csv(
+        os.path.join(out_dir, "location_metrics_by_dataset.csv"),
+        [
+            "dataset",
+            "frame_count",
+            "location_frame_count",
+            "mean_distribution_viou",
+            "mean_pred_mass_on_gt_support",
+            "mean_gt_mass_in_pred_support",
+            "core_location_frame_count",
+            "mean_core_distribution_viou",
+            "mean_core_pred_mass_on_gt_support",
+            "mean_core_gt_mass_in_pred_support",
+        ],
+        domain_rows,
     )
 
     catastrophic_over_base = gt_volume < CATASTROPHIC_OVER_GT_MAX
@@ -1231,7 +1527,6 @@ def _evaluate_sample_records(args, data_dirs, sample_records, worker_rank=0, sho
     if len(sample_records) == 0:
         return _empty_eval_result()
 
-    os.chdir(os.path.join(base_dir, 'hamer'))
     device = torch.device(f'cuda:{worker_rank}' if torch.cuda.is_available() else 'cpu')
     if torch.cuda.is_available():
         torch.cuda.set_device(worker_rank)
@@ -1245,6 +1540,8 @@ def _evaluate_sample_records(args, data_dirs, sample_records, worker_rank=0, sho
         train=False,
         sample_records=sample_records,
         tactile_only=True,
+        bbox_rescale_factor=args.bbox_rescale_factor,
+        bbox_source_policy=args.bbox_source_policy,
     )
     dataloader = torch.utils.data.DataLoader(
         dataset,
@@ -1256,6 +1553,7 @@ def _evaluate_sample_records(args, data_dirs, sample_records, worker_rank=0, sho
 
     stats = _empty_stats()
     diagnostics = _empty_diagnostics()
+    touchanything_protocol_stats = CompactTouchAnythingProtocolAccumulator()
     palm_mask = None
     sample_cursor = 0
     iterator = tqdm(dataloader, desc=f"GPU {worker_rank} Evaluating", position=worker_rank) if show_progress else dataloader
@@ -1276,6 +1574,9 @@ def _evaluate_sample_records(args, data_dirs, sample_records, worker_rank=0, sho
             out = model.forward_step(batch, train=False)
 
         pred_tactile = out['pred_tactile'].detach().cpu().numpy()[valid_tactile_mask]
+        base_pred_tactile = None
+        if "pred_tactile_base" in out:
+            base_pred_tactile = out["pred_tactile_base"].detach().cpu().numpy()[valid_tactile_mask]
         gt_tactile = batch['tactile_signal'].detach().cpu().numpy()[valid_tactile_mask]
         valid_records = [
             record for record, is_valid in zip(batch_records, valid_tactile_mask) if is_valid
@@ -1289,6 +1590,33 @@ def _evaluate_sample_records(args, data_dirs, sample_records, worker_rank=0, sho
             active_thr=args.active_pressure_thr,
             background_thr=args.background_pressure_thr,
         )
+        pred_palm = pred_tactile[:, palm_mask] if palm_mask is not None else pred_tactile
+        gt_palm = gt_tactile[:, palm_mask] if palm_mask is not None else gt_tactile
+        touch_indices = [
+            index
+            for index, record in enumerate(valid_records)
+            if str(record.get("dataset", "")).casefold() in ("touchanything", "egotouch", "ta")
+        ]
+        if touch_indices:
+            touch_frame_stats = touchanything_protocol_frame_stats(
+                pred_palm[touch_indices],
+                gt_palm[touch_indices],
+                value_axis=1,
+                contact_threshold=args.touchanything_contact_thr,
+            )
+            touchanything_protocol_stats.add(
+                [
+                    touchanything_protocol_group_key(
+                        valid_records[index].get("sequence_key", ""),
+                        valid_records[index].get(
+                            "query_alias", valid_records[index].get("hand", "")
+                        ),
+                    )
+                    for index in touch_indices
+                ],
+                [valid_records[index].get("frame_idx", 0) for index in touch_indices],
+                touch_frame_stats,
+            )
         if args.save_diagnostics or args.save_visualizations:
             _update_diagnostics(
                 diagnostics,
@@ -1300,6 +1628,7 @@ def _evaluate_sample_records(args, data_dirs, sample_records, worker_rank=0, sho
                 args.diagnostic_max_frames,
                 valid_records,
                 worker_rank,
+                base_pred_tactile=base_pred_tactile,
             )
     if args.save_diagnostics or args.save_visualizations:
         for key in FRAME_DIAG_KEYS:
@@ -1315,7 +1644,11 @@ def _evaluate_sample_records(args, data_dirs, sample_records, worker_rank=0, sho
             )
         _trim_frame_diagnostics(diagnostics, args.diagnostic_max_frames, seed=2026 + int(worker_rank))
 
-    return {"stats": stats, "diagnostics": diagnostics}
+    return {
+        "stats": stats,
+        "diagnostics": diagnostics,
+        "touchanything_protocol_stats": touchanything_protocol_stats.pack(),
+    }
 
 
 def _eval_worker(rank, args, data_dirs, sample_records, queue):
@@ -1339,18 +1672,24 @@ def _loss_config_summary(args):
     if not checkpoint_root.is_absolute():
         checkpoint_root = Path(base_dir) / checkpoint_root
     loss_path = checkpoint_root / args.exp_name / "loss_config.json"
-    if not loss_path.is_file():
-        return f"missing ({loss_path})"
-    try:
-        with loss_path.open("r", encoding="utf-8") as f:
-            loss_config = json.load(f)
-    except Exception as exc:
-        return f"unreadable ({loss_path}: {exc})"
+    if loss_path.is_file():
+        try:
+            with loss_path.open("r", encoding="utf-8") as f:
+                loss_config = json.load(f)
+        except Exception as exc:
+            return f"unreadable ({loss_path}: {exc})"
+        source = str(loss_path)
+    else:
+        checkpoint = _load_checkpoint(args.checkpoint)
+        loss_config = checkpoint.get("loss_config") if isinstance(checkpoint, dict) else None
+        if not isinstance(loss_config, dict):
+            return f"missing ({loss_path}; no compact loss_config)"
+        source = f"compact:{args.checkpoint}"
     compact = json.dumps(loss_config, sort_keys=True, ensure_ascii=False)
-    return f"{loss_path} | {compact}"
+    return f"{source} | {compact}"
 
 
-def _format_report(args, stats):
+def _format_report(args, stats, touchanything_protocol_stats):
     if stats["total_frames"] == 0 or stats["total_values"] == 0:
         return None
 
@@ -1359,7 +1698,16 @@ def _format_report(args, stats):
     avg_pcc = stats["pcc_sum"] / stats["pcc_count"] if stats["pcc_count"] > 0 else 0.0
     temporal_acc = stats["temporal_correct"] / stats["total_frames"]
     contact_iou = stats["contact_iou_sum"] / stats["total_frames"]
-    volumetric_iou = stats["vol_iou_sum"] / stats["total_frames"]
+    volumetric_iou_frame_macro = stats["vol_iou_sum"] / stats["total_frames"]
+    volumetric_iou_split_micro = (
+        stats["vol_intersection_sum"] / stats["vol_union_sum"]
+        if stats["vol_union_sum"] > 1e-12
+        else 1.0
+    )
+    touch_summary = summarize_compact_touchanything_protocol(
+        [touchanything_protocol_stats],
+        min_contact_ratio=args.touchanything_min_contact_ratio,
+    )
     volume_ratio = stats["pred_volume"] / max(stats["gt_volume"], 1e-6)
     active_mae = stats["active_abs_sum"] / stats["active_count"] if stats["active_count"] > 0 else 0.0
     background_mae = stats["background_abs_sum"] / stats["background_count"] if stats["background_count"] > 0 else 0.0
@@ -1367,12 +1715,25 @@ def _format_report(args, stats):
     false_positive_rate = (
         stats["background_false_positive"] / stats["background_count"] if stats["background_count"] > 0 else 0.0
     )
+    location_count = max(int(stats["nonempty_location_frame_count"]), 1)
+    distribution_viou = stats["distribution_viou_sum"] / location_count
+    pred_mass_on_gt_support = stats["pred_mass_on_gt_support_sum"] / location_count
+    gt_mass_in_pred_support = stats["gt_mass_in_pred_support_sum"] / location_count
+    core_location_count = max(int(stats["core_location_frame_count"]), 1)
+    core_distribution_viou = stats["core_distribution_viou_sum"] / core_location_count
+    core_pred_mass_on_gt_support = (
+        stats["core_pred_mass_on_gt_support_sum"] / core_location_count
+    )
+    core_gt_mass_in_pred_support = (
+        stats["core_gt_mass_in_pred_support_sum"] / core_location_count
+    )
     checkpoint_path = Path(args.checkpoint)
     if checkpoint_path.is_symlink():
         checkpoint_target = os.readlink(checkpoint_path)
     else:
         checkpoint_target = ""
 
+    model_metadata = getattr(args, "model_metadata", {}) or {}
     report_lines = [
         f"🎉 Tactile Fast Evaluation 最终评估结果 🎉",
         "="*55,
@@ -1382,8 +1743,10 @@ def _format_report(args, stats):
         f" Checkpoint    : {args.ckpt}",
         f" Resolved Ckpt : {args.checkpoint}",
         f" Symlink Target: {checkpoint_target or 'N/A'}",
-        f" Head Type     : {(getattr(args, 'model_metadata', {}) or {}).get('tactile_head_type', 'dense_v2')}",
-        " Pool Layout   : legacy5 / 5x5 (21 retained cells)",
+        f" Head Type     : {model_metadata.get('tactile_head_type', 'dense_v2_dino_rezero')}",
+        f" BBox Rescale  : {args.bbox_rescale_factor:g}",
+        f" BBox Source   : {args.bbox_source_policy}",
+        f" Pool Layout   : {model_metadata.get('pool_layout', 'fullgrid32')}",
         f" Loss Config   : {_loss_config_summary(args)}",
         f" 总有效评估帧数: {stats['total_frames']}",
         f" 触觉输出维度  : {stats['tactile_dim']} (subdiv MANO vertices)",
@@ -1391,8 +1754,40 @@ def _format_report(args, stats):
         f" 整体 RMSE     : {rmse:.4f} (归一化区间 [0,1])",
         f" 整体 PCC      : {avg_pcc:.4f} (皮尔逊相关系数)",
         f" Temporal Acc  : {temporal_acc:.4f} (Contact Thr = {args.contact_thr})",
-        f" Contact IoU   : {contact_iou:.4f} (Contact Thr = {args.contact_thr})",
-        f" Volumetric IoU: {volumetric_iou:.4f} (无需 Thr)",
+        f" Contact IoU Frame-Macro: {contact_iou:.4f} (Contact Thr = {args.contact_thr})",
+        f" V-IoU Frame-Macro : {volumetric_iou_frame_macro:.4f} (逐帧计算后等权平均)",
+        (
+            f" V-IoU TA-Trajectory: {touch_summary['volumetric_iou']:.4f} "
+            f"(source-trajectory micro, trajectory macro; n={touch_summary['sequence_count']})"
+        ),
+        f" V-IoU Split-Micro  : {volumetric_iou_split_micro:.4f} (整个 split pressure mass 聚合)",
+        f" Distribution V-IoU : {distribution_viou:.4f} (GT volume >= 1, scale invariant)",
+        f" Volume-Matched V-IoU: {distribution_viou:.4f} (same normalized distribution metric)",
+        f" Pred Mass on GT Support: {pred_mass_on_gt_support:.4f} (GT >= {args.active_pressure_thr:g})",
+        f" GT Mass in Pred Support: {gt_mass_in_pred_support:.4f} (Pred >= {args.active_pressure_thr:g})",
+        f" Location Frames: {stats['nonempty_location_frame_count']} (GT volume >= 1)",
+        (
+            f" Core Distribution V-IoU: {core_distribution_viou:.4f} "
+            f"(power={CORE_LOCATION_DISTRIBUTION_POWER:g}, GT max >= "
+            f"{CORE_LOCATION_MIN_GT_PEAK:g})"
+        ),
+        (
+            f" Core Pred Mass on GT Support: {core_pred_mass_on_gt_support:.4f} "
+            f"(GT >= {CORE_LOCATION_MIN_GT_PEAK:g})"
+        ),
+        (
+            f" Core GT Mass in Pred Support: {core_gt_mass_in_pred_support:.4f} "
+            f"(Pred >= {CORE_LOCATION_MIN_GT_PEAK:g})"
+        ),
+        f" Core Location Frames: {stats['core_location_frame_count']}",
+        (
+            f" TA Temporal Acc    : {touch_summary['temporal_accuracy']:.4f} "
+            f"(Thr={args.touchanything_contact_thr:g}, min ratio={args.touchanything_min_contact_ratio:g})"
+        ),
+        f" TA Contact IoU     : {touch_summary['contact_iou']:.4f} (source-trajectory macro)",
+        f" TA MAE             : {touch_summary['mae']:.4f} (source-trajectory macro)",
+        f" TA Temporal F1     : {touch_summary['temporal_f1']:.4f} (source-trajectory macro)",
+        " TA Protocol Note   : canonical palm query; no sensor-grid bend-mask equivalent",
         f" Pred/GT Volume: {volume_ratio:.4f}",
         f" Active MAE    : {active_mae:.4f} (GT > {args.active_pressure_thr})",
         f" Background MAE: {background_mae:.4f} (GT <= {args.background_pressure_thr})",
@@ -1414,11 +1809,22 @@ def _format_report(args, stats):
         ),
         "="*55
     ]
+    if touch_summary["sequence_count"] > 0:
+        scene_lines = [" TouchAnything Scene Metrics (sequence-macro):"]
+        for scene in TOUCHANYTHING_SCENE_CATEGORIES:
+            values = touch_summary["by_scene"][scene]
+            scene_lines.append(
+                f"  {scene:<9} T.Acc={values['temporal_accuracy']:.4f} "
+                f"C.IoU={values['contact_iou']:.4f} "
+                f"V.IoU={values['volumetric_iou']:.4f} MAE={values['mae']:.4f} "
+                f"(n={values['sequence_count']})"
+            )
+        report_lines[-1:-1] = scene_lines
     return "\n".join(report_lines)
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Hamer Tactile Fast Evaluation using Extracted Dataset')
+    parser = argparse.ArgumentParser(description='Fast evaluation for the DINO tactile regressor')
     parser.add_argument('--checkpoint', type=str, default=None, help='Explicit trained tactile checkpoint path. Overrides --exp_name/--ckpt.')
     parser.add_argument(
         '--dino_weights',
@@ -1429,15 +1835,19 @@ def main():
     parser.add_argument(
         '--exp_name',
         type=str,
-        default='mixed_dense_v2_repro',
+        default='mixed_dense_v2_dinov3_rezero_fullgrid32',
         help='Experiment name under --checkpoint_root.',
     )
     parser.add_argument(
         '--ckpt',
         type=str,
-        default='rmse-best',
-        choices=['rmse-best', 'viou-best', 'last', 'best'],
-        help='Checkpoint selector used with --exp_name. "best" is a compatibility alias for "rmse-best".',
+        default='loss-best',
+        choices=[
+            'loss-best',
+            'contact-best',
+            'last',
+        ],
+        help='Checkpoint selector used with --exp_name.',
     )
     parser.add_argument(
         '--checkpoint_root',
@@ -1465,14 +1875,61 @@ def main():
     )
     parser.add_argument('--gpu', '--gpus', dest='gpu', type=str, default='4')
     parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument(
+        '--bbox_rescale_factor',
+        type=float,
+        default=None,
+        help='Optional eval crop override; compact checkpoint metadata is used by default.',
+    )
+    parser.add_argument(
+        '--bbox_source_policy',
+        choices=('any', 'sam3_only'),
+        default=None,
+        help='Optional bbox provenance override; compact checkpoint metadata is used by default.',
+    )
+    parser.add_argument(
+        '--bbox_manifests',
+        type=str,
+        default=None,
+        help='Optional comma-separated reviewed SAM3 bbox manifests; checkpoint metadata is used by default.',
+    )
     parser.add_argument('--num_workers', type=int, default=8)
     parser.add_argument('--contact_thr', type=float, default=0.05, help='Threshold for defining contact (0-1)')
     parser.add_argument('--active_pressure_thr', type=float, default=0.05)
     parser.add_argument('--background_pressure_thr', type=float, default=0.02)
-    parser.add_argument('--render_platform', type=str, default='egl', choices=['egl', 'osmesa'], help='Rendering platform (egl or osmesa)')
+    parser.add_argument(
+        '--touchanything_contact_thr',
+        type=float,
+        default=TOUCHANYTHING_CONTACT_THRESHOLD,
+        help='TouchAnything inference protocol contact threshold (official caller uses 0.1).',
+    )
+    parser.add_argument(
+        '--touchanything_min_contact_ratio',
+        type=float,
+        default=TOUCHANYTHING_MIN_CONTACT_RATIO,
+        help='Minimum active-point ratio for TouchAnything temporal contact (official caller uses 0.05).',
+    )
     parser.add_argument('--index_workers', type=int, default=128)
     parser.add_argument('--index_backend', type=str, default='process', choices=['process', 'thread'])
     parser.add_argument('--index_chunksize', type=int, default=512)
+    parser.add_argument(
+        '--index_process_worker_cap',
+        type=int,
+        default=64,
+        help='Maximum process workers for shared-filesystem index scans; 0 disables the cap.',
+    )
+    parser.add_argument(
+        '--index_manifest',
+        type=str,
+        default=os.path.join(
+            base_dir,
+            'hamer_tactile_ft',
+            'data_integrity_audits',
+            'mixed_v2_input',
+            'data_integrity_samples.csv',
+        ),
+        help='Verified audit CSV used to build compact indexes without rescanning sample dirs.',
+    )
     parser.add_argument('--index_cache_dir', type=str, default=os.path.join(base_dir, "hamer_tactile_ft", "index_cache"))
     parser.add_argument('--rebuild_index', action='store_true')
     parser.add_argument('--index_cache_timeout', type=int, default=3600)
@@ -1497,10 +1954,13 @@ def main():
     parser.add_argument('--diagnostic_max_frames', type=int, default=200000, help='Maximum frame-level samples kept for diagnostic scatter plots/CSV.')
     parser.add_argument('--diagnostics_dir', type=str, default=None, help='Directory for diagnostic CSV/PNG outputs. Defaults next to the eval report.')
     args = parser.parse_args()
+    if not 0.0 <= args.touchanything_contact_thr <= 1.0:
+        parser.error("--touchanything_contact_thr must lie in [0, 1]")
+    if not 0.0 <= args.touchanything_min_contact_ratio <= 1.0:
+        parser.error("--touchanything_min_contact_ratio must lie in [0, 1]")
 
-    # Worker processes call os.chdir(<workspace>/hamer), so resolve every
-    # user-facing filesystem input while the launch directory is still intact.
-    for name in ("dino_weights", "report_dir", "diagnostics_dir", "index_cache_dir"):
+    # Resolve every user-facing filesystem input before worker processes spawn.
+    for name in ("dino_weights", "report_dir", "diagnostics_dir", "index_cache_dir", "index_manifest"):
         value = getattr(args, name, None)
         if value:
             setattr(args, name, _resolve_invocation_path(value))
@@ -1516,7 +1976,6 @@ def main():
     gpu_ids = _gpu_ids(args.gpu)
     world_size = len(gpu_ids) if torch.cuda.is_available() and len(gpu_ids) > 0 else 1
 
-    os.chdir(os.path.join(base_dir, 'hamer'))
     print(f"📦 加载 {args.split} 划分集...")
     model_cfg = _load_model_cfg()
     dataset = OpenTouchTactileDataset(
@@ -1527,9 +1986,15 @@ def main():
         index_workers=args.index_workers,
         index_chunksize=args.index_chunksize,
         index_backend=args.index_backend,
+        index_process_worker_cap=args.index_process_worker_cap,
+        index_manifest=args.index_manifest,
         index_cache_dir=args.index_cache_dir,
         rebuild_index=args.rebuild_index,
         index_cache_timeout=args.index_cache_timeout,
+        bbox_rescale_factor=args.bbox_rescale_factor,
+        bbox_source_policy=args.bbox_source_policy,
+        bbox_manifests=args.bbox_manifests,
+        expected_datasets=canonical_dataset_filter(args.datasets),
     )
 
     if len(dataset) == 0:
@@ -1569,7 +2034,7 @@ def main():
 
     stats = result["stats"]
 
-    report_text = _format_report(args, stats)
+    report_text = _format_report(args, stats, result.get("touchanything_protocol_stats", {}))
     if report_text is None:
         print("❌ 未产生任何有效的评估指标！可能数据集中 has_tactile 都是 0。")
         return
@@ -1603,6 +2068,14 @@ def main():
 
     loss_config = read_json_if_exists(exp_dir / "loss_config.json") if exp_dir is not None else None
     model_config = read_json_if_exists(exp_dir / "model_config.json") if exp_dir is not None else None
+    if loss_config is None:
+        compact_checkpoint = _load_checkpoint(args.checkpoint)
+        if isinstance(compact_checkpoint, dict):
+            compact_loss_config = compact_checkpoint.get("loss_config")
+            if isinstance(compact_loss_config, dict):
+                loss_config = compact_loss_config
+    if model_config is None:
+        model_config = dict(getattr(args, "model_metadata", {}) or {})
     eval_config = {
         "args": vars(args),
         "exp_name": args.exp_name,
@@ -1615,6 +2088,11 @@ def main():
         "model_config": model_config,
         "report_path": report_path,
         "diagnostics_dir": diagnostics_dir,
+        "metrics": _stats_summary(
+            stats,
+            result.get("touchanything_protocol_stats", {}),
+            touchanything_min_contact_ratio=args.touchanything_min_contact_ratio,
+        ),
     }
     with open(os.path.join(os.path.dirname(report_path), "eval_config.json"), "w", encoding="utf-8") as f_cfg:
         json.dump(eval_config, f_cfg, indent=2, sort_keys=True, ensure_ascii=False)

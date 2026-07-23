@@ -1,10 +1,10 @@
 from pathlib import Path
 from typing import Dict, Sequence
 
+import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 
-from hamer.models.hamer import HAMER
 from losses import TactileLossConfig, compute_tactile_loss
 
 
@@ -20,12 +20,12 @@ def default_tactile_dim() -> int:
 
 
 class ResidualBlock(nn.Module):
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, dropout_probability: float = 0.3):
         super().__init__()
         self.fc1 = nn.Linear(dim, dim)
         self.norm1 = nn.LayerNorm(dim)
         self.act = nn.GELU()
-        self.drop = nn.Dropout(0.3)
+        self.drop = nn.Dropout(float(dropout_probability))
         self.fc2 = nn.Linear(dim, dim)
         self.norm2 = nn.LayerNorm(dim)
 
@@ -36,184 +36,191 @@ class ResidualBlock(nn.Module):
         return self.act(features + residual)
 
 
-class AnatomicalSpatialPooling(nn.Module):
-    """The original V2 5x5 pooling with 21 retained spatial cells."""
-
-    def __init__(self):
-        super().__init__()
-        self.pool = nn.AdaptiveAvgPool2d((5, 5))
-        mask = torch.ones((1, 1, 5, 5), dtype=torch.bool)
-        mask[0, 0, 4, 0] = False
-        mask[0, 0, 4, 1] = False
-        mask[0, 0, 4, 3] = False
-        mask[0, 0, 4, 4] = False
-        self.register_buffer("mask", mask)
-        self.valid_token_count = int(mask.sum().item())
-
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
-        features = self.pool(features)
-        batch_size, channels, height, width = features.shape
-        features = features.reshape(batch_size, channels, height * width)
-        return features[:, :, self.mask.reshape(-1)].reshape(batch_size, -1)
-
-
-class DenseV2TactileHead(nn.Module):
-    """High-capacity direct continuous decoder used by the original V2 model."""
-
-    def __init__(self, tactile_dim: int):
-        super().__init__()
-        pool = AnatomicalSpatialPooling()
-        self.layers = nn.Sequential(
-            nn.LazyConv2d(out_channels=256, kernel_size=1),
-            nn.GELU(),
-            pool,
-            nn.Dropout(p=0.5),
-            nn.Linear(256 * pool.valid_token_count, 512),
-            nn.LayerNorm(512),
-            nn.GELU(),
-            nn.Dropout(p=0.3),
-            ResidualBlock(512),
-            nn.Linear(512, tactile_dim),
-        )
-
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
-        return self.layers(features)
-
-
 class ChannelLayerNorm(nn.Module):
-    """LayerNorm over channels for a BCHW feature map."""
-
     def __init__(self, channels: int):
         super().__init__()
-        self.norm = nn.LayerNorm(channels)
+        self.norm = nn.LayerNorm(int(channels))
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
-        features = features.permute(0, 2, 3, 1)
-        features = self.norm(features)
-        return features.permute(0, 3, 1, 2).contiguous()
+        return self.norm(features.permute(0, 2, 3, 1)).permute(0, 3, 1, 2).contiguous()
 
 
-class DenseV2MultilevelTactileHead(nn.Module):
-    """Fuse multiple ViT stages, then retain the original V2 dense decoder."""
+class FullGrid32SpatialPooling(nn.Module):
+    """Preserve the complete 16x12 DINO grid while controlling decoder size."""
 
-    def __init__(self, tactile_dim: int, num_levels: int, projected_channels: int = 256):
+    output_dim = 32 * 16 * 12
+
+    def __init__(self, input_channels: int = 256):
         super().__init__()
-        if num_levels < 2:
-            raise ValueError("dense_v2_multilevel requires at least two backbone feature levels")
-
-        self.projections = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.LazyConv2d(projected_channels, kernel_size=1),
-                    ChannelLayerNorm(projected_channels),
-                    nn.GELU(),
-                )
-                for _ in range(num_levels)
-            ]
-        )
-        self.level_logits = nn.Parameter(torch.zeros(num_levels))
-        pool = AnatomicalSpatialPooling()
-        self.decoder = nn.Sequential(
-            pool,
-            nn.Dropout(p=0.5),
-            nn.Linear(projected_channels * pool.valid_token_count, 512),
-            nn.LayerNorm(512),
+        self.projection = nn.Sequential(
+            nn.Conv2d(int(input_channels), 32, kernel_size=1),
+            ChannelLayerNorm(32),
             nn.GELU(),
-            nn.Dropout(p=0.3),
-            ResidualBlock(512),
-            nn.Linear(512, tactile_dim),
         )
 
-    def fusion_weights(self) -> torch.Tensor:
-        return torch.softmax(self.level_logits, dim=0)
-
-    def forward(self, feature_levels: Sequence[torch.Tensor]) -> torch.Tensor:
-        if len(feature_levels) != len(self.projections):
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        if tuple(features.shape[-2:]) != (16, 12):
             raise ValueError(
-                f"Expected {len(self.projections)} feature levels, got {len(feature_levels)}"
+                f"FullGrid32 expects a 16x12 feature map, got {tuple(features.shape[-2:])}"
             )
-        projected = [projection(features) for projection, features in zip(self.projections, feature_levels)]
-        reference_size = projected[-1].shape[-2:]
-        projected = [
-            features
-            if features.shape[-2:] == reference_size
-            else nn.functional.interpolate(features, size=reference_size, mode="bilinear", align_corners=False)
-            for features in projected
-        ]
-        weights = self.fusion_weights().to(dtype=projected[0].dtype)
-        fused = sum(weight * features for weight, features in zip(weights, projected))
-        return self.decoder(fused)
+        return self.projection(features).flatten(1)
 
 
-class DenseV2MultilevelConcatTactileHead(nn.Module):
-    """Preserve complementary ViT levels before the original V2 decoder."""
+class DenseV2DinoReZeroTactileHead(nn.Module):
+    """Fuse multilevel DINO maps through one bounded ReZero residual."""
 
-    def __init__(self, tactile_dim: int, num_levels: int, projected_channels: int = 256):
+    def __init__(
+        self,
+        tactile_dim: int,
+        layer_indices: Sequence[int],
+        residual_max_scale: float = 0.10,
+        residual_rms_budget: float = 0.50,
+        input_channels: int = 1280,
+        channels: int = 256,
+        decoder_dropout_scale: float = 1.0,
+    ):
         super().__init__()
-        if num_levels < 2:
-            raise ValueError("dense_v2_multilevel_concat requires at least two feature levels")
-        self.num_levels = int(num_levels)
-        self.projected_channels = int(projected_channels)
-        self.projections = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.LazyConv2d(projected_channels, kernel_size=1),
-                    ChannelLayerNorm(projected_channels),
-                    nn.GELU(),
-                )
-                for _ in range(num_levels)
-            ]
-        )
-        self.fusion = nn.Sequential(
-            nn.Conv2d(num_levels * projected_channels, projected_channels, kernel_size=1),
-            ChannelLayerNorm(projected_channels),
-            nn.GELU(),
-        )
-        pool = AnatomicalSpatialPooling()
+        layer_indices = tuple(int(layer) for layer in layer_indices)
+        if len(layer_indices) < 2 or tuple(sorted(set(layer_indices))) != layer_indices:
+            raise ValueError("DINO layers must contain at least two unique increasing indices")
+        if not 0.0 < float(residual_max_scale) <= 1.0:
+            raise ValueError("dino_residual_max_scale must lie in (0, 1]")
+        if not 0.0 < float(residual_rms_budget) <= 1.0:
+            raise ValueError("dino_residual_rms_budget must lie in (0, 1]")
+        dropout_scale = float(decoder_dropout_scale)
+        if not 0.0 <= dropout_scale <= 1.0:
+            raise ValueError("decoder_dropout_scale must lie in [0, 1]")
+
+        self.layer_indices = layer_indices
+        self.refinement_layer_indices = tuple(reversed(layer_indices[:-1]))
+        self.residual_max_scale = float(residual_max_scale)
+        self.residual_rms_budget = float(residual_rms_budget)
+
+        pool = FullGrid32SpatialPooling(input_channels=channels)
         self.decoder = nn.Sequential(
             pool,
-            nn.Dropout(p=0.5),
-            nn.Linear(projected_channels * pool.valid_token_count, 512),
+            nn.Dropout(p=0.5 * dropout_scale),
+            nn.Linear(pool.output_dim, 512),
             nn.LayerNorm(512),
             nn.GELU(),
-            nn.Dropout(p=0.3),
-            ResidualBlock(512),
-            nn.Linear(512, tactile_dim),
+            nn.Dropout(p=0.3 * dropout_scale),
+            ResidualBlock(512, dropout_probability=0.3 * dropout_scale),
+            nn.Linear(512, int(tactile_dim)),
         )
-        self._last_feature_diagnostics = {}
+        self.base_projection = nn.Sequential(
+            nn.Conv2d(int(input_channels), channels, kernel_size=1),
+            nn.GELU(),
+        )
 
-    def fusion_group_contributions(self) -> torch.Tensor:
-        weight = self.fusion[0].weight
-        groups = weight.reshape(
-            weight.shape[0], self.num_levels, self.projected_channels, *weight.shape[2:]
-        )
-        norms = groups.float().pow(2).sum(dim=(0, 2, 3, 4)).sqrt()
-        return norms / norms.sum().clamp_min(1e-12)
+        self.projections = nn.ModuleDict()
+        self.refiners = nn.ModuleDict()
+        for layer in self.refinement_layer_indices:
+            key = str(layer)
+            self.projections[key] = nn.Sequential(
+                nn.Conv2d(int(input_channels), channels, kernel_size=1),
+                ChannelLayerNorm(channels),
+                nn.GELU(),
+            )
+            refiner = nn.Sequential(
+                nn.Conv2d(channels * 2, channels, kernel_size=3, padding=1),
+                ChannelLayerNorm(channels),
+                nn.GELU(),
+                nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            )
+            nn.init.normal_(refiner[-1].weight, mean=0.0, std=1e-3)
+            nn.init.zeros_(refiner[-1].bias)
+            self.refiners[key] = refiner
+
+        self.level_logits = nn.Parameter(torch.zeros(len(self.refinement_layer_indices)))
+        self.global_gate = nn.Parameter(torch.zeros(()))
+        self._last_feature_diagnostics: Dict[str, torch.Tensor] = {}
 
     def feature_diagnostics(self) -> Dict[str, torch.Tensor]:
         return self._last_feature_diagnostics
 
-    def forward(self, feature_levels: Sequence[torch.Tensor]) -> torch.Tensor:
-        if len(feature_levels) != len(self.projections):
-            raise ValueError(f"Expected {len(self.projections)} levels, got {len(feature_levels)}")
-        projected = [projection(features) for projection, features in zip(self.projections, feature_levels)]
-        reference_size = projected[-1].shape[-2:]
-        projected = [
-            features
-            if features.shape[-2:] == reference_size
-            else nn.functional.interpolate(features, size=reference_size, mode="bilinear", align_corners=False)
-            for features in projected
-        ]
-        fused = self.fusion(torch.cat(projected, dim=1))
+    def fusion_weights(self) -> torch.Tensor:
+        return torch.softmax(self.level_logits, dim=0)
+
+    def effective_gate(self) -> torch.Tensor:
+        return self.residual_max_scale * torch.tanh(self.global_gate)
+
+    @staticmethod
+    def _sample_rms(features: torch.Tensor) -> torch.Tensor:
+        return features.float().pow(2).mean(dim=(1, 2, 3), keepdim=True).clamp_min(1e-24).sqrt()
+
+    def _fuse(self, feature_levels: Sequence[torch.Tensor]) -> torch.Tensor:
+        if len(feature_levels) != len(self.layer_indices):
+            raise ValueError(f"Expected {len(self.layer_indices)} DINO levels, got {len(feature_levels)}")
+        features_by_layer = dict(zip(self.layer_indices, feature_levels))
+        base = self.base_projection(features_by_layer[self.layer_indices[-1]])
+        projected_values = []
+        residual_logits_values = []
+        unit_residual_values = []
+        for layer in self.refinement_layer_indices:
+            key = str(layer)
+            projected = self.projections[key](features_by_layer[layer])
+            if projected.shape[-2:] != base.shape[-2:]:
+                projected = nn.functional.interpolate(
+                    projected,
+                    size=base.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            residual_logits = self.refiners[key](torch.cat([base, projected], dim=1))
+            projected_values.append(projected)
+            residual_logits_values.append(residual_logits)
+            unit_residual_values.append(torch.tanh(residual_logits))
+
+        weights = self.fusion_weights().to(dtype=base.dtype)
+        raw_delta = sum(weight * residual for weight, residual in zip(weights, unit_residual_values))
+        delta_pre_budget = self.effective_gate().to(dtype=base.dtype) * raw_delta
+        base_rms_per_sample = self._sample_rms(base).detach()
+        delta_rms_pre_per_sample = self._sample_rms(delta_pre_budget)
+        allowed_rms = self.residual_rms_budget * base_rms_per_sample
+        budget_scale = torch.clamp(
+            allowed_rms / delta_rms_pre_per_sample.clamp_min(1e-12),
+            max=1.0,
+        )
+        delta = delta_pre_budget * budget_scale.to(dtype=delta_pre_budget.dtype)
+        fused = base + delta
+
+        unit_rms = torch.stack(
+            [value.detach().float().pow(2).mean().sqrt() for value in unit_residual_values]
+        )
+        weighted_rms = weights.detach().float() * unit_rms
+        delta_rms_post_per_sample = self._sample_rms(delta)
         self._last_feature_diagnostics = {
-            "projected_rms": torch.stack([features.detach().float().pow(2).mean().sqrt() for features in projected]),
-            "fusion_rms": fused.detach().float().pow(2).mean().sqrt(),
+            "gate_raw": self.global_gate.detach().float(),
+            "gate_effective": self.effective_gate().detach().float(),
+            "level_weight": weights.detach().float(),
+            "projected_rms": torch.stack(
+                [value.detach().float().pow(2).mean().sqrt() for value in projected_values]
+            ),
+            "raw_residual_rms": unit_rms,
+            "residual_saturation": torch.stack(
+                [
+                    (value.detach().float().abs() > 3.0).float().mean()
+                    for value in residual_logits_values
+                ]
+            ),
+            "effective_contribution": weighted_rms / weighted_rms.sum().clamp_min(1e-12),
+            "delta_rms_pre_budget": delta_rms_pre_per_sample.detach().mean(),
+            "delta_rms_post_budget": delta_rms_post_per_sample.detach().mean(),
+            "delta_to_base_rms": (
+                delta_rms_post_per_sample.detach() / base_rms_per_sample.clamp_min(1e-12)
+            ).mean(),
+            "budget_clip_rate": (budget_scale.detach() < (1.0 - 1e-6)).float().mean(),
+            "base_rms": base.detach().float().pow(2).mean().sqrt(),
+            "final_rms": fused.detach().float().pow(2).mean().sqrt(),
         }
-        return self.decoder(fused)
+        return fused
+
+    def forward(self, feature_levels: Sequence[torch.Tensor]) -> torch.Tensor:
+        return self.decoder(self._fuse(feature_levels))
 
 
 class DinoV3BackboneAdapter(nn.Module):
-    """Frozen timm DINOv3 backbone returning a BCHW patch feature map."""
+    """Frozen local DINOv3 H+/16 backbone returning BCHW patch maps."""
 
     MODEL_NAME = "vit_huge_plus_patch16_dinov3.lvd1689m"
 
@@ -262,106 +269,113 @@ class DinoV3BackboneAdapter(nn.Module):
         self.model.eval()
         return self
 
-    def forward(self, image: torch.Tensor) -> torch.Tensor:
-        tokens = self.model.forward_features(image)
-        patch_tokens = tokens[:, self.num_prefix_tokens :]
+    def forward(self, image: torch.Tensor, layer_indices: Sequence[int]) -> Sequence[torch.Tensor]:
+        layer_indices = tuple(int(layer) for layer in layer_indices)
+        depth = self.get_num_layers()
+        if not layer_indices or tuple(sorted(set(layer_indices))) != layer_indices:
+            raise ValueError("DINO layers must contain unique increasing indices")
+        if min(layer_indices) < 1 or max(layer_indices) > depth:
+            raise ValueError(f"DINO layers must lie in [1, {depth}], got {layer_indices}")
+        feature_maps = self.model.forward_intermediates(
+            image,
+            indices=[layer - 1 for layer in layer_indices],
+            return_prefix_tokens=False,
+            norm=True,
+            stop_early=False,
+            output_fmt="NCHW",
+            intermediates_only=True,
+        )
         height, width = self.model.patch_embed.dynamic_feat_size(image.shape[-2:])
-        expected = int(height * width)
-        if patch_tokens.shape[1] != expected:
-            raise RuntimeError(
-                f"DINOv3 returned {patch_tokens.shape[1]} patch tokens; expected {height}x{width}={expected}"
-            )
-        return patch_tokens.reshape(image.shape[0], height, width, -1).permute(0, 3, 1, 2).contiguous()
+        for layer, feature_map in zip(layer_indices, feature_maps):
+            expected_shape = (image.shape[0], 1280, height, width)
+            if tuple(feature_map.shape) != expected_shape:
+                raise RuntimeError(
+                    f"DINO layer {layer} returned {tuple(feature_map.shape)}, expected {expected_shape}"
+                )
+        return feature_maps
 
 
-class HAMER_Tactile(HAMER):
+class DinoTactileModel(pl.LightningModule):
+    """Standalone frozen-DINO to canonical tactile model."""
+
     def __init__(
         self,
-        cfg,
+        cfg=None,
         init_renderer: bool = False,
         tactile_only_forward: bool = True,
         tactile_loss_scale: float = 10.0,
-        tactile_head_type: str = "dense_v2",
-        backbone_feature_layers: Sequence[int] = (16, 24, 32),
-        visual_backbone: str = "hamer",
+        tactile_head_type: str = "dense_v2_dino_rezero",
+        backbone_feature_layers: Sequence[int] = (8, 16, 24, 32),
+        visual_backbone: str = "dinov3_hplus",
         dino_weights: str = "",
+        dino_rezero_source: str = "multilevel",
+        dino_residual_max_scale: float = 0.10,
+        dino_residual_rms_budget: float = 0.50,
+        pool_layout: str = "fullgrid32",
+        decoder_dropout_scale: float = 1.0,
     ):
-        super().__init__(cfg, init_renderer=init_renderer)
+        super().__init__()
+        if not tactile_only_forward:
+            raise ValueError("The standalone tactile model only supports tactile_only_forward=True")
+        if tactile_head_type != "dense_v2_dino_rezero":
+            raise ValueError("Only tactile_head_type=dense_v2_dino_rezero is supported")
+        if visual_backbone != "dinov3_hplus":
+            raise ValueError("Only visual_backbone=dinov3_hplus is supported")
+        if dino_rezero_source != "multilevel":
+            raise ValueError("Only dino_rezero_source=multilevel is supported")
+        if pool_layout != "fullgrid32":
+            raise ValueError("Only pool_layout=fullgrid32 is supported")
+
         self.visual_backbone = str(visual_backbone)
-        self.dino_weights = str(dino_weights or "")
-        if self.visual_backbone == "dinov3_hplus":
-            self.backbone = DinoV3BackboneAdapter(self.dino_weights, image_size=(256, 192))
-        elif self.visual_backbone != "hamer":
-            raise ValueError(f"Unsupported visual_backbone: {self.visual_backbone}")
+        self.dino_weights = str(dino_weights)
+        self.backbone = DinoV3BackboneAdapter(self.dino_weights, image_size=(256, 192))
         self.tactile_dim = default_tactile_dim()
         self.tactile_head_type = str(tactile_head_type)
         self.backbone_feature_layers = tuple(int(layer) for layer in backbone_feature_layers)
-        backbone_depth = int(self.backbone.get_num_layers()) if hasattr(self.backbone, "get_num_layers") else None
-        if self.tactile_head_type in {"dense_v2_multilevel", "dense_v2_multilevel_concat"}:
-            if self.visual_backbone != "hamer":
-                raise ValueError(f"{self.tactile_head_type} currently requires visual_backbone=hamer")
-            if len(self.backbone_feature_layers) < 2 or len(set(self.backbone_feature_layers)) != len(
-                self.backbone_feature_layers
-            ):
-                raise ValueError("backbone_feature_layers must contain at least two unique layer indices")
-            if backbone_depth is not None and (
-                min(self.backbone_feature_layers) < 1 or max(self.backbone_feature_layers) > backbone_depth
-            ):
-                raise ValueError(
-                    f"backbone_feature_layers must be in [1, {backbone_depth}], "
-                    f"got {self.backbone_feature_layers}"
-                )
-        self.pool_layout = "legacy5"
-        self.pool_grid_size = 5
-        self.pool_valid_tokens = 21
-        self.tactile_only_forward = bool(tactile_only_forward)
+        if self.backbone_feature_layers[-1] != self.backbone.get_num_layers():
+            raise ValueError("backbone_feature_layers must end at the final DINO block")
+        self.dino_rezero_source = "multilevel"
+        self.dino_residual_max_scale = float(dino_residual_max_scale)
+        self.dino_residual_rms_budget = float(dino_residual_rms_budget)
+        self.pool_layout = "fullgrid32"
+        self.pool_grid_size = (16, 12)
+        self.pool_valid_tokens = 192
+        self.decoder_dropout_scale = float(decoder_dropout_scale)
+        self.tactile_only_forward = True
         self.tactile_loss_scale = float(tactile_loss_scale)
         self.tactile_loss_config = TactileLossConfig()
-        if self.tactile_head_type == "dense_v2":
-            self.tactile_head = DenseV2TactileHead(self.tactile_dim)
-        elif self.tactile_head_type == "dense_v2_multilevel":
-            self.tactile_head = DenseV2MultilevelTactileHead(
-                self.tactile_dim,
-                num_levels=len(self.backbone_feature_layers),
-            )
-        elif self.tactile_head_type == "dense_v2_multilevel_concat":
-            self.tactile_head = DenseV2MultilevelConcatTactileHead(
-                self.tactile_dim,
-                num_levels=len(self.backbone_feature_layers),
-            )
-        else:
-            raise ValueError(f"Unsupported tactile_head_type: {self.tactile_head_type}")
+        self.tactile_head = DenseV2DinoReZeroTactileHead(
+            self.tactile_dim,
+            layer_indices=self.backbone_feature_layers,
+            residual_max_scale=self.dino_residual_max_scale,
+            residual_rms_budget=self.dino_residual_rms_budget,
+            decoder_dropout_scale=self.decoder_dropout_scale,
+        )
         self.automatic_optimization = True
 
     def set_tactile_loss_config(self, config: TactileLossConfig) -> None:
         self.tactile_loss_config = config
 
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.backbone.eval()
+        return self
+
     def _extract_tactile_features(self, image: torch.Tensor):
-        if self.tactile_head_type in {"dense_v2_multilevel", "dense_v2_multilevel_concat"}:
-            return self.backbone(image, return_intermediate_layers=self.backbone_feature_layers)
-        return self.backbone(image)
+        return self.backbone(image, self.backbone_feature_layers)
 
     def forward_step(self, batch: Dict, train: bool = False) -> Dict:
-        if self.tactile_only_forward:
-            output = {"losses": {}}
-        else:
-            output = super().forward_step(batch, train=train)
-
         image = batch["img"][:, :, :, 32:-32]
-        with torch.set_grad_enabled(self.backbone.training and train):
+        with torch.no_grad():
             conditioning_features = self._extract_tactile_features(image)
         pred_logits = self.tactile_head(conditioning_features)
-        output["pred_logits"] = pred_logits
-        output["pred_tactile"] = torch.sigmoid(pred_logits)
-        return output
+        return {
+            "losses": {},
+            "pred_logits": pred_logits,
+            "pred_tactile": torch.sigmoid(pred_logits),
+        }
 
     def compute_loss(self, batch: Dict, output: Dict, train: bool = True) -> torch.Tensor:
-        if self.tactile_only_forward:
-            base_loss = output["pred_tactile"].new_zeros(())
-            output.setdefault("losses", {})
-        else:
-            base_loss = super().compute_loss(batch, output, train=train)
-
         tactile_loss, tactile_losses = compute_tactile_loss(
             pred=output["pred_tactile"],
             logits=output["pred_logits"],
@@ -373,7 +387,12 @@ class HAMER_Tactile(HAMER):
             current_epoch=getattr(self, "current_epoch", 0),
             sample_weight=batch.get("sample_weight"),
         )
+        total_loss = self.tactile_loss_scale * tactile_loss
         output["losses"].update(tactile_losses)
-        total_loss = base_loss + self.tactile_loss_scale * tactile_loss
         output["losses"]["loss_total"] = total_loss.detach()
+        output["losses"]["loss_current_ramp"] = total_loss.detach()
+        output["losses"]["loss_direct_raw"] = tactile_losses["loss_base_tactile"]
+        output["losses"]["loss_full_ramp_reference"] = (
+            self.tactile_loss_scale * tactile_losses["loss_full_ramp"]
+        ).detach()
         return total_loss

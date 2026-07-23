@@ -1,7 +1,9 @@
 from dataclasses import dataclass
+import math
 from typing import Any, Dict, Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 
@@ -19,9 +21,19 @@ class TactileLossConfig:
     active_pressure_gamma: float = 1.0
     background_loss_weight: float = 1.0
     logit_bce_weight: float = 0.1
-    loss_ramp_epochs: int = 10
+    loss_ramp_epochs: int = 5
     opentouch_high_pressure_thr: float = 0.9
     opentouch_high_pressure_weight: float = 0.3
+    tail_pressure_thr: float = 0.2
+    tail_l1_weight: float = 0.0
+    location_loss_weight: float = 0.0
+    location_gt_volume_thr: float = 1.0
+    location_distribution_power: float = 1.0
+    location_min_gt_peak: float = 0.0
+    contact_loss_type: str = "none"
+    contact_loss_weight: float = 0.0
+    contact_pressure_thr: float = 0.1
+    contact_temperature: float = 0.025
 
     def __post_init__(self):
         if self.loss_mode != "dense_v2":
@@ -30,9 +42,43 @@ class TactileLossConfig:
             raise ValueError("Expected active_pressure_thr < active_pressure_peak < active_pressure_high")
         if not 0.0 <= self.background_pressure_thr <= self.background_pred_margin <= 1.0:
             raise ValueError("Background thresholds must lie in [0, 1]")
-        for name in ("active_pressure_weight", "active_pressure_gamma", "background_loss_weight", "logit_bce_weight"):
+        for name in (
+            "active_pressure_weight",
+            "active_pressure_gamma",
+            "background_loss_weight",
+            "logit_bce_weight",
+            "tail_l1_weight",
+            "location_loss_weight",
+            "contact_loss_weight",
+        ):
             if float(getattr(self, name)) < 0.0:
                 raise ValueError(f"{name} must be nonnegative")
+        if not 0.0 <= self.tail_pressure_thr <= 1.0:
+            raise ValueError("tail_pressure_thr must lie in [0, 1]")
+        if self.location_gt_volume_thr < 0.0:
+            raise ValueError("location_gt_volume_thr must be nonnegative")
+        if not math.isfinite(float(self.location_distribution_power)) or not (
+            1.0 <= float(self.location_distribution_power) <= 4.0
+        ):
+            raise ValueError("location_distribution_power must be finite and lie in [1, 4]")
+        if not math.isfinite(float(self.location_min_gt_peak)) or not (
+            0.0 <= float(self.location_min_gt_peak) <= 1.0
+        ):
+            raise ValueError("location_min_gt_peak must be finite and lie in [0, 1]")
+        if self.contact_loss_type not in {"none", "soft_jaccard", "lovasz"}:
+            raise ValueError(
+                "contact_loss_type must be one of: none, soft_jaccard, lovasz"
+            )
+        if not math.isfinite(float(self.contact_loss_weight)):
+            raise ValueError("contact_loss_weight must be finite and nonnegative")
+        if not math.isfinite(float(self.contact_pressure_thr)) or not (
+            0.0 <= float(self.contact_pressure_thr) <= 1.0
+        ):
+            raise ValueError("contact_pressure_thr must be finite and lie in [0, 1]")
+        if not math.isfinite(float(self.contact_temperature)) or not (
+            float(self.contact_temperature) > 0.0
+        ):
+            raise ValueError("contact_temperature must be finite and positive")
         if not 0.0 < self.opentouch_high_pressure_weight <= 1.0:
             raise ValueError("opentouch_high_pressure_weight must lie in (0, 1]")
 
@@ -148,6 +194,97 @@ def pressure_weight_like(target: torch.Tensor, config: TactileLossConfig, ramp: 
     return 1.0 + float(ramp) * config.active_pressure_weight * active_strength
 
 
+def global_conditional_mean(local_sum: torch.Tensor, local_count: torch.Tensor) -> torch.Tensor:
+    """Return a DDP-gradient-correct mean over a distributed conditional mask."""
+    global_count = local_count.detach().to(device=local_sum.device, dtype=torch.float32).clone()
+    world_size = 1
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(global_count, op=dist.ReduceOp.SUM)
+        world_size = dist.get_world_size()
+    return local_sum * float(world_size) / global_count.clamp_min(1.0)
+
+
+def _location_distribution_mass(values: torch.Tensor, power: float) -> torch.Tensor:
+    values = values.float().clamp_min(0.0)
+    return values if float(power) == 1.0 else values.pow(float(power))
+
+
+def _lovasz_gradient(sorted_labels: torch.Tensor) -> torch.Tensor:
+    """Gradient of the Lovasz extension with respect to sorted errors."""
+    count = sorted_labels.numel()
+    if count == 0:
+        return sorted_labels
+    total_positive = sorted_labels.sum()
+    intersection = total_positive - sorted_labels.cumsum(dim=0)
+    union = total_positive + (1.0 - sorted_labels).cumsum(dim=0)
+    gradient = 1.0 - intersection / union.clamp_min(1e-12)
+    if count > 1:
+        gradient = torch.cat((gradient[:1], gradient[1:] - gradient[:-1]))
+    return gradient
+
+
+def _masked_lovasz_hinge(
+    contact_logits: torch.Tensor,
+    contact_labels: torch.Tensor,
+    valid_vertices: torch.Tensor,
+) -> torch.Tensor:
+    logits = contact_logits[valid_vertices]
+    labels = contact_labels[valid_vertices]
+    if logits.numel() == 0:
+        return contact_logits.sum() * 0.0
+    signs = 2.0 * labels - 1.0
+    errors = 1.0 - logits * signs
+    sorted_errors, permutation = torch.sort(errors, descending=True)
+    sorted_labels = labels[permutation]
+    return torch.dot(F.relu(sorted_errors), _lovasz_gradient(sorted_labels))
+
+
+def _contact_loss_sum_and_count(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    config: TactileLossConfig,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the sum of per-frame contact losses and eligible frame count."""
+    pred_frames = pred.float().reshape(-1, pred.shape[-1])
+    target_frames = target.float().reshape_as(pred_frames)
+    valid_frames = (mask > 0.0).reshape_as(pred_frames)
+    eligible = valid_frames.any(dim=-1)
+    contact_logits = (
+        pred_frames - float(config.contact_pressure_thr)
+    ) / float(config.contact_temperature)
+    # Match the TouchAnything protocol exactly: contact is strictly above 0.1.
+    contact_labels = (target_frames > float(config.contact_pressure_thr)).float()
+
+    if config.contact_loss_type == "soft_jaccard":
+        probabilities = torch.sigmoid(contact_logits)
+        valid_float = valid_frames.float()
+        intersection = (probabilities * contact_labels * valid_float).sum(dim=-1)
+        union = (
+            (probabilities + contact_labels - probabilities * contact_labels)
+            * valid_float
+        ).sum(dim=-1)
+        per_frame = 1.0 - (intersection + 1.0) / (union + 1.0)
+    elif config.contact_loss_type == "lovasz":
+        per_frame = (
+            torch.stack(
+                [
+                    _masked_lovasz_hinge(frame_logits, frame_labels, frame_valid)
+                    for frame_logits, frame_labels, frame_valid in zip(
+                        contact_logits, contact_labels, valid_frames
+                    )
+                ]
+            )
+            if contact_logits.shape[0] > 0
+            else contact_logits.new_empty((0,))
+        )
+    else:
+        raise ValueError(f"Unsupported contact loss type: {config.contact_loss_type}")
+
+    contact_sum = per_frame.masked_fill(~eligible, 0.0).sum()
+    return contact_sum, eligible.float().sum()
+
+
 def compute_tactile_loss(
     pred: torch.Tensor,
     logits: torch.Tensor,
@@ -158,9 +295,12 @@ def compute_tactile_loss(
     config: Optional[TactileLossConfig] = None,
     current_epoch: Optional[int] = None,
     sample_weight: Optional[torch.Tensor] = None,
+    ramp_override: Optional[float] = None,
 ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     config = config or TactileLossConfig()
-    ramp = loss_ramp(config, current_epoch)
+    ramp = loss_ramp(config, current_epoch) if ramp_override is None else float(ramp_override)
+    if not 0.0 <= ramp <= 1.0:
+        raise ValueError(f"ramp_override must lie in [0, 1], got {ramp}")
 
     target = target.to(dtype=pred.dtype, device=pred.device)
     logits = logits.to(device=pred.device, dtype=pred.dtype)
@@ -175,27 +315,120 @@ def compute_tactile_loss(
 
     pressure_weight = pressure_weight_like(target, config, ramp)
     weights = pressure_weight * dataset_weight_like(target, dataset_batch, config)
+    full_ramp_weights = pressure_weight_like(target, config, 1.0) * dataset_weight_like(
+        target, dataset_batch, config
+    )
     mask = palm * valid
     denom = mask.sum().clamp_min(1.0)
     weighted_tactile = (direct * weights * mask).sum() / denom
+    weighted_tactile_full_ramp = (direct * full_ramp_weights * mask).sum() / denom
     base_tactile = (direct * mask).sum() / denom
     smooth_l1_raw = (smooth * mask).sum() / denom
     logit_bce_raw = (logit_bce * mask).sum() / denom
 
     background_mask = (target <= config.background_pressure_thr).to(target.dtype) * mask
     background_denom = background_mask.sum().clamp_min(1.0)
-    background = (
+    background_raw = (
         F.relu(pred - config.background_pred_margin).pow(2) * background_mask
     ).sum() / background_denom
-    background = background * (ramp * config.background_loss_weight)
+    background = background_raw * (ramp * config.background_loss_weight)
 
-    total = weighted_tactile + background
+    tail_mask = (target >= config.tail_pressure_thr).to(target.dtype) * mask
+    tail_count_local = tail_mask.float().sum()
+    if config.tail_l1_weight > 0.0:
+        tail_abs_sum = (torch.abs(pred.float() - target.float()) * tail_mask.float()).sum()
+        tail_l1_raw = global_conditional_mean(tail_abs_sum, tail_count_local)
+        tail_l1_weighted = tail_l1_raw * (ramp * config.tail_l1_weight)
+    else:
+        # Preserve the baseline graph and avoid an unnecessary collective.
+        tail_l1_raw = pred.sum() * 0.0
+        tail_l1_weighted = tail_l1_raw
+
+    total = weighted_tactile + background + tail_l1_weighted
+
+    location_mask = palm.float() * (valid > 0.0).float()
+    location_gt_raw = target.float().clamp_min(0.0) * location_mask
+    location_gt = _location_distribution_mass(
+        location_gt_raw,
+        config.location_distribution_power,
+    )
+    location_gt_volume_raw = location_gt_raw.sum(dim=-1)
+    location_gt_volume = location_gt.sum(dim=-1)
+    location_gt_peak = location_gt_raw.amax(dim=-1)
+    location_valid_frame = location_mask.sum(dim=-1) > 0.0
+    location_eligible = location_valid_frame & (
+        location_gt_volume_raw >= config.location_gt_volume_thr
+    ) & (
+        location_gt_peak >= config.location_min_gt_peak
+    )
+    location_count_local = location_eligible.float().sum()
+    location_valid_count_local = location_valid_frame.float().sum()
+    location_eligible_fraction = (
+        location_count_local / location_valid_count_local.clamp_min(1.0)
+    )
+
+    if config.location_loss_weight > 0.0:
+        location_pred = (
+            _location_distribution_mass(pred, config.location_distribution_power)
+            * location_mask
+        )
+        location_pred_volume = location_pred.sum(dim=-1)
+        pred_dist = location_pred / location_pred_volume.unsqueeze(-1).clamp_min(1e-12)
+        gt_dist = location_gt / location_gt_volume.unsqueeze(-1).clamp_min(1e-12)
+        location_intersection = torch.minimum(pred_dist, gt_dist).sum(dim=-1)
+        location_union = torch.maximum(pred_dist, gt_dist).sum(dim=-1)
+        location_viou = torch.where(
+            location_union > 1e-12,
+            location_intersection / location_union.clamp_min(1e-12),
+            torch.zeros_like(location_union),
+        )
+        location_sum = (1.0 - location_viou).masked_fill(~location_eligible, 0.0).sum()
+        location_loss_raw = global_conditional_mean(location_sum, location_count_local)
+        location_loss_weighted = location_loss_raw * (ramp * config.location_loss_weight)
+        total = total + location_loss_weighted
+    else:
+        # Keep weight=0 numerically identical to the pre-location path and collective-free.
+        location_loss_raw = pred.new_zeros(())
+        location_loss_weighted = location_loss_raw
+
+    if config.contact_loss_type != "none" and config.contact_loss_weight > 0.0:
+        contact_sum, contact_count_local = _contact_loss_sum_and_count(
+            pred,
+            target,
+            mask,
+            config,
+        )
+        contact_loss_raw = global_conditional_mean(contact_sum, contact_count_local)
+        contact_loss_weighted = contact_loss_raw * (ramp * config.contact_loss_weight)
+        total = total + contact_loss_weighted
+    else:
+        # Preserve the baseline graph and avoid an unnecessary collective.
+        contact_loss_raw = pred.new_zeros(())
+        contact_loss_weighted = contact_loss_raw
+
+    full_ramp_total = (
+        weighted_tactile_full_ramp
+        + background_raw * config.background_loss_weight
+        + tail_l1_raw * config.tail_l1_weight
+        + location_loss_raw * config.location_loss_weight
+        + contact_loss_raw * config.contact_loss_weight
+    )
+
     return total, {
         "loss_smooth_l1_raw": smooth_l1_raw.detach(),
         "loss_logit_bce_raw": logit_bce_raw.detach(),
         "loss_base_tactile": base_tactile.detach(),
         "loss_weighted_tactile": weighted_tactile.detach(),
         "loss_background": background.detach(),
+        "loss_tail_l1_raw": tail_l1_raw.detach(),
+        "loss_tail_l1_weighted": tail_l1_weighted.detach(),
+        "diagnostics_tail_fraction": tail_count_local.detach() / mask.sum().detach().clamp_min(1.0),
+        "loss_location_raw": location_loss_raw.detach(),
+        "loss_location_weighted": location_loss_weighted.detach(),
+        "diagnostics_location_eligible_fraction": location_eligible_fraction.detach(),
+        "loss_contact_raw": contact_loss_raw.detach(),
+        "loss_contact_weighted": contact_loss_weighted.detach(),
+        "loss_full_ramp": full_ramp_total.detach(),
         "loss_tactile": total.detach(),
         "loss_ramp": pred.new_tensor(ramp),
     }
