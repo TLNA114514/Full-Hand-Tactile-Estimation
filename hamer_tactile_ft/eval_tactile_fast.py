@@ -109,6 +109,11 @@ CATASTROPHIC_OVER_GT_MAX = 10.0
 CATASTROPHIC_OVER_PRED_MIN = 300.0
 CATASTROPHIC_UNDER_GT_MIN = 150.0
 CATASTROPHIC_UNDER_PRED_MAX = 50.0
+CHECKPOINT_FILENAMES = {
+    "loss-best": "best_loss.ckpt",
+    "contact-best": "best_contact.ckpt",
+    "last": "last.ckpt",
+}
 
 
 def _safe_name(value):
@@ -153,6 +158,14 @@ def _checkpoint_exists(path: Path) -> bool:
     # Path.exists() is false for a broken symlink, but lexists lets us report
     # the link target clearly instead of silently ignoring last.ckpt.
     return os.path.lexists(path)
+
+
+def _canonical_checkpoint_selector(selector: str) -> str:
+    selector = str(selector).strip().lower()
+    if selector not in CHECKPOINT_FILENAMES:
+        choices = ", ".join(CHECKPOINT_FILENAMES)
+        raise ValueError(f"Unsupported checkpoint selector {selector!r}; choose one of: {choices}")
+    return selector
 
 
 def _validate_checkpoint_candidate(path: Path, label: str) -> str:
@@ -200,20 +213,16 @@ def _resolve_checkpoint_path(args):
         suffix = f" Available experiments: {', '.join(existing[:20])}" if existing else ""
         raise FileNotFoundError(f"Checkpoint experiment directory not found: {exp_dir}.{suffix}")
 
-    canonical_names = {
-        "loss-best": "best_loss.ckpt",
-        "contact-best": "best_contact.ckpt",
-        "last": "last.ckpt",
-    }
-    canonical_path = exp_dir / canonical_names[args.ckpt]
+    selector = _canonical_checkpoint_selector(args.ckpt)
+    canonical_path = exp_dir / CHECKPOINT_FILENAMES[selector]
     if _checkpoint_exists(canonical_path):
-        selected = _validate_checkpoint_candidate(canonical_path, args.ckpt)
-        print(f"Checkpoint selector: --ckpt {args.ckpt}; selected canonical checkpoint: {selected}")
+        selected = _validate_checkpoint_candidate(canonical_path, selector)
+        print(f"Checkpoint selector: --ckpt {selector}; selected canonical checkpoint: {selected}")
         return selected
 
     available = sorted(path.name for path in exp_dir.glob("*.ckpt"))
     suffix = f" Available checkpoints: {', '.join(available)}" if available else " No .ckpt files found."
-    raise FileNotFoundError(f"Could not resolve --ckpt {args.ckpt!r} under {exp_dir}.{suffix}")
+    raise FileNotFoundError(f"Could not resolve --ckpt {selector!r} under {exp_dir}.{suffix}")
 
 
 def _load_model_cfg():

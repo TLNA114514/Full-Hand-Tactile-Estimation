@@ -12,6 +12,7 @@ SYNC_DIRS=(
     "hamer_tactile_infiller"
     "opentouch_hamer_ft"
     "preprocess"
+    “sam3_bbox_reconstruction”
     "scratch"
     # "未来你想同步的新文件夹A"
     # "未来你想同步的新文件夹B"
