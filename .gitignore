@@ -5,6 +5,8 @@
 # ==========================================
 # Ignore all raw data directories at any level
 data/
+!hamer_tactile_ft/data/
+!hamer_tactile_ft/data/*.py
 _DATA/
 datasets/
 preprocessed_data/
@@ -135,6 +137,15 @@ hamer_tactile_ft/eval_reports_*
 hamer_tactile_ft/eval_reports_baseline
 hamer_tactile_ft/data_integrity_audits/
 hamer_tactile_ft/index_cache
+hamer_tactile_ft/hdf5_manifest_cache
 hamer_tactile_ft/reports
 hamer_tactile_ft/amp_audits
 hamer_tactile_ft/memorization
+hamer_tactile_ft/run_processes/
+hamer_tactile_ft/preflight_logs/
+hamer_tactile_ft/input_prior_audits/
+tactile_input_priors/outputs/
+tactile_input_priors/cache/
+tactile_input_priors/sidecars/
+tactile_input_priors/models/
+tactile_input_priors/envs/

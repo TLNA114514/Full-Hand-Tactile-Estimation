@@ -1,62 +1,149 @@
-import os
+#!/usr/bin/env python3
+"""Adapt checked-in local absolute paths to the ModelArts filesystem.
 
-# ==========================================
-# 自动路径替换配置 (你可以自由修改和添加)
-# 格式: "本地路径": "远端服务器路径"
-# ==========================================
-PATH_MAPPINGS = {
-    # 替换代码根目录
-    "/code/users/jiangrui/Full-Hand-Tactile-Estimation": "/home/ma-user/work/cfzhao/Full-Hand-Tactile-Estimation",
-    
-    # 替换数据集目录（请把下面的远端路径换成你实际在 ModelArts 上的数据集绝对路径）
-    "/data1/jiangrui/OpenTouch Data": "/home/ma-user/work/cfzhao/OpenTouch Data", 
-    "/data1/jiangrui/EgoTouch/": "/home/ma-user/work/cfzhao/EgoTouch/",
-    "/data1/jiangrui/EgoTactile/": "/home/ma-user/work/cfzhao/EgoTactile/"
-    # 你可以继续在这里无限添加你需要自动替换的字符串
+The deployment sync invokes this script on the remote checkout after rsync.
+It is intentionally deterministic and idempotent: running it repeatedly does
+not modify files after the first successful pass.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+import tempfile
+
+
+LOCAL_WORKSPACE = "/code/users/jiangrui/Full-Hand-Tactile-Estimation"
+LOCAL_DATA_ROOT = "/data1/jiangrui"
+DEFAULT_REMOTE_ROOT = "/home/ma-user/work/cfzhao"
+
+SOURCE_SUFFIXES = {".py", ".sh", ".json", ".yaml", ".yml", ".toml"}
+SKIP_DIRS = {
+    ".git",
+    ".agents",
+    ".codex",
+    "__pycache__",
+    "wandb",
+    "logs",
+    "lightning_logs",
+    "checkpoints",
+    "eval_reports",
+    "index_cache",
+    "third_party",
+    "outputs",
+    "results",
+    "reports",
+    "demo_output",
+    "data_integrity_audits",
+    "input_prior_audits",
+    "amp_audits",
+    "memorization",
+    "hdf5_manifest_cache",
+    "index_cache",
+    "sidecars",
+    "models",
+    "envs",
+    "pre_dialog",
 }
 
-def auto_replace_paths():
-    """
-    遍历当前目录所有的 Python 和 Shell 脚本，并自动替换其中的绝对路径。
-    """
-    print("🚀 开始扫描并自动替换远端服务器独有的路径...")
-    
-    valid_extensions = ('.py', '.sh')
-    skip_dirs = {'.git', '__pycache__', 'wandb', 'logs', 'lightning_logs'}
-    
-    adapted_count = 0
-    
-    for root, dirs, files in os.walk('.'):
-        dirs[:] = [d for d in dirs if d not in skip_dirs]
-        for file in files:
-            if not file.endswith(valid_extensions):
-                continue
-                
-            filepath = os.path.join(root, file)
-            # 排除本文件，防止把映射字典本身给替换乱了
-            if file == "auto_adapt_paths.py":
-                continue
-                
-            try:
-                with open(filepath, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                
-                new_content = content
-                for local_path, remote_path in PATH_MAPPINGS.items():
-                    new_content = new_content.replace(local_path, remote_path)
-                
-                # 如果内容有变化，则重新写入
-                if new_content != content:
-                    with open(filepath, 'w', encoding='utf-8') as f:
-                        f.write(new_content)
-                    print(f"✨ [已适配远端路径] -> {filepath}")
-                    adapted_count += 1
-            except Exception as e:
-                # 忽略非文本或编码无法读取的文件
-                pass
+SKIP_DIR_PREFIXES = ("eval_reports",)
 
-    print("-" * 50)
-    print(f"🎉 路径适配完成！共修改了 {adapted_count} 个文件。")
 
-if __name__ == '__main__':
-    auto_replace_paths()
+def _path_mappings(remote_root: str) -> dict[str, str]:
+    remote_root = remote_root.rstrip("/")
+    return {
+        LOCAL_WORKSPACE: f"{remote_root}/Full-Hand-Tactile-Estimation",
+        f"{LOCAL_DATA_ROOT}/OpenTouch Data": f"{remote_root}/OpenTouch Data",
+        f"{LOCAL_DATA_ROOT}/EgoTouch": f"{remote_root}/EgoTouch",
+        f"{LOCAL_DATA_ROOT}/EgoTactile": f"{remote_root}/EgoTactile",
+    }
+
+
+def _iter_source_files(root: Path):
+    for current_root, dirs, files in os.walk(root):
+        dirs[:] = [
+            name
+            for name in dirs
+            if name not in SKIP_DIRS
+            and not any(name.startswith(prefix) for prefix in SKIP_DIR_PREFIXES)
+        ]
+        current = Path(current_root)
+        for name in files:
+            path = current / name
+            if path.name == Path(__file__).name or path.suffix.lower() not in SOURCE_SUFFIXES:
+                continue
+            yield path
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    mode = path.stat().st_mode
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.adapt.", dir=str(path.parent)
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def adapt_paths(root: Path, remote_root: str, dry_run: bool = False) -> int:
+    mappings = sorted(
+        _path_mappings(remote_root).items(), key=lambda item: len(item[0]), reverse=True
+    )
+    changed = 0
+    for path in _iter_source_files(root):
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        adapted = content
+        for local_path, remote_path in mappings:
+            adapted = adapted.replace(local_path, remote_path)
+        if adapted == content:
+            continue
+        changed += 1
+        print(f"[path-adapt] {path.relative_to(root)}")
+        if not dry_run:
+            _atomic_write_text(path, adapted)
+    action = "would update" if dry_run else "updated"
+    print(f"[path-adapt] {action} {changed} source file(s).")
+    return changed
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Rewrite local absolute source paths for ModelArts deployment."
+    )
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=Path(__file__).resolve().parent,
+        help="Checkout root to scan (defaults to this script's directory).",
+    )
+    parser.add_argument(
+        "--remote-root",
+        default=os.environ.get("REMOTE_WORK_ROOT", DEFAULT_REMOTE_ROOT),
+        help="Remote parent containing the project and datasets.",
+    )
+    parser.add_argument("--dry-run", action="store_true")
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    root = args.root.expanduser().resolve()
+    if not root.is_dir():
+        raise SystemExit(f"Checkout root does not exist: {root}")
+    adapt_paths(root, args.remote_root, dry_run=args.dry_run)
+
+
+if __name__ == "__main__":
+    main()

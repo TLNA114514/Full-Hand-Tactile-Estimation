@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 try:
+    from .cli_args import add_tracking_arguments
     from .defaults import (
         DEFAULT_OPENTOUCH_DATA_ROOT,
         DEFAULT_OPENTOUCH_SPLITS,
@@ -38,6 +39,7 @@ try:
         resolve_verifier_prompt_lists,
     )
 except ImportError:  # Direct execution through run_pilot.sh.
+    from cli_args import add_tracking_arguments
     from defaults import (
         DEFAULT_OPENTOUCH_DATA_ROOT,
         DEFAULT_OPENTOUCH_SPLITS,
@@ -72,11 +74,7 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated split names; auto selects every canonical split.",
     )
     parser.add_argument("--opentouch-data-root", type=Path, default=DEFAULT_OPENTOUCH_DATA_ROOT)
-    parser.add_argument(
-        "--opentouch-splits",
-        type=Path,
-        default=DEFAULT_OPENTOUCH_SPLITS,
-    )
+    parser.add_argument("--opentouch-splits", type=Path, default=DEFAULT_OPENTOUCH_SPLITS)
     parser.add_argument("--touchanything-root", type=Path, default=DEFAULT_TOUCHANYTHING_ROOT)
     parser.add_argument(
         "--touchanything-split-json",
@@ -110,227 +108,38 @@ def parse_args() -> argparse.Namespace:
         "--workers-per-gpu",
         type=int,
         default=1,
-        help=(
-            "Independent persistent sequence workers per physical GPU. Each worker "
-            "loads one model copy; use 2 for OpenTouch on 80GB A800 GPUs."
-        ),
+        help="Persistent sequence workers per physical GPU.",
     )
     parser.add_argument(
         "--cpu-threads-per-worker",
         type=int,
         default=1,
-        help=(
-            "CPU threads available to each persistent worker for OpenCV, PyTorch, "
-            "OpenMP, BLAS, and NumExpr. Keep this at 1 when running many workers."
-        ),
+        help="CPU threads available to each persistent worker.",
     )
-    parser.add_argument("--sam-version", choices=("sam3", "sam3.1"), default="sam3")
-    parser.add_argument(
-        "--checkpoint",
-        type=Path,
-        help=(
-            "Local SAM checkpoint. By default sam3.pt or sam3.1_multiplex.pt is "
-            "resolved from the shared repository _DATA directory."
-        ),
-    )
-    parser.add_argument("--prompt-preset", choices=("gloved", "bare"), default="gloved")
-    parser.add_argument("--prompt", help="Override the prompt preset primary phrase")
-    parser.add_argument(
-        "--propagation-direction",
-        choices=("forward", "both"),
-        default="forward",
-    )
-    parser.add_argument("--max-frames", type=int, default=0, help="0 runs complete sequences")
-    parser.add_argument(
-        "--max-objects",
-        type=int,
-        default=0,
-        help="Safety cap; 0 uses OpenTouch=1 and TouchAnything=2.",
-    )
-    parser.add_argument(
-        "--sam-candidate-capacity",
-        type=int,
-        default=0,
-        help="SAM3.1 candidate capacity; 0 resolves to at least four before query selection.",
-    )
-    parser.add_argument("--min-mask-area-ratio", type=float, default=0.0005)
-    parser.add_argument(
-        "--min-relative-mask-area",
-        type=float,
-        default=0.05,
-        help="Legacy compatibility option; not used for prompt-track identity selection.",
-    )
-    parser.add_argument("--min-prompt-score", type=float, default=0.5)
-    parser.add_argument("--min-track-frames", type=int, default=2)
-    parser.add_argument("--duplicate-track-iou-floor", type=float, default=0.80)
-    parser.add_argument("--duplicate-track-overlap-fraction", type=float, default=0.60)
-    parser.add_argument("--duplicate-track-match-fraction", type=float, default=0.80)
-    parser.add_argument("--duplicate-track-centroid-ratio", type=float, default=0.18)
-    parser.add_argument("--duplicate-track-area-ratio", type=float, default=1.50)
-    parser.add_argument("--duplicate-track-min-frames", type=int, default=2)
-    parser.add_argument(
-        "--bare-verification-mode",
-        choices=("off", "report", "filter"),
-        default="filter",
-        help=(
-            "Legacy global semantic-verification fallback. It is used only when a "
-            "dataset-specific semantic mode is set to inherit."
-        ),
-    )
+
+    add_tracking_arguments(parser, preview_policy="pilot")
     parser.add_argument(
         "--opentouch-semantic-verification-mode",
         choices=("inherit", "off", "report", "filter"),
         default="filter",
-        help=(
-            "OpenTouch default: require independent positive glove evidence. "
-            "Use inherit to fall back to --bare-verification-mode."
-        ),
+        help="OpenTouch defaults to requiring independent positive glove evidence.",
     )
     parser.add_argument(
         "--touchanything-semantic-verification-mode",
         choices=("inherit", "off", "report", "filter"),
         default="off",
-        help=(
-            "TouchAnything default: disable glove/bare verifier replay because both "
-            "query hands are gloved. Native prompt score and temporal filtering remain active."
-        ),
-    )
-    parser.add_argument(
-        "--glove-verification-prompts",
-        default="auto",
-    )
-    parser.add_argument(
-        "--bare-verification-prompts",
-        default="auto",
-    )
-    parser.add_argument(
-        "--bare-verification-prompt",
-        default=None,
-        help="Legacy additional negative verifier prompt.",
-    )
-    parser.add_argument("--bare-match-iou-floor", type=float, default=0.70)
-    parser.add_argument("--min-glove-verifier-fraction", type=float, default=0.10)
-    parser.add_argument("--semantic-match-centroid-ratio", type=float, default=0.25)
-    parser.add_argument("--max-bare-evidence-fraction", type=float, default=0.0)
-    parser.add_argument(
-        "--bare-rejection-policy",
-        choices=("hard", "bare_only", "off"),
-        default="off",
-        help="How bare verifier evidence is converted into rejection; off keeps bare votes diagnostic-only.",
-    )
-    parser.add_argument("--allow-missing-prompt-score", action="store_true")
-    parser.add_argument("--temporal-max-frame-gap", type=int, default=1)
-    parser.add_argument("--temporal-center-residual-ratio", type=float, default=0.75)
-    parser.add_argument("--temporal-area-ratio", type=float, default=3.0)
-    parser.add_argument("--temporal-neighbor-iou-floor", type=float, default=0.10)
-    parser.add_argument("--temporal-return-excursion-frames", type=int, default=0)
-    parser.add_argument(
-        "--flow-assist",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Add conservative bidirectional LK validation after SAM track selection.",
-    )
-    parser.add_argument(
-        "--flow-bridge-policy",
-        choices=("off", "short_bridge"),
-        default="off",
-    )
-    parser.add_argument("--flow-max-gap", type=int, default=5)
-    parser.add_argument("--flow-fb-error", type=float, default=1.5)
-    parser.add_argument("--flow-min-points", type=int, default=12)
-    parser.add_argument("--flow-min-inlier-ratio", type=float, default=0.60)
-    parser.add_argument("--flow-min-confidence", type=float, default=0.45)
-    parser.add_argument("--flow-sam-iou-accept", type=float, default=0.50)
-    parser.add_argument("--flow-conflict-iou", type=float, default=0.15)
-    parser.add_argument("--flow-cache-frames", type=int, default=16)
-    preview_group = parser.add_mutually_exclusive_group()
-    preview_group.add_argument("--mask-previews", dest="mask_previews", action="store_true")
-    preview_group.add_argument("--no-mask-previews", dest="mask_previews", action="store_false")
-    parser.set_defaults(mask_previews=None)
-    rgb_group = parser.add_mutually_exclusive_group()
-    rgb_group.add_argument(
-        "--input-rgb-samples",
-        dest="input_rgb_samples",
-        action="store_true",
-    )
-    rgb_group.add_argument(
-        "--no-input-rgb-samples",
-        dest="input_rgb_samples",
-        action="store_false",
-    )
-    parser.set_defaults(input_rgb_samples=None)
-    parser.add_argument(
-        "--semantic-debug",
-        action="store_true",
-        help="Write per-observation match evidence and raw verifier previews for pilot review.",
+        help="TouchAnything skips glove/bare verifier replay by default.",
     )
     parser.add_argument(
         "--reload-predictor-per-job",
         action="store_true",
-        help="Fallback for a SAM build that cannot reuse a predictor across videos; disabled by default.",
+        help="Reload SAM for every sequence instead of reusing one predictor per worker.",
     )
-    parser.add_argument(
-        "--offload-video-to-cpu",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Keep decoded source frames on CPU to reduce long-video VRAM growth.",
-    )
-    parser.add_argument(
-        "--offload-state-to-cpu",
-        choices=("auto", "always", "never"),
-        default="auto",
-    )
-    parser.add_argument("--long-video-offload-frames", type=int, default=256)
-    parser.add_argument("--video-chunk-frames", type=int, default=256)
-    parser.add_argument("--video-chunk-overlap", type=int, default=32)
-    parser.add_argument(
-        "--chunk-staging-root",
-        default="auto",
-        help="auto uses /dev/shm for bounded per-session frame chunks.",
-    )
-    parser.add_argument("--chunk-jpeg-quality", type=int, default=95)
-    parser.add_argument("--chunk-encode-workers", type=int, default=4)
-    parser.add_argument(
-        "--cache-staged-chunks",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    parser.add_argument(
-        "--empty-cache-between-chunks",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    parser.add_argument(
-        "--chunk-continuity",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    parser.add_argument("--chunk-carry-min-score", type=float, default=0.60)
-    parser.add_argument("--chunk-carry-sessions", type=int, default=2)
-    parser.add_argument(
-        "--chunk-fragment-reentry",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    parser.add_argument(
-        "--continuous-state-memory",
-        choices=("native", "bounded"),
-        default="native",
-        help="Bound input and inference history while preserving one continuous session.",
-    )
-    parser.add_argument("--continuous-state-retain-frames", type=int, default=64)
-    parser.add_argument("--continuous-state-log-interval", type=int, default=256)
-    parser.add_argument("--continuous-input-cache-frames", type=int, default=4)
-    parser.add_argument("--opentouch-redetect-frames", type=int, default=96)
-    parser.add_argument("--opentouch-redetect-overlap", type=int, default=24)
     parser.add_argument(
         "--opentouch-materialization",
         choices=("stream", "lazy", "eager"),
         default="stream",
-        help=(
-            "stream copies only the active HDF5 chunk to RAM; lazy/eager retain the "
-            "legacy per-sequence JPEG materialization paths."
-        ),
+        help="stream copies only the active HDF5 chunk to RAM.",
     )
     parser.add_argument(
         "--keep-materialized-opentouch",
@@ -341,10 +150,9 @@ def parse_args() -> argparse.Namespace:
         "--materialization-min-free-gb",
         type=float,
         default=1.0,
-        help="Abort and clean the active OpenTouch sequence before free space drops below this value.",
+        help="Abort before materialization exhausts the target filesystem.",
     )
     parser.add_argument("--manifest-only", action="store_true")
-    parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
 

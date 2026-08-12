@@ -1,4 +1,10 @@
-# Tactile Infiller Pipeline
+# Tactile Infiller Pipeline (Historical)
+
+> This directory is documentation-only. The original prototype depended on a
+> retired MLP/legacy5 interface, used identity-like inputs that conflict with
+> the anonymous-query contract, and did not model real timestamp deltas. Its
+> executable code was removed during the 2026-08 cleanup. Any future temporal
+> model should be rebuilt on the current FullGrid/ReZero baseline.
 
 This directory is intentionally isolated from `hamer_tactile_ft`. The old path still trains a single-frame bbox-crop tactile regressor. This path trains a sequence-level infiller that can learn from sparse hand detections.
 

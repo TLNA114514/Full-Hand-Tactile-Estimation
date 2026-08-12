@@ -1,0 +1,29 @@
+# Shared source-sync exclusions. Runtime assets live on the machine that
+# creates them and must survive rsync --delete.
+- .git/
+- __pycache__/
+- *.pyc
+- *.pem
+- .nfs*
+- .DS_Store
+- _DATA/
+- *checkpoint*
+- *ckpt*
+- *weights*
+- *.ckpt
+- *.pt
+- *.pth
+- *.pkl
+- wandb/
+- logs/
+- lightning_logs/
+- hdf5_manifest_cache/
+- eval_reports*
+- data_integrity_audits/
+- input_prior_audits/
+- memorization/
+- outputs/
+- cache/
+- sidecars/
+- models/
+- envs/

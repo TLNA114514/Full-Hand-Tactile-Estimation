@@ -3,8 +3,18 @@ import os
 import argparse
 import csv
 import json
+import queue as queue_module
 import traceback
 import multiprocessing as mp
+import hashlib
+
+from process_lifecycle import (
+    configure_supervised_process,
+    initialize_worker_parent_death_signal,
+)
+
+configure_supervised_process()
+
 import numpy as np
 import torch
 torch.set_float32_matmul_precision('high')
@@ -21,6 +31,7 @@ if _gpus:
     os.environ["CUDA_VISIBLE_DEVICES"] = _gpus
 
 base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.append(base_dir)
 sys.path.append(os.path.join(base_dir, 'hamer'))
 sys.path.append(os.path.join(base_dir, 'evaluation'))
 sys.path.append(os.path.join(base_dir, 'hamer_tactile_ft'))
@@ -31,6 +42,7 @@ from train import _load_checkpoint
 from train import file_sha256
 from train import load_compatible_state_dict
 from train import resolve_data_dirs
+from hamer_tactile import parse_input_resolution
 from dataset import OpenTouchTactileDataset, canonical_dataset_filter
 from tactile_metrics import (
     CompactTouchAnythingProtocolAccumulator,
@@ -94,17 +106,20 @@ FRAME_DIAG_KEYS = (
     "false_high_gt005_pred05_excess_volume",
     "false_high_gt05_pred03_count",
     "false_high_gt05_pred03_excess_volume",
-    "base_prediction_available",
-    "base_pred_volume",
-    "base_false_high_gt005_pred03_count",
-    "base_false_high_gt005_pred03_excess_volume",
-    "base_false_high_gt05_pred03_count",
-    "base_false_high_gt05_pred03_excess_volume",
-    "base_catastrophic_over",
-    "residual_created_catastrophic_over",
-    "residual_corrected_catastrophic_over",
 )
-FRAME_PROVENANCE_KEYS = ("sample_dir", "dataset", "hand", "worker_rank")
+FRAME_PROVENANCE_KEYS = (
+    "sample_dir",
+    "sample_ref",
+    "sequence_key",
+    "frame_idx",
+    "query_alias",
+    "h5_path",
+    "frame_row",
+    "query_row",
+    "dataset",
+    "hand",
+    "worker_rank",
+)
 CATASTROPHIC_OVER_GT_MAX = 10.0
 CATASTROPHIC_OVER_PRED_MIN = 300.0
 CATASTROPHIC_UNDER_GT_MIN = 150.0
@@ -148,6 +163,176 @@ def _report_path(args):
     if not filename.endswith(".txt"):
         filename += ".txt"
     return os.path.join(report_dir, filename)
+
+
+def _prepare_prediction_export(args):
+    if not args.prediction_output_dir:
+        return
+    output_root = Path(args.prediction_output_dir)
+    shard_root = output_root / "shards"
+    shard_root.mkdir(parents=True, exist_ok=True)
+    for path in shard_root.glob("worker_*.npz"):
+        path.unlink()
+    for name in ("prediction_config.json", "_COMPLETE"):
+        path = output_root / name
+        if path.exists():
+            path.unlink()
+
+
+def _finalize_prediction_export(args, sample_records):
+    if not args.prediction_output_dir:
+        return None
+    output_root = Path(args.prediction_output_dir)
+    shard_paths = sorted((output_root / "shards").glob("worker_*.npz"))
+    if not shard_paths:
+        raise RuntimeError(f"Prediction export produced no shards under {output_root}")
+
+    observed_indices = []
+    observed_uids = []
+    prediction_width = None
+    for shard_path in shard_paths:
+        with np.load(shard_path, allow_pickle=False) as shard:
+            indices = np.asarray(shard["indices"], dtype=np.int64)
+            predictions = np.asarray(shard["predictions"])
+            sample_uids = np.asarray(shard["sample_uids"], dtype=str)
+        if predictions.ndim != 2 or len(indices) != len(predictions):
+            raise RuntimeError(f"Malformed prediction shard: {shard_path}")
+        if len(sample_uids) != len(indices):
+            raise RuntimeError(f"UID count differs from predictions: {shard_path}")
+        if prediction_width is None:
+            prediction_width = int(predictions.shape[1])
+        elif prediction_width != int(predictions.shape[1]):
+            raise RuntimeError("Prediction width differs between worker shards")
+        observed_indices.append(indices)
+        observed_uids.append(sample_uids)
+
+    indices = np.concatenate(observed_indices)
+    sample_uids = np.concatenate(observed_uids)
+    order = np.argsort(indices, kind="stable")
+    indices = indices[order]
+    sample_uids = sample_uids[order]
+    expected_indices = np.arange(len(sample_records), dtype=np.int64)
+    if not np.array_equal(indices, expected_indices):
+        raise RuntimeError(
+            "Prediction export does not cover the exact sample manifest once: "
+            f"expected={len(expected_indices)}, observed={len(indices)}"
+        )
+    expected_uids = np.asarray(
+        [str(record.get("sample_uid", "")) for record in sample_records], dtype=str
+    )
+    if not np.array_equal(sample_uids, expected_uids):
+        mismatch = int(np.flatnonzero(sample_uids != expected_uids)[0])
+        raise RuntimeError(
+            "Prediction export UID order differs from the exact sample manifest at "
+            f"index {mismatch}: observed={sample_uids[mismatch]!r}, "
+            f"expected={expected_uids[mismatch]!r}"
+        )
+
+    manifest_path = Path(args.sample_records_jsonl).resolve(strict=True)
+    config = {
+        "schema": "tactile_exact_prediction_shards_v1",
+        "status": "complete",
+        "sample_records": str(manifest_path),
+        "sample_records_sha256": file_sha256(manifest_path),
+        "record_count": len(sample_records),
+        "prediction_width": prediction_width,
+        "prediction_dtype": "float16",
+        "checkpoint": str(Path(args.checkpoint).resolve(strict=True)),
+        "checkpoint_sha256": file_sha256(args.checkpoint),
+        "shards": [str(path) for path in shard_paths],
+    }
+    config_path = output_root / "prediction_config.json"
+    temporary = output_root / f".prediction_config.{os.getpid()}.tmp"
+    temporary.write_text(
+        json.dumps(config, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, config_path)
+    complete_path = output_root / "_COMPLETE"
+    temporary = output_root / f"._COMPLETE.{os.getpid()}.tmp"
+    temporary.write_text(config["sample_records_sha256"] + "\n", encoding="utf-8")
+    os.replace(temporary, complete_path)
+    print(
+        f"[prediction-export] complete records={len(sample_records)} root={output_root}",
+        flush=True,
+    )
+    return config
+
+
+def _archive_training_val_metrics(args):
+    output_root = Path(
+        args.eval_output_root or args.report_dir or os.path.dirname(_report_path(args))
+    ).expanduser().resolve(strict=False)
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    checkpoint_path = Path(args.checkpoint).expanduser().resolve(strict=False)
+    checkpoint_root = Path(args.checkpoint_root).expanduser()
+    if not checkpoint_root.is_absolute():
+        checkpoint_root = Path(base_dir) / checkpoint_root
+    candidates = [checkpoint_path.parent / "val_metrics.txt"]
+    if args.exp_name:
+        candidates.append(
+            checkpoint_root.expanduser().resolve(strict=False)
+            / args.exp_name
+            / "val_metrics.txt"
+        )
+    source = next((path for path in candidates if path.is_file()), None)
+    if source is None:
+        raise FileNotFoundError(
+            "Training val_metrics.txt is required for evaluation provenance; "
+            "checked: " + ", ".join(str(path) for path in candidates)
+        )
+
+    source = source.resolve()
+    payload = source.read_bytes()
+    digest = hashlib.sha256(payload).hexdigest()
+    destination = output_root / "val_metrics.txt"
+    if destination.exists():
+        existing_digest = hashlib.sha256(destination.read_bytes()).hexdigest()
+        if existing_digest != digest:
+            raise RuntimeError(
+                "Eval output root already contains val_metrics.txt from a different "
+                f"training run: destination={destination}, existing_sha256="
+                f"{existing_digest}, source_sha256={digest}"
+            )
+    elif destination.resolve(strict=False) != source:
+        temporary = output_root / f".val_metrics.txt.tmp.{os.getpid()}"
+        with temporary.open("wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+
+    record = {
+        "source": str(source),
+        "destination": str(destination),
+        "sha256": digest,
+        "size_bytes": len(payload),
+    }
+    provenance_path = output_root / "val_metrics.provenance.json"
+    provenance_payload = (
+        json.dumps(record, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    ).encode("utf-8")
+    if provenance_path.exists():
+        existing = json.loads(provenance_path.read_text(encoding="utf-8"))
+        if existing.get("sha256") != digest:
+            raise RuntimeError(
+                "Existing val_metrics provenance conflicts with the selected "
+                f"training run: {provenance_path}"
+            )
+    else:
+        temporary = output_root / f".val_metrics.provenance.json.tmp.{os.getpid()}"
+        with temporary.open("wb") as handle:
+            handle.write(provenance_payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, provenance_path)
+    record["provenance"] = str(provenance_path)
+    print(
+        "Archived training validation metrics: "
+        f"{source} -> {destination} (sha256={digest[:12]}...)"
+    )
+    return record
 
 
 def _gpu_ids(value):
@@ -225,13 +410,14 @@ def _resolve_checkpoint_path(args):
     raise FileNotFoundError(f"Could not resolve --ckpt {selector!r} under {exp_dir}.{suffix}")
 
 
-def _load_model_cfg():
+def _load_model_cfg(input_resolution=(256, 192)):
     model_cfg_path = os.path.join(base_dir, 'hamer/_DATA/hamer_ckpts/model_config.yaml')
     model_cfg = get_config(model_cfg_path, update_cachedir=True)
-    if (model_cfg.MODEL.BACKBONE.TYPE == 'vit') and ('BBOX_SHAPE' not in model_cfg.MODEL):
-        model_cfg.defrost()
-        model_cfg.MODEL.BBOX_SHAPE = [192, 256]
-        model_cfg.freeze()
+    height, width = parse_input_resolution(input_resolution)
+    model_cfg.defrost()
+    model_cfg.MODEL.IMAGE_SIZE = height
+    model_cfg.MODEL.BBOX_SHAPE = [width, height]
+    model_cfg.freeze()
     if 'PRETRAINED_WEIGHTS' in model_cfg.MODEL.BACKBONE:
         model_cfg.defrost()
         model_cfg.MODEL.BACKBONE.pop('PRETRAINED_WEIGHTS')
@@ -248,12 +434,16 @@ def _load_model(args, model_cfg, device):
     dino_residual_rms_budget = float(experiment_model_config.get("dino_residual_rms_budget", 0.50))
     pool_layout = str(experiment_model_config.get("pool_layout", "fullgrid32"))
     decoder_dropout_scale = float(experiment_model_config.get("decoder_dropout_scale", 1.0))
+    input_resolution = parse_input_resolution(
+        experiment_model_config.get("input_resolution", (256, 192))
+    )
+    pool_output_channels = int(experiment_model_config.get("pool_output_channels", 32))
     visual_backbone = experiment_model_config.get("visual_backbone", "dinov3_hplus")
     dino_weights = getattr(args, "resolved_backbone_weights", "")
     print(
         f"Tactile config: head={tactile_head_type}, visual_backbone={visual_backbone}, "
         f"backbone_feature_layers={backbone_feature_layers}, "
-        "dino_rezero_source=multilevel"
+        "fusion=multilevel_rezero"
     )
     model = TactileTrainingModule(
         cfg=model_cfg,
@@ -261,18 +451,19 @@ def _load_model(args, model_cfg, device):
         backbone_feature_layers=backbone_feature_layers,
         visual_backbone=visual_backbone,
         dino_weights=dino_weights,
-        dino_rezero_source="multilevel",
         dino_residual_max_scale=dino_residual_max_scale,
         dino_residual_rms_budget=dino_residual_rms_budget,
         pool_layout=pool_layout,
         decoder_dropout_scale=decoder_dropout_scale,
+        input_resolution=input_resolution,
+        pool_output_channels=pool_output_channels,
     )
     model.visual_backbone_model_name = experiment_model_config.get("visual_backbone_model_name", "")
     model.backbone_weights_path = getattr(args, "resolved_backbone_weights", "")
     model.backbone_weights_sha256 = getattr(args, "resolved_backbone_sha256", "")
-    dummy_input = torch.zeros(1, 3, model_cfg.MODEL.IMAGE_SIZE, model_cfg.MODEL.IMAGE_SIZE)
+    dummy_input = torch.zeros(1, 3, *input_resolution)
     with torch.no_grad():
-        dummy_feat = model._extract_tactile_features(dummy_input[:, :, :, 32:-32])
+        dummy_feat = model._extract_tactile_features(dummy_input)
         model.tactile_head(dummy_feat)
         print(f"Tactile head initialized with output dim: {model.tactile_dim}")
 
@@ -301,15 +492,25 @@ def _resolve_experiment_model_metadata(args):
                 "backbone_sha256",
                 "tactile_head_type",
                 "backbone_feature_layers",
-                "dino_rezero_source",
                 "dino_residual_max_scale",
                 "dino_residual_rms_budget",
                 "pool_layout",
+                "input_resolution",
+                "pool_grid_size",
+                "pool_valid_tokens",
+                "decoder_input_dim",
+                "pool_output_channels",
                 "decoder_dropout_scale",
                 "index_schema_version",
                 "index_cache_key",
                 "indexed_sample_count",
                 "index_manifest_sha256",
+                "data_backend",
+                "query_manifest_sha256",
+                "hdf5_schema_version",
+                "hdf5_handle_cache_size",
+                "hdf5_manifest_cache_dir",
+                "hdf5_manifest_cache_key",
                 "bbox_manifest_sha256",
                 "dataset_filter",
                 "bbox_rescale_factor",
@@ -342,6 +543,18 @@ def _resolve_experiment_model_metadata(args):
 
     metadata["visual_backbone"] = visual_backbone
     metadata["backbone_weights"] = str(weights_path)
+    checkpoint_resolution = parse_input_resolution(
+        metadata.get("input_resolution", (256, 192))
+    )
+    if args.input_resolution is not None:
+        requested_resolution = parse_input_resolution(args.input_resolution)
+        if requested_resolution != checkpoint_resolution:
+            raise ValueError(
+                "Explicit --input_resolution conflicts with checkpoint metadata: "
+                f"requested={requested_resolution}, checkpoint={checkpoint_resolution}"
+            )
+    args.input_resolution = checkpoint_resolution
+    metadata["input_resolution"] = list(checkpoint_resolution)
     bbox_rescale_factor = (
         args.bbox_rescale_factor
         if args.bbox_rescale_factor is not None
@@ -412,6 +625,9 @@ def _empty_stats():
         "catastrophic_over_denominator": 0,
         "catastrophic_under_count": 0,
         "catastrophic_under_denominator": 0,
+        "false_high_gt005_pred03_count": 0,
+        "false_high_gt005_pred03_denominator": 0,
+        "false_high_gt005_pred03_excess_volume": 0.0,
         "distribution_viou_sum": 0.0,
         "pred_mass_on_gt_support_sum": 0.0,
         "gt_mass_in_pred_support_sum": 0.0,
@@ -453,6 +669,18 @@ def _stats_summary(
         "pred_gt_volume_ratio": stats["pred_volume"] / max(stats["gt_volume"], 1e-6),
         "active_recall": stats["active_true_positive"] / max(stats["active_gt_count"], 1),
         "bg_false_positive": stats["background_false_positive"] / max(stats["background_count"], 1),
+        "false_high_gt005_pred03_rate": (
+            stats["false_high_gt005_pred03_count"]
+            / max(stats["false_high_gt005_pred03_denominator"], 1)
+        ),
+        "false_high_gt005_pred03_excess_volume_fraction": (
+            stats["false_high_gt005_pred03_excess_volume"]
+            / max(stats["pred_volume"], 1e-6)
+        ),
+        "catastrophic_over_rate": (
+            stats["catastrophic_over_count"]
+            / max(stats["catastrophic_over_denominator"], 1)
+        ),
         "distribution_viou": (
             stats["distribution_viou_sum"] / max(stats["nonempty_location_frame_count"], 1)
         ),
@@ -647,6 +875,12 @@ def _update_stats(stats, pred_tactile, gt_tactile, palm_mask, contact_thr, activ
         np.sum(catastrophic_under_base & (pred_volume_per_frame < CATASTROPHIC_UNDER_PRED_MAX))
     )
     stats["catastrophic_under_denominator"] += int(np.sum(catastrophic_under_base))
+    false_high_mask = (gt < 0.005) & (pred >= 0.3)
+    stats["false_high_gt005_pred03_count"] += int(false_high_mask.sum())
+    stats["false_high_gt005_pred03_denominator"] += int(np.sum(gt < 0.005))
+    stats["false_high_gt005_pred03_excess_volume"] += float(
+        np.maximum(pred - gt, 0.0)[false_high_mask].sum()
+    )
     stats["total_frames"] += int(pred.shape[0])
     stats["total_values"] += int(pred.size)
     stats["abs_sum"] += float(np.abs(diff).sum())
@@ -730,7 +964,7 @@ def _update_stats(stats, pred_tactile, gt_tactile, palm_mask, contact_thr, activ
         )
 
 
-def _frame_metrics(pred, gt, contact_thr, active_thr=0.05, base_pred=None):
+def _frame_metrics(pred, gt, contact_thr, active_thr=0.05):
     pred_bin = pred > contact_thr
     gt_bin = gt > contact_thr
     intersection = float(np.sum(pred_bin & gt_bin))
@@ -790,41 +1024,6 @@ def _frame_metrics(pred, gt, contact_thr, active_thr=0.05, base_pred=None):
         mask = (gt < gt_max) & (pred >= pred_min)
         metrics[f"false_high_{label}_count"] = float(np.sum(mask))
         metrics[f"false_high_{label}_excess_volume"] = float(np.maximum(pred - gt, 0.0)[mask].sum())
-    metrics.update(
-        {
-            "base_prediction_available": 0.0,
-            "base_pred_volume": -1.0,
-            "base_false_high_gt005_pred03_count": 0.0,
-            "base_false_high_gt005_pred03_excess_volume": 0.0,
-            "base_false_high_gt05_pred03_count": 0.0,
-            "base_false_high_gt05_pred03_excess_volume": 0.0,
-            "base_catastrophic_over": 0.0,
-            "residual_created_catastrophic_over": 0.0,
-            "residual_corrected_catastrophic_over": 0.0,
-        }
-    )
-    if base_pred is not None:
-        base_volume = float(base_pred.sum())
-        fused_catastrophic = gt_volume < CATASTROPHIC_OVER_GT_MAX and pred_volume > CATASTROPHIC_OVER_PRED_MIN
-        base_catastrophic = gt_volume < CATASTROPHIC_OVER_GT_MAX and base_volume > CATASTROPHIC_OVER_PRED_MIN
-        metrics["base_prediction_available"] = 1.0
-        metrics["base_pred_volume"] = base_volume
-        for label, gt_max, pred_min in (
-            ("gt005_pred03", 0.005, 0.3),
-            ("gt05_pred03", 0.05, 0.3),
-        ):
-            mask = (gt < gt_max) & (base_pred >= pred_min)
-            metrics[f"base_false_high_{label}_count"] = float(np.sum(mask))
-            metrics[f"base_false_high_{label}_excess_volume"] = float(
-                np.maximum(base_pred - gt, 0.0)[mask].sum()
-            )
-        metrics["base_catastrophic_over"] = float(base_catastrophic)
-        metrics["residual_created_catastrophic_over"] = float(
-            fused_catastrophic and not base_catastrophic
-        )
-        metrics["residual_corrected_catastrophic_over"] = float(
-            base_catastrophic and not fused_catastrophic
-        )
     return metrics
 
 
@@ -838,16 +1037,12 @@ def _update_diagnostics(
     max_frames,
     frame_records,
     worker_rank,
-    base_pred_tactile=None,
 ):
     if pred_tactile.shape[0] == 0:
         return
 
     pred = pred_tactile[:, palm_mask] if palm_mask is not None else pred_tactile
     gt = gt_tactile[:, palm_mask] if palm_mask is not None else gt_tactile
-    base_pred = None
-    if base_pred_tactile is not None:
-        base_pred = base_pred_tactile[:, palm_mask] if palm_mask is not None else base_pred_tactile
     flat_pred = np.clip(pred.reshape(-1).astype(np.float32), 0.0, 1.0)
     flat_gt = np.clip(gt.reshape(-1).astype(np.float32), 0.0, 1.0)
     flat_err = flat_pred - flat_gt
@@ -891,19 +1086,29 @@ def _update_diagnostics(
                 bin_idx[tail], weights=gt_values[tail], minlength=n_bins
             )
 
-    if base_pred is None:
-        frame_metrics = [_frame_metrics(p, g, contact_thr, active_thr=active_thr) for p, g in zip(pred, gt)]
-    else:
-        frame_metrics = [
-            _frame_metrics(p, g, contact_thr, active_thr=active_thr, base_pred=b)
-            for p, g, b in zip(pred, gt, base_pred)
-        ]
+    frame_metrics = [
+        _frame_metrics(p, g, contact_thr, active_thr=active_thr)
+        for p, g in zip(pred, gt)
+    ]
     for key in FRAME_DIAG_KEYS:
         diagnostics["frame"][key].append(np.asarray([item[key] for item in frame_metrics], dtype=np.float32))
     if len(frame_records) != len(frame_metrics):
         raise RuntimeError(f"Frame provenance mismatch: {len(frame_records)} records for {len(frame_metrics)} metrics")
     provenance_values = {
         "sample_dir": [str(record.get("sample_dir", "")) for record in frame_records],
+        "sample_ref": [
+            str(record.get("sample_ref", record.get("sample_dir", "")))
+            for record in frame_records
+        ],
+        "sequence_key": [str(record.get("sequence_key", "")) for record in frame_records],
+        "frame_idx": [int(record.get("frame_idx", 0) or 0) for record in frame_records],
+        "query_alias": [
+            str(record.get("query_alias", record.get("hand", "")))
+            for record in frame_records
+        ],
+        "h5_path": [str(record.get("h5_path", "")) for record in frame_records],
+        "frame_row": [int(record.get("frame_row", -1)) for record in frame_records],
+        "query_row": [int(record.get("query_row", -1)) for record in frame_records],
         "dataset": [str(record.get("dataset", "")) for record in frame_records],
         "hand": [str(record.get("hand", "")) for record in frame_records],
         "worker_rank": [int(worker_rank)] * len(frame_records),
@@ -1540,7 +1745,7 @@ def _evaluate_sample_records(args, data_dirs, sample_records, worker_rank=0, sho
     if torch.cuda.is_available():
         torch.cuda.set_device(worker_rank)
 
-    model_cfg = _load_model_cfg()
+    model_cfg = _load_model_cfg(args.input_resolution)
     model = _load_model(args, model_cfg, device)
     dataset = OpenTouchTactileDataset(
         model_cfg,
@@ -1549,14 +1754,21 @@ def _evaluate_sample_records(args, data_dirs, sample_records, worker_rank=0, sho
         train=False,
         sample_records=sample_records,
         tactile_only=True,
+        input_resolution=args.input_resolution,
         bbox_rescale_factor=args.bbox_rescale_factor,
         bbox_source_policy=args.bbox_source_policy,
+        data_backend=args.data_backend,
+        query_manifests=args.query_manifests,
+        hdf5_handle_cache_size=args.hdf5_handle_cache_size,
+        hdf5_manifest_cache_dir=args.hdf5_manifest_cache_dir,
+        lazy_index_records=(args.data_backend != "legacy_dirs"),
     )
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
+        worker_init_fn=initialize_worker_parent_death_signal,
         drop_last=False,
     )
 
@@ -1565,6 +1777,9 @@ def _evaluate_sample_records(args, data_dirs, sample_records, worker_rank=0, sho
     touchanything_protocol_stats = CompactTouchAnythingProtocolAccumulator()
     palm_mask = None
     sample_cursor = 0
+    exported_indices = []
+    exported_predictions = []
+    exported_sample_uids = []
     iterator = tqdm(dataloader, desc=f"GPU {worker_rank} Evaluating", position=worker_rank) if show_progress else dataloader
     for batch in iterator:
         raw_batch_size = len(batch["dataset"]) if isinstance(batch.get("dataset"), (list, tuple)) else int(batch["img"].shape[0])
@@ -1583,13 +1798,31 @@ def _evaluate_sample_records(args, data_dirs, sample_records, worker_rank=0, sho
             out = model.forward_step(batch, train=False)
 
         pred_tactile = out['pred_tactile'].detach().cpu().numpy()[valid_tactile_mask]
-        base_pred_tactile = None
-        if "pred_tactile_base" in out:
-            base_pred_tactile = out["pred_tactile_base"].detach().cpu().numpy()[valid_tactile_mask]
         gt_tactile = batch['tactile_signal'].detach().cpu().numpy()[valid_tactile_mask]
         valid_records = [
             record for record, is_valid in zip(batch_records, valid_tactile_mask) if is_valid
         ]
+        if args.prediction_output_dir:
+            missing_indices = [
+                record.get("sample_uid", "")
+                for record in valid_records
+                if record.get("_artifact_index") is None
+            ]
+            if missing_indices:
+                raise RuntimeError(
+                    "--prediction_output_dir requires _artifact_index in every exact "
+                    f"sample record; first missing sample={missing_indices[0]!r}"
+                )
+            exported_indices.append(
+                np.asarray(
+                    [int(record["_artifact_index"]) for record in valid_records],
+                    dtype=np.int64,
+                )
+            )
+            exported_predictions.append(pred_tactile.astype(np.float16, copy=False))
+            exported_sample_uids.extend(
+                str(record.get("sample_uid", "")) for record in valid_records
+            )
         _update_stats(
             stats,
             pred_tactile,
@@ -1637,7 +1870,6 @@ def _evaluate_sample_records(args, data_dirs, sample_records, worker_rank=0, sho
                 args.diagnostic_max_frames,
                 valid_records,
                 worker_rank,
-                base_pred_tactile=base_pred_tactile,
             )
     if args.save_diagnostics or args.save_visualizations:
         for key in FRAME_DIAG_KEYS:
@@ -1653,6 +1885,37 @@ def _evaluate_sample_records(args, data_dirs, sample_records, worker_rank=0, sho
             )
         _trim_frame_diagnostics(diagnostics, args.diagnostic_max_frames, seed=2026 + int(worker_rank))
 
+    if args.prediction_output_dir:
+        output_root = Path(args.prediction_output_dir)
+        shard_root = output_root / "shards"
+        shard_root.mkdir(parents=True, exist_ok=True)
+        indices = (
+            np.concatenate(exported_indices)
+            if exported_indices
+            else np.zeros(0, dtype=np.int64)
+        )
+        predictions = (
+            np.concatenate(exported_predictions, axis=0)
+            if exported_predictions
+            else np.zeros((0, 13614), dtype=np.float16)
+        )
+        if len(indices) != len(predictions) or len(indices) != len(exported_sample_uids):
+            raise RuntimeError("Prediction artifact arrays have inconsistent lengths")
+        order = np.argsort(indices, kind="stable")
+        target = shard_root / f"worker_{int(worker_rank):02d}.npz"
+        temporary = target.with_name(f".{target.stem}.{os.getpid()}.tmp.npz")
+        np.savez(
+            temporary,
+            indices=indices[order],
+            predictions=predictions[order],
+            sample_uids=np.asarray(exported_sample_uids, dtype=str)[order],
+        )
+        os.replace(temporary, target)
+        print(
+            f"[prediction-export] worker={worker_rank} records={len(indices)} path={target}",
+            flush=True,
+        )
+
     return {
         "stats": stats,
         "diagnostics": diagnostics,
@@ -1661,6 +1924,7 @@ def _evaluate_sample_records(args, data_dirs, sample_records, worker_rank=0, sho
 
 
 def _eval_worker(rank, args, data_dirs, sample_records, queue):
+    initialize_worker_parent_death_signal()
     try:
         result = _evaluate_sample_records(
             args,
@@ -1698,7 +1962,11 @@ def _loss_config_summary(args):
     return f"{source} | {compact}"
 
 
-def _format_report(args, stats, touchanything_protocol_stats):
+def _format_report(
+    args,
+    stats,
+    touchanything_protocol_stats,
+):
     if stats["total_frames"] == 0 or stats["total_values"] == 0:
         return None
 
@@ -1753,6 +2021,9 @@ def _format_report(args, stats, touchanything_protocol_stats):
         f" Resolved Ckpt : {args.checkpoint}",
         f" Symlink Target: {checkpoint_target or 'N/A'}",
         f" Head Type     : {model_metadata.get('tactile_head_type', 'dense_v2_dino_rezero')}",
+        f" Input HxW     : {args.input_resolution[0]}x{args.input_resolution[1]}",
+        f" Patch Grid    : {model_metadata.get('pool_grid_size', 'legacy-default')}",
+        f" Spatial Tokens: {model_metadata.get('pool_valid_tokens', 'legacy-default')}",
         f" BBox Rescale  : {args.bbox_rescale_factor:g}",
         f" BBox Source   : {args.bbox_source_policy}",
         f" Pool Layout   : {model_metadata.get('pool_layout', 'fullgrid32')}",
@@ -1885,6 +2156,12 @@ def main():
     parser.add_argument('--gpu', '--gpus', dest='gpu', type=str, default='4')
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument(
+        '--input_resolution',
+        type=str,
+        default=None,
+        help='Optional HEIGHTxWIDTH assertion; must match checkpoint metadata.',
+    )
+    parser.add_argument(
         '--bbox_rescale_factor',
         type=float,
         default=None,
@@ -1902,7 +2179,31 @@ def main():
         default=None,
         help='Optional comma-separated reviewed SAM3 bbox manifests; checkpoint metadata is used by default.',
     )
-    parser.add_argument('--num_workers', type=int, default=8)
+    parser.add_argument('--num_workers', type=int, default=32)
+    parser.add_argument(
+        '--data_backend',
+        choices=('auto', 'legacy_dirs', 'sequence_hdf5'),
+        default='auto',
+        help='Storage backend; auto prefers sequence-HDF5 manifests under each processed root.',
+    )
+    parser.add_argument(
+        '--query_manifests',
+        type=str,
+        default='',
+        help='Optional comma-separated sequence-HDF5 query manifests.',
+    )
+    parser.add_argument(
+        '--hdf5_handle_cache_size',
+        type=int,
+        default=4,
+        help='Maximum read-only sequence HDF5 handles retained by each DataLoader worker.',
+    )
+    parser.add_argument(
+        '--hdf5_manifest_cache_dir',
+        type=str,
+        default=os.path.join(base_dir, 'hamer_tactile_ft', 'hdf5_manifest_cache'),
+        help='Shared mmap cache for normalized HDF5 query-manifest rows.',
+    )
     parser.add_argument('--contact_thr', type=float, default=0.05, help='Threshold for defining contact (0-1)')
     parser.add_argument('--active_pressure_thr', type=float, default=0.05)
     parser.add_argument('--background_pressure_thr', type=float, default=0.02)
@@ -1939,14 +2240,46 @@ def main():
         ),
         help='Verified audit CSV used to build compact indexes without rescanning sample dirs.',
     )
+    parser.add_argument(
+        '--sample_records_jsonl',
+        type=str,
+        default='',
+        help=(
+            'Optional exact normalized sample-record subset. This bypasses full index/query '
+            'manifest enumeration and is intended for deterministic train-fit probes.'
+        ),
+    )
+    parser.add_argument(
+        '--prediction_output_dir',
+        type=str,
+        default='',
+        help=(
+            'Optional atomic NPZ shard output for exact-subset predictions. '
+            'Every sample record must contain a unique _artifact_index.'
+        ),
+    )
     parser.add_argument('--index_cache_dir', type=str, default=os.path.join(base_dir, "hamer_tactile_ft", "index_cache"))
-    parser.add_argument('--rebuild_index', action='store_true')
+    parser.add_argument(
+        '--rebuild_index',
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help='Force index-cache reconstruction; disabled by default.',
+    )
     parser.add_argument('--index_cache_timeout', type=int, default=3600)
     parser.add_argument(
         '--report_dir',
         type=str,
         default=None,
         help='Directory for evaluation reports. Defaults to eval_reports_{exp_name}_{ckpt} when --exp_name is set.',
+    )
+    parser.add_argument(
+        '--eval_output_root',
+        type=str,
+        default=None,
+        help=(
+            'Root shared by all tasks/checkpoints in one eval matrix. Training '
+            'val_metrics.txt is archived here atomically.'
+        ),
     )
     parser.add_argument(
         '--report_name',
@@ -1969,12 +2302,30 @@ def main():
         parser.error("--touchanything_min_contact_ratio must lie in [0, 1]")
 
     # Resolve every user-facing filesystem input before worker processes spawn.
-    for name in ("dino_weights", "report_dir", "diagnostics_dir", "index_cache_dir", "index_manifest"):
+    for name in (
+        "dino_weights",
+        "report_dir",
+        "eval_output_root",
+        "diagnostics_dir",
+        "index_cache_dir",
+        "hdf5_manifest_cache_dir",
+        "index_manifest",
+        "prediction_output_dir",
+    ):
         value = getattr(args, name, None)
         if value:
             setattr(args, name, _resolve_invocation_path(value))
+    if args.query_manifests:
+        args.query_manifests = ",".join(
+            _resolve_invocation_path(path.strip())
+            for path in str(args.query_manifests).split(",")
+            if path.strip()
+        )
+    if int(args.hdf5_handle_cache_size) < 1:
+        parser.error("--hdf5_handle_cache_size must be at least 1")
     args.checkpoint = _resolve_checkpoint_path(args)
     _resolve_experiment_model_metadata(args)
+    args.training_val_metrics_archive = _archive_training_val_metrics(args)
     print(f"Resolved checkpoint: {args.checkpoint}")
 
     data_dirs = resolve_data_dirs(args)
@@ -1986,7 +2337,35 @@ def main():
     world_size = len(gpu_ids) if torch.cuda.is_available() and len(gpu_ids) > 0 else 1
 
     print(f"📦 加载 {args.split} 划分集...")
-    model_cfg = _load_model_cfg()
+    model_cfg = _load_model_cfg(args.input_resolution)
+    sample_records = None
+    if args.sample_records_jsonl:
+        sample_manifest = Path(args.sample_records_jsonl).expanduser().resolve(strict=True)
+        sample_records = []
+        with sample_manifest.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                if not isinstance(record, dict):
+                    raise ValueError(
+                        f"{sample_manifest}:{line_number}: sample record must be a JSON object"
+                    )
+                record_split = str(record.get("split", args.split))
+                if record_split != args.split:
+                    raise ValueError(
+                        f"{sample_manifest}:{line_number}: split={record_split!r} does not "
+                        f"match --split={args.split!r}"
+                    )
+                sample_records.append(record)
+        if not sample_records:
+            raise RuntimeError(f"Exact sample manifest is empty: {sample_manifest}")
+        print(
+            f"Using exact sample subset: {sample_manifest} ({len(sample_records)} records)",
+            flush=True,
+        )
+
     dataset = OpenTouchTactileDataset(
         model_cfg,
         split=args.split,
@@ -1995,20 +2374,32 @@ def main():
         index_workers=args.index_workers,
         index_chunksize=args.index_chunksize,
         index_backend=args.index_backend,
+        sample_records=sample_records,
         index_process_worker_cap=args.index_process_worker_cap,
         index_manifest=args.index_manifest,
         index_cache_dir=args.index_cache_dir,
         rebuild_index=args.rebuild_index,
         index_cache_timeout=args.index_cache_timeout,
+        input_resolution=args.input_resolution,
         bbox_rescale_factor=args.bbox_rescale_factor,
         bbox_source_policy=args.bbox_source_policy,
         bbox_manifests=args.bbox_manifests,
         expected_datasets=canonical_dataset_filter(args.datasets),
+        data_backend=args.data_backend,
+        query_manifests=args.query_manifests,
+        hdf5_handle_cache_size=args.hdf5_handle_cache_size,
+        hdf5_manifest_cache_dir=args.hdf5_manifest_cache_dir,
+        lazy_index_records=(args.data_backend != "legacy_dirs"),
     )
 
     if len(dataset) == 0:
         print("❌ 评估集为空。请检查 --datasets/--data_dir 和 --split。")
         return
+
+    if args.prediction_output_dir:
+        if not args.sample_records_jsonl:
+            parser.error("--prediction_output_dir requires --sample_records_jsonl")
+        _prepare_prediction_export(args)
 
     print(f"🔔 开始极速评估推理 | samples={len(dataset)} | GPUs={world_size} | batch_size/GPU={args.batch_size}")
     if world_size <= 1:
@@ -2016,24 +2407,60 @@ def main():
     else:
         shards = [dataset.samples[rank::world_size] for rank in range(world_size)]
         ctx = mp.get_context("spawn")
-        queue = ctx.Queue()
+        result_queue = ctx.Queue()
         procs = []
         for rank, shard in enumerate(shards):
-            proc = ctx.Process(target=_eval_worker, args=(rank, args, data_dirs, shard, queue))
+            proc = ctx.Process(
+                target=_eval_worker,
+                args=(rank, args, data_dirs, shard, result_queue),
+            )
             proc.start()
             procs.append(proc)
 
         worker_results = []
         errors = []
-        for _ in procs:
-            rank, result_item, error = queue.get()
-            if error:
-                errors.append((rank, error))
-            else:
-                worker_results.append(result_item)
-
-        for proc in procs:
-            proc.join()
+        pending_ranks = set(range(len(procs)))
+        try:
+            while pending_ranks:
+                try:
+                    rank, result_item, error = result_queue.get(timeout=1.0)
+                except queue_module.Empty:
+                    failed_without_result = [
+                        rank
+                        for rank in pending_ranks
+                        if procs[rank].exitcode is not None
+                    ]
+                    for rank in failed_without_result:
+                        errors.append(
+                            (
+                                rank,
+                                f"Worker exited without returning a result "
+                                f"(exitcode={procs[rank].exitcode}).",
+                            )
+                        )
+                        pending_ranks.remove(rank)
+                    if errors:
+                        break
+                    continue
+                pending_ranks.discard(rank)
+                if error:
+                    errors.append((rank, error))
+                else:
+                    worker_results.append(result_item)
+                if errors:
+                    break
+        finally:
+            if errors:
+                for proc in procs:
+                    if proc.is_alive():
+                        proc.terminate()
+            for proc in procs:
+                proc.join(timeout=5.0)
+                if proc.is_alive():
+                    proc.kill()
+                    proc.join(timeout=2.0)
+            result_queue.close()
+            result_queue.join_thread()
 
         if errors:
             for rank, error in errors:
@@ -2041,9 +2468,15 @@ def main():
             raise RuntimeError("One or more evaluation workers failed.")
         result = _merge_eval_results(worker_results, args.diagnostic_max_frames)
 
+    prediction_export = _finalize_prediction_export(args, dataset.samples)
+
     stats = result["stats"]
 
-    report_text = _format_report(args, stats, result.get("touchanything_protocol_stats", {}))
+    report_text = _format_report(
+        args,
+        stats,
+        result.get("touchanything_protocol_stats", {}),
+    )
     if report_text is None:
         print("❌ 未产生任何有效的评估指标！可能数据集中 has_tactile 都是 0。")
         return
@@ -2097,6 +2530,8 @@ def main():
         "model_config": model_config,
         "report_path": report_path,
         "diagnostics_dir": diagnostics_dir,
+        "training_val_metrics_archive": args.training_val_metrics_archive,
+        "prediction_export": prediction_export,
         "metrics": _stats_summary(
             stats,
             result.get("touchanything_protocol_stats", {}),

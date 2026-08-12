@@ -1,4 +1,5 @@
 import argparse
+import json
 import sys
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
@@ -12,7 +13,7 @@ from preprocess.check_utils import check_array_field, check_required_fields, fil
 
 def sample_files_ok(sample_dir):
     sample_dir = Path(sample_dir)
-    required = ["chest.jpg", "left.jpg", "right.jpg", "meta.json"]
+    required = ["chest.jpg", "meta.json"]
     missing = [name for name in required if not file_nonempty(sample_dir / name)]
     return missing
 

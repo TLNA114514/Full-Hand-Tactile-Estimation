@@ -479,9 +479,10 @@ def write_frame_images(caps, sample_dir):
         if not ret:
             return False
         frames[view] = frame
-    for view, frame in frames.items():
-        cv2.imwrite(str(sample_dir / f"{view}.jpg"), frame)
-    return True
+    # Only the chest view is consumed by tactile training/evaluation. Keep
+    # advancing all source streams for alignment, but do not materialize the
+    # two wrist views in the processed dataset.
+    return bool(cv2.imwrite(str(sample_dir / "chest.jpg"), frames["chest"]))
 
 
 def sample_is_complete(sample_dir):
@@ -489,10 +490,9 @@ def sample_is_complete(sample_dir):
     meta_path = sample_dir / "meta.json"
     if not meta_path.exists():
         return False
-    for view in ("chest", "left", "right"):
-        image_path = sample_dir / f"{view}.jpg"
-        if not image_path.exists() or image_path.stat().st_size <= 0:
-            return False
+    image_path = sample_dir / "chest.jpg"
+    if not image_path.exists() or image_path.stat().st_size <= 0:
+        return False
     try:
         with meta_path.open("r", encoding="utf-8") as f:
             json.load(f)
@@ -566,8 +566,6 @@ def make_frame_meta(clip, frame_idx, bbox_record, pressure_records, pressure_npz
         "jq_pressure_frame_index": raw_pressure.get("frame_index"),
         "views": {
             "chest": "chest.jpg",
-            "left": "left.jpg",
-            "right": "right.jpg",
         },
         "bbox_view": "chest",
         "hands": hands,

@@ -17,10 +17,10 @@ from pathlib import Path
 from typing import Any, Iterator
 
 try:
+    from .cli_args import add_tracking_arguments
     from .flow_assist import FlowAssistConfig, apply_optical_flow_assist
     from .progress import progress as progress_bar
     from .track_selection import (
-        BARE_REJECTION_POLICIES,
         TrackObservation,
         attach_semantic_prompt_votes,
         bbox_iou,
@@ -30,10 +30,10 @@ try:
         stitch_overlapping_chunk_tracks,
     )
 except ImportError:  # Direct script execution from run_pilot.py.
+    from cli_args import add_tracking_arguments
     from flow_assist import FlowAssistConfig, apply_optical_flow_assist
     from progress import progress as progress_bar
     from track_selection import (
-        BARE_REJECTION_POLICIES,
         TrackObservation,
         attach_semantic_prompt_votes,
         bbox_iou,
@@ -58,7 +58,12 @@ CHUNK_CONTINUITY_VERSION = "semantic_box_isolation_v3_fragment_reentry"
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--resource", type=Path, required=True, help="MP4 or JPEG frame directory")
+    parser.add_argument(
+        "--resource",
+        type=Path,
+        required=True,
+        help="MP4 or JPEG frame directory.",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
         "--dataset",
@@ -66,345 +71,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="generic",
     )
     parser.add_argument("--expected-gloved-hands", type=int, default=0)
-    parser.add_argument("--sam-version", choices=("sam3", "sam3.1"), default="sam3")
-    parser.add_argument("--checkpoint", type=Path)
-    parser.add_argument("--prompt-preset", choices=("gloved", "bare"), default="gloved")
-    parser.add_argument("--prompt", help="Override the preset's primary prompt")
+    add_tracking_arguments(parser, preview_policy="track")
     parser.add_argument("--prompt-frame", type=int, default=0)
-    parser.add_argument(
-        "--propagation-direction",
-        choices=("forward", "both"),
-        default="forward",
-        help="Forward is sufficient for the default frame-0 anchor; use both for a deliberate mid-video anchor.",
-    )
-    parser.add_argument("--max-frames", type=int, default=0, help="0 tracks the complete sequence")
-    parser.add_argument("--max-objects", type=int, default=0)
-    parser.add_argument(
-        "--sam-candidate-capacity",
-        type=int,
-        default=0,
-        help="SAM3.1 internal candidate capacity; 0 keeps at least four candidates before prompt-track selection.",
-    )
     parser.add_argument("--mask-threshold", type=float, default=0.5)
-    parser.add_argument("--min-mask-area-ratio", type=float, default=0.0005)
-    parser.add_argument(
-        "--min-prompt-score",
-        type=float,
-        default=0.5,
-        help="Minimum native SAM text-prompt confidence required for a kept frame.",
-    )
-    parser.add_argument(
-        "--min-track-frames",
-        type=int,
-        default=2,
-        help="Minimum number of prompt-conformant frames before a SAM ID becomes a query.",
-    )
-    parser.add_argument("--duplicate-track-iou-floor", type=float, default=0.80)
-    parser.add_argument("--duplicate-track-overlap-fraction", type=float, default=0.60)
-    parser.add_argument("--duplicate-track-match-fraction", type=float, default=0.80)
-    parser.add_argument("--duplicate-track-centroid-ratio", type=float, default=0.18)
-    parser.add_argument("--duplicate-track-area-ratio", type=float, default=1.50)
-    parser.add_argument("--duplicate-track-min-frames", type=int, default=2)
-    parser.add_argument(
-        "--bare-verification-mode",
-        choices=("off", "report", "filter"),
-        default="filter",
-        help=(
-            "Run independent glove and bare verifier prompts. filter requires "
-            "positive glove evidence; bare votes are controlled separately by "
-            "--bare-rejection-policy. report only records their votes."
-        ),
-    )
-    parser.add_argument(
-        "--glove-verification-prompts",
-        default="auto",
-        help=(
-            "Comma-separated independent positive verifier prompts, or auto to use "
-            "the preset's curated verifier subset. The primary preset is unchanged."
-        ),
-    )
-    parser.add_argument(
-        "--bare-verification-prompts",
-        default="auto",
-        help=(
-            "Comma-separated bare-hand diagnostic prompts, or auto to use the "
-            "preset's diagnostic subset. These are not a calibrated glove classifier."
-        ),
-    )
-    parser.add_argument(
-        "--bare-verification-prompt",
-        default=None,
-        help="Legacy additional negative verifier prompt; appended without changing preset order.",
-    )
-    parser.add_argument(
-        "--bare-match-iou-floor",
-        type=float,
-        default=0.70,
-        help="Minimum same-frame bbox IoU used to associate gloved and bare prompt tracks.",
-    )
-    parser.add_argument(
-        "--min-glove-verifier-fraction",
-        type=float,
-        default=0.10,
-        help="Minimum primary-track frame fraction with independent positive glove evidence.",
-    )
-    parser.add_argument(
-        "--semantic-match-centroid-ratio",
-        type=float,
-        default=0.25,
-        help="Maximum verifier/primary centroid distance relative to the smaller bbox diagonal.",
-    )
-    parser.add_argument(
-        "--max-bare-evidence-fraction",
-        type=float,
-        default=0.0,
-        help="Reject a whole locked track when effective bare evidence covers more than this fraction.",
-    )
-    parser.add_argument(
-        "--bare-rejection-policy",
-        choices=BARE_REJECTION_POLICIES,
-        default="off",
-        help=(
-            "hard rejects every matched bare vote; bare_only rejects only bare evidence "
-            "without an independent glove vote; off keeps bare votes diagnostic-only."
-        ),
-    )
-    parser.add_argument(
-        "--allow-missing-prompt-score",
-        action="store_true",
-        help="Diagnostic-only escape hatch when a nonstandard SAM build omits out_probs.",
-    )
-    parser.add_argument(
-        "--temporal-max-frame-gap",
-        type=int,
-        default=1,
-        help="Only compare immediately adjacent observations separated by at most this many frames.",
-    )
-    parser.add_argument(
-        "--temporal-center-residual-ratio",
-        type=float,
-        default=0.75,
-        help="Reject a middle-frame return jump above this fraction of neighbouring hand size.",
-    )
-    parser.add_argument(
-        "--temporal-area-ratio",
-        type=float,
-        default=3.0,
-        help="Reject an isolated return-to-normal mask-area spike above this ratio.",
-    )
-    parser.add_argument(
-        "--temporal-neighbor-iou-floor",
-        type=float,
-        default=0.10,
-        help="Neighbours must agree at least this much before a middle frame is called a return jump.",
-    )
-    parser.add_argument(
-        "--temporal-return-excursion-frames",
-        type=int,
-        default=0,
-        help="Optional legacy return-excursion filter; 0 keeps it disabled.",
-    )
-    parser.add_argument(
-        "--flow-assist",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "Run bidirectional pyramidal-LK motion validation after SAM semantic "
-            "selection. SAM remains authoritative and flow never creates a new track."
-        ),
-    )
-    parser.add_argument(
-        "--flow-bridge-policy",
-        choices=("off", "short_bridge"),
-        default="off",
-        help="Optionally fill only short gaps whose forward/backward flow projections agree.",
-    )
-    parser.add_argument("--flow-max-gap", type=int, default=5)
-    parser.add_argument("--flow-fb-error", type=float, default=1.5)
-    parser.add_argument("--flow-min-points", type=int, default=12)
-    parser.add_argument("--flow-min-inlier-ratio", type=float, default=0.60)
-    parser.add_argument("--flow-min-confidence", type=float, default=0.45)
-    parser.add_argument("--flow-sam-iou-accept", type=float, default=0.50)
-    parser.add_argument("--flow-conflict-iou", type=float, default=0.15)
-    parser.add_argument("--flow-cache-frames", type=int, default=16)
-    parser.add_argument(
-        "--min-relative-mask-area",
-        type=float,
-        default=0.05,
-        help="Legacy compatibility option; no longer used to choose an identity by area.",
-    )
-    parser.add_argument("--preview-fps", type=float, default=0.0, help="0 preserves source FPS")
-    parser.add_argument(
-        "--no-mask-previews",
-        action="store_true",
-        help="Skip raw/final SAM mask videos; bbox JSONL and track audit are still written.",
-    )
-    parser.add_argument(
-        "--input-rgb-samples",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Persist three decoded RGB audit JPEGs; the numeric color audit is always written.",
-    )
-    parser.add_argument(
-        "--semantic-debug",
-        action="store_true",
-        help=(
-            "Write per-observation semantic match evidence and raw verifier-mask videos. "
-            "Use for pilot diagnosis; it adds verifier replay work."
-        ),
-    )
-    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--preview-fps", type=float, default=0.0, help="0 preserves source FPS.")
     parser.add_argument("--no-amp", action="store_true")
-    parser.add_argument(
-        "--offload-video-to-cpu",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Keep decoded source frames on CPU to reduce long-video VRAM growth.",
-    )
-    parser.add_argument(
-        "--offload-state-to-cpu",
-        choices=("auto", "always", "never"),
-        default="auto",
-        help="Offload temporal state; auto enables it for sufficiently long videos.",
-    )
-    parser.add_argument(
-        "--long-video-offload-frames",
-        type=int,
-        default=256,
-        help="Frame threshold used by automatic temporal-state CPU offload.",
-    )
-    parser.add_argument(
-        "--video-chunk-frames",
-        type=int,
-        default=256,
-        help="Maximum frames physically staged into one independent SAM session; 0 disables chunking.",
-    )
-    parser.add_argument(
-        "--video-chunk-overlap",
-        type=int,
-        default=32,
-        help="Overlap between long-video sessions for retrospective track stitching.",
-    )
-    parser.add_argument(
-        "--chunk-staging-root",
-        default="auto",
-        help=(
-            "Temporary root for physical frame chunks. auto prefers /dev/shm so chunk "
-            "JPEGs use RAM rather than filesystem capacity."
-        ),
-    )
-    parser.add_argument(
-        "--chunk-jpeg-quality",
-        type=int,
-        default=95,
-        help="JPEG quality used only when a source MP4 is staged into bounded RAM chunks.",
-    )
-    parser.add_argument(
-        "--chunk-encode-workers",
-        type=int,
-        default=4,
-        help="Bounded CPU JPEG-encoding workers per GPU process for MP4 chunk staging.",
-    )
-    parser.add_argument(
-        "--cache-staged-chunks",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "Reuse byte-identical RAM-staged chunks across primary/verifier/preview "
-            "passes within one sequence job, then delete them."
-        ),
-    )
-    parser.add_argument(
-        "--empty-cache-between-chunks",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Return closed-session CUDA cache between chunks while retaining model weights.",
-    )
-    parser.add_argument(
-        "--chunk-continuity",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "Seed each new chunk with high-confidence boxes from the preceding overlap "
-            "while retaining the text prompt."
-        ),
-    )
-    parser.add_argument(
-        "--chunk-carry-min-score",
-        type=float,
-        default=0.60,
-        help="Minimum native text-prompt score for a box carried into the next chunk.",
-    )
-    parser.add_argument(
-        "--chunk-carry-sessions",
-        type=int,
-        default=2,
-        help=(
-            "Maximum independent SAM sessions used to carry distinct boxes across a "
-            "chunk boundary. SAM3 permits only one initial visual box per session."
-        ),
-    )
-    parser.add_argument(
-        "--chunk-fragment-reentry",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "Retain later prompt-conformant track fragments when they fit unused "
-            "per-frame hand slots. This recovers a hand rediscovered after a chunk "
-            "boundary without allowing excess same-frame boxes."
-        ),
-    )
-    parser.add_argument(
-        "--continuous-state-memory",
-        choices=("native", "bounded"),
-        default="native",
-        help=(
-            "Memory policy for an unchunked continuous SAM session. bounded drops "
-            "already-emitted full-resolution caches and tracker frames that are no "
-            "longer reachable by SAM's finite memory bank."
-        ),
-    )
-    parser.add_argument(
-        "--continuous-state-retain-frames",
-        type=int,
-        default=64,
-        help=(
-            "Minimum recent tracker frames retained in bounded continuous mode; "
-            "architecture-selected high-quality memory frames are retained in addition."
-        ),
-    )
-    parser.add_argument(
-        "--continuous-state-log-interval",
-        type=int,
-        default=256,
-        help="Report rolling-state/RSS statistics every N emitted frames; 0 disables logs.",
-    )
-    parser.add_argument(
-        "--continuous-input-cache-frames",
-        type=int,
-        default=4,
-        help=(
-            "Number of decoded input frames retained by the bounded unchunked loader. "
-            "Frames are decoded lazily from the original video or image directory."
-        ),
-    )
-    parser.add_argument(
-        "--hdf5-source",
-        default=None,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--opentouch-redetect-frames",
-        type=int,
-        default=96,
-        help="OpenTouch-only fresh text re-detection session length; 0 disables it.",
-    )
-    parser.add_argument(
-        "--opentouch-redetect-overlap",
-        type=int,
-        default=24,
-        help="Overlap used to reconnect OpenTouch fresh-detection sessions.",
-    )
+    parser.add_argument("--hdf5-source", default=None, help=argparse.SUPPRESS)
     return parser.parse_args(argv)
 
 

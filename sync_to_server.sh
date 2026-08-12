@@ -14,29 +14,19 @@ SYNC_METHOD="rsync"
 MODE="${1:-sync}"
 
 # SSH 连接参数
-PORT="32504"
-KEY_PATH="/code/users/jiangrui/Full-Hand-Tactile-Estimation/cfzhao.pem"
-REMOTE_USER="ma-user"
-REMOTE_HOST="dev-modelarts.cn-north-11.huaweicloud.com"
-REMOTE_DIR="/home/ma-user/work/cfzhao/"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PORT="${REMOTE_SSH_PORT:-32504}"
+KEY_PATH="${SSH_KEY_PATH:-$SCRIPT_DIR/cfzhao.pem}"
+REMOTE_USER="${REMOTE_SSH_USER:-ma-user}"
+REMOTE_HOST="${REMOTE_SSH_HOST:-dev-modelarts.cn-north-11.huaweicloud.com}"
+REMOTE_DIR="${REMOTE_WORK_ROOT:-/home/ma-user/work/cfzhao/}"
+REMOTE_PROJECT_DIR="${REMOTE_DIR%/}/Full-Hand-Tactile-Estimation"
 
 # 本地项目目录
-SRC_DIR="/code/users/jiangrui/Full-Hand-Tactile-Estimation"
+SRC_DIR="${SYNC_SOURCE_ROOT:-$SCRIPT_DIR}"
 
 RSYNC_EXCLUDES=(
-    --exclude='.git/'
-    --exclude='.nfs*'
-    --exclude='.DS_Store'
-    --exclude='*checkpoint*'
-    --exclude='*ckpt*'
-    --exclude='*weights*'
-    --exclude='*.ckpt'
-    --exclude='*.pt'
-    --exclude='*.pth'
-    --exclude='*.pkl'
-    --exclude='wandb/'
-    --exclude='logs/'
-    --exclude='lightning_logs/'
+    --filter="merge $SRC_DIR/.rsync-filter"
     --exclude='hamer_tactile_ft/touchanything_bboxes_cache/'
     --exclude='hamer_tactile_ft/egotactile_bboxes_cache/'
     --exclude='hamer_tactile_ft/full_bboxes_cache/'
@@ -50,12 +40,9 @@ RSYNC_EXCLUDES=(
     --exclude='hamer_tactile_ft/opentouch_all_bboxes.json'
     --exclude='hamer_tactile_ft/opentouch_test_bboxes.json'
     --exclude='hamer_tactile_ft/dataset_frames_registry.json'
-    --exclude='hamer_tactile_infiller/manifests'
     --exclude='hamer_tactile_ft/reports'
-    --exclude='hamer_tactile_ft/memorization'
     --exclude='demo_output/'
     --exclude='hamer_tactile_ft/amp_audits'
-    --exclude='hamer_tactile_ft/data_integrity_audits/'
     --exclude='preprocess/artifacts/'
     --exclude='sam3_bbox_reconstruction/third_party/'
     --exclude='sam3_bbox_reconstruction/results/'
@@ -112,10 +99,10 @@ if [ "$MODE" = "--check" ] || [ "$MODE" = "check" ]; then
     fi
 
     echo "🧪 rsync dry-run 测试..."
-    rsync -avn --delete \
+    rsync -avn --delete --delay-updates \
         -e "ssh -p $PORT -i $KEY_PATH -o StrictHostKeyChecking=no" \
         "${RSYNC_EXCLUDES[@]}" \
-        "$SRC_DIR/" "$REMOTE_USER@$REMOTE_HOST:$REMOTE_DIR/Full-Hand-Tactile-Estimation/"
+        "$SRC_DIR/" "$REMOTE_USER@$REMOTE_HOST:$REMOTE_PROJECT_DIR/"
     RSYNC_STATUS=$?
     if [ $RSYNC_STATUS -ne 0 ]; then
         echo "❌ rsync dry-run 失败。请查看上面的具体 rsync 错误。"
@@ -132,10 +119,10 @@ if [ "$SYNC_METHOD" = "rsync" ]; then
     
     # 使用 rsync 增量同步，不限制文件大小，但排除了 checkpoint 和训练日志相关目录
     # 这样可以豁免对远端服务器训练生成的权重、日志的 --delete 操作，防止远端训练结果被清空
-    rsync -avz --delete \
+    rsync -avz --delete --delay-updates \
         -e "ssh -p $PORT -i $KEY_PATH -o StrictHostKeyChecking=no" \
         "${RSYNC_EXCLUDES[@]}" \
-        "$SRC_DIR/" "$REMOTE_USER@$REMOTE_HOST:$REMOTE_DIR/Full-Hand-Tactile-Estimation/"
+        "$SRC_DIR/" "$REMOTE_USER@$REMOTE_HOST:$REMOTE_PROJECT_DIR/"
 
     SYNC_STATUS=$?
 else
@@ -150,10 +137,23 @@ fi
 # ------------------ 4. 结果处理 ------------------
 echo "=========================================="
 if [ $SYNC_STATUS -eq 0 ]; then
-    echo "🎉 同步成功！正在远端服务器上触发自动路径适配..."
-    ssh -p "$PORT" -i "$KEY_PATH" -o StrictHostKeyChecking=no "$REMOTE_USER@$REMOTE_HOST" "cd $REMOTE_DIR/Full-Hand-Tactile-Estimation && python3 auto_adapt_paths.py"
-    
-    echo "👉 路径已全部自动修改并部署至: $REMOTE_USER@$REMOTE_HOST:$REMOTE_DIR/Full-Hand-Tactile-Estimation/"
+    echo "🧭 正在自动适配远端绝对路径..."
+    ssh -p "$PORT" \
+        -i "$KEY_PATH" \
+        -o StrictHostKeyChecking=no \
+        "$REMOTE_USER@$REMOTE_HOST" \
+        "cd '$REMOTE_PROJECT_DIR' && python3 auto_adapt_paths.py --root '$REMOTE_PROJECT_DIR' --remote-root '${REMOTE_DIR%/}'"
+    ADAPT_STATUS=$?
+    if [ $ADAPT_STATUS -ne 0 ]; then
+        echo "❌ 代码已同步，但远端路径自动适配失败。" >&2
+        SYNC_STATUS=$ADAPT_STATUS
+    fi
+fi
+
+if [ $SYNC_STATUS -eq 0 ]; then
+    echo "🎉 同步成功！"
+    echo "👉 代码已部署至: $REMOTE_USER@$REMOTE_HOST:$REMOTE_PROJECT_DIR/"
+    echo "👉 本地绝对路径已自动适配为远端路径。"
 else
     echo "❌ 同步失败，请检查网络连接、端口或 SSH 密钥配置。"
 fi

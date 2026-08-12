@@ -8,8 +8,16 @@ import math
 import shlex
 import subprocess
 import time
+import uuid
 from dataclasses import asdict
 from pathlib import Path
+
+from process_lifecycle import (
+    configure_supervised_process,
+    initialize_worker_parent_death_signal,
+)
+
+configure_supervised_process()
 
 sys.argv[0] = os.path.abspath(__file__)
 
@@ -22,7 +30,7 @@ import cv2
 cv2.setNumThreads(0)
 
 from pytorch_lightning.callbacks import Callback, LearningRateMonitor
-from pytorch_lightning.loggers import WandbLogger
+from pytorch_lightning.loggers import CSVLogger
 import torch
 torch.set_float32_matmul_precision('high')
 from torch.utils.data import DataLoader
@@ -32,6 +40,7 @@ torch.multiprocessing.set_sharing_strategy('file_system')
 # Add paths
 ft_dir = os.path.dirname(os.path.abspath(__file__))
 workspace_dir = os.path.abspath(os.path.join(ft_dir, ".."))
+sys.path.append(workspace_dir)
 sys.path.append(os.path.join(workspace_dir, "hamer"))
 sys.path.append(ft_dir)
 
@@ -44,7 +53,7 @@ from dataset import (
     ddp_global_rank,
     release_unused_python_heap,
 )
-from hamer_tactile import DinoTactileModel
+from hamer_tactile import DinoTactileModel, parse_input_resolution
 from losses import TactileLossConfig
 from tactile_metrics import (
     CompactTouchAnythingProtocolAccumulator,
@@ -75,20 +84,28 @@ class ValidationMetricsTextLogger(Callback):
         "train/grad_clip_trigger_rate_epoch",
         "train/nonfinite_grad_rate_epoch",
         "train/effective_lr_epoch_end",
+        "train/data_wait_fraction_epoch",
+        "train/data_wait_mean_ms_epoch",
+        "train/host_step_mean_ms_epoch",
     }
 
-    def __init__(self, output_path, config_record=None):
+    def __init__(self, output_path, config_record=None, append=False):
         super().__init__()
         self.output_path = output_path
         self.config_record = config_record
+        self.append = bool(append)
 
     def on_fit_start(self, trainer, pl_module):
         if not trainer.is_global_zero:
             return
         os.makedirs(os.path.dirname(self.output_path), exist_ok=True)
-        with open(self.output_path, "w", encoding="utf-8") as f:
+        mode = "a" if self.append and os.path.isfile(self.output_path) else "w"
+        with open(self.output_path, mode, encoding="utf-8") as f:
             if self.config_record is not None:
-                record = {"record_type": "config", **self.config_record}
+                record = {
+                    "record_type": "resume_config" if mode == "a" else "config",
+                    **self.config_record,
+                }
                 f.write(json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n")
 
     def on_validation_end(self, trainer, pl_module):
@@ -240,13 +257,14 @@ class TactileTrainingModule(DinoTactileModel):
         backbone_feature_layers=(8, 16, 24, 32),
         visual_backbone="dinov3_hplus",
         dino_weights="",
-        dino_rezero_source="multilevel",
         dino_residual_max_scale=0.10,
         dino_residual_rms_budget=0.50,
         bbox_rescale_factor=2.0,
         bbox_source_policy="sam3_only",
         pool_layout="fullgrid32",
         decoder_dropout_scale=1.0,
+        input_resolution=(256, 192),
+        pool_output_channels=32,
         optimizer_weight_decay=1e-4,
         lr_scheduler="cosine",
         lr_decay_milestones="0.5,0.75",
@@ -262,11 +280,12 @@ class TactileTrainingModule(DinoTactileModel):
             backbone_feature_layers=backbone_feature_layers,
             visual_backbone=visual_backbone,
             dino_weights=dino_weights,
-            dino_rezero_source=dino_rezero_source,
             dino_residual_max_scale=dino_residual_max_scale,
             dino_residual_rms_budget=dino_residual_rms_budget,
             pool_layout=pool_layout,
             decoder_dropout_scale=decoder_dropout_scale,
+            input_resolution=input_resolution,
+            pool_output_channels=pool_output_channels,
         )
         self.learning_rate = learning_rate
         self.optimizer_weight_decay = float(optimizer_weight_decay)
@@ -293,7 +312,6 @@ class TactileTrainingModule(DinoTactileModel):
         for param in self.parameters():
             param.requires_grad = False
 
-        # Keep the tactile head trainable
         for param in self.tactile_head.parameters():
             param.requires_grad = True
 
@@ -311,6 +329,167 @@ class TactileTrainingModule(DinoTactileModel):
         self._train_metric_weight = 0
         self._global_train_summary_epoch = None
         self._global_train_summary_cache = None
+        self._throughput_started_at = None
+        self._last_train_batch_end_at = None
+        self._train_batch_started_at = None
+        self._data_wait_seconds = 0.0
+        self._host_step_seconds = 0.0
+        self._timed_train_batches = 0
+        self._loading_tactile_resume = False
+
+    def _resume_contract(self):
+        return {
+            "tactile_head_type": str(self.tactile_head_type),
+            "input_resolution": list(self.input_resolution),
+            "backbone_feature_layers": list(self.backbone_feature_layers),
+            "pool_layout": str(self.pool_layout),
+            "pool_output_channels": int(self.pool_output_channels),
+            "dataset_filter": list(getattr(self, "dataset_filter", ())),
+            "bbox_rescale_factor": float(self.bbox_rescale_factor),
+            "bbox_source_policy": str(self.bbox_source_policy),
+            "loss_config": asdict(self.tactile_loss_config),
+        }
+
+    def on_save_checkpoint(self, checkpoint):
+        """Keep exact trainer state while rebuilding the frozen DINO from disk."""
+        state_dict = checkpoint.get("state_dict", {})
+        checkpoint["state_dict"] = {
+            name: value
+            for name, value in state_dict.items()
+            if not name.startswith("backbone.")
+        }
+        checkpoint["format"] = "tactile_resume_v1"
+        checkpoint["backbone_weights"] = str(self.backbone_weights_path or "")
+        checkpoint["backbone_sha256"] = str(self.backbone_weights_sha256 or "")
+        checkpoint["tactile_head_type"] = str(self.tactile_head_type)
+        checkpoint["input_resolution"] = list(self.input_resolution)
+        checkpoint["dataset_filter"] = list(getattr(self, "dataset_filter", ()))
+        checkpoint["wandb_run_id"] = str(
+            getattr(self, "wandb_run_id", "") or ""
+        )
+        checkpoint["resume_contract"] = self._resume_contract()
+
+    def on_load_checkpoint(self, checkpoint):
+        if checkpoint.get("format") != "tactile_resume_v1":
+            return
+        checkpoint_wandb_run_id = str(
+            checkpoint.get("wandb_run_id", "") or ""
+        )
+        configured_wandb_run_id = str(
+            getattr(self, "wandb_run_id", "") or ""
+        )
+        if (
+            checkpoint_wandb_run_id
+            and configured_wandb_run_id
+            and checkpoint_wandb_run_id != configured_wandb_run_id
+        ):
+            raise RuntimeError(
+                "Resume checkpoint WandB run ID mismatch: "
+                f"checkpoint={checkpoint_wandb_run_id}, "
+                f"current={configured_wandb_run_id}"
+            )
+        if checkpoint_wandb_run_id:
+            self.wandb_run_id = checkpoint_wandb_run_id
+        expected_sha = str(getattr(self, "backbone_weights_sha256", "") or "")
+        checkpoint_sha = str(checkpoint.get("backbone_sha256", "") or "")
+        if expected_sha and checkpoint_sha and expected_sha != checkpoint_sha:
+            raise RuntimeError(
+                "Resume checkpoint DINO SHA256 mismatch: "
+                f"checkpoint={checkpoint_sha}, current={expected_sha}"
+            )
+        if str(checkpoint.get("tactile_head_type", "")) != self.tactile_head_type:
+            raise RuntimeError(
+                "Resume checkpoint tactile head mismatch: "
+                f"checkpoint={checkpoint.get('tactile_head_type')}, "
+                f"current={self.tactile_head_type}"
+            )
+        checkpoint_resolution = tuple(
+            int(value) for value in checkpoint.get("input_resolution", ())
+        )
+        if checkpoint_resolution and checkpoint_resolution != self.input_resolution:
+            raise RuntimeError(
+                "Resume checkpoint input resolution mismatch: "
+                f"checkpoint={checkpoint_resolution}, current={self.input_resolution}"
+            )
+        checkpoint_contract = checkpoint.get("resume_contract")
+        if checkpoint_contract is not None:
+            current_contract = self._resume_contract()
+            mismatches = {
+                key: {
+                    "checkpoint": checkpoint_contract.get(key),
+                    "current": current_contract.get(key),
+                }
+                for key in current_contract
+                if checkpoint_contract.get(key) != current_contract.get(key)
+            }
+            if mismatches:
+                raise RuntimeError(
+                    "Resume checkpoint configuration mismatch: "
+                    + json.dumps(mismatches, sort_keys=True)
+                )
+        self._loading_tactile_resume = True
+
+    def load_state_dict(self, state_dict, strict=True):
+        if not self._loading_tactile_resume:
+            return super().load_state_dict(state_dict, strict=strict)
+        incompatible = super().load_state_dict(state_dict, strict=False)
+        unexpected = list(incompatible.unexpected_keys)
+        missing = [
+            name
+            for name in incompatible.missing_keys
+            if not name.startswith("backbone.")
+        ]
+        self._loading_tactile_resume = False
+        if unexpected or missing:
+            raise RuntimeError(
+                "Resume checkpoint state mismatch: "
+                f"missing={missing}, unexpected={unexpected}"
+            )
+        return incompatible
+
+    def on_train_start(self):
+        self._throughput_started_at = time.perf_counter()
+        self._last_train_batch_end_at = self._throughput_started_at
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(self.device)
+
+    def on_train_end(self):
+        if self._throughput_started_at is None:
+            return
+        elapsed = max(time.perf_counter() - self._throughput_started_at, 1e-6)
+        world_size = int(getattr(self.trainer, "world_size", 1))
+        accumulation = int(getattr(self.trainer, "accumulate_grad_batches", 1))
+        batch_size = int(getattr(self, "batch_size_config", 0))
+        estimated_samples = int(self.global_step) * batch_size * world_size * accumulation
+        samples_per_second = estimated_samples / elapsed
+        tokens_per_second = samples_per_second * int(self.pool_valid_tokens)
+        train_dataset = getattr(self.trainer.train_dataloader, "dataset", None)
+        dataset_size = len(train_dataset) if train_dataset is not None else 0
+        estimated_epoch_seconds = dataset_size / max(samples_per_second, 1e-12)
+        peak_gib = (
+            torch.cuda.max_memory_reserved(self.device) / (1024.0 ** 3)
+            if torch.cuda.is_available()
+            else 0.0
+        )
+        if self.trainer.is_global_zero:
+            print(
+                "Training performance: "
+                f"peak_reserved={peak_gib:.2f} GiB/GPU, "
+                f"samples_per_second={samples_per_second:.2f}, "
+                f"spatial_tokens_per_second={tokens_per_second:.2f}, "
+                f"estimated_epoch_seconds={estimated_epoch_seconds:.1f}, "
+                f"elapsed={elapsed:.1f}s"
+            )
+            if self.logger is not None:
+                self.logger.log_metrics(
+                    {
+                        "performance/peak_reserved_gib": peak_gib,
+                        "performance/samples_per_second": samples_per_second,
+                        "performance/spatial_tokens_per_second": tokens_per_second,
+                        "performance/estimated_epoch_seconds": estimated_epoch_seconds,
+                    },
+                    step=int(self.global_step),
+                )
 
     def on_train_epoch_start(self):
         self._grad_clip_trigger_count = 0
@@ -323,27 +502,67 @@ class TactileTrainingModule(DinoTactileModel):
         self._train_metric_weight = 0
         self._global_train_summary_epoch = None
         self._global_train_summary_cache = None
+        self._data_wait_seconds = 0.0
+        self._host_step_seconds = 0.0
+        self._timed_train_batches = 0
+        self._last_train_batch_end_at = time.perf_counter()
+        self._train_batch_started_at = None
+
+    def on_train_batch_start(self, batch, batch_idx):
+        del batch, batch_idx
+        now = time.perf_counter()
+        if self._last_train_batch_end_at is not None:
+            self._data_wait_seconds += max(
+                now - self._last_train_batch_end_at,
+                0.0,
+            )
+        self._train_batch_started_at = now
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        del outputs, batch, batch_idx
+        now = time.perf_counter()
+        if self._train_batch_started_at is not None:
+            self._host_step_seconds += max(
+                now - self._train_batch_started_at,
+                0.0,
+            )
+            self._timed_train_batches += 1
+        self._last_train_batch_end_at = now
 
     def on_before_optimizer_step(self, optimizer):
-        squared_norm = torch.zeros((), device=self.device)
-        first_nonfinite_parameter = None
-        nonfinite_parameter_count = 0
+        gradient_names = []
+        gradients = []
         for name, parameter in self.tactile_head.named_parameters():
             if parameter.grad is not None:
-                gradient = parameter.grad.detach().float()
-                gradient_squared = gradient.pow(2).sum()
-                squared_norm = squared_norm + gradient_squared
-                gradient_is_finite = bool(torch.isfinite(gradient).all().item())
-                if not gradient_is_finite:
-                    nonfinite_parameter_count += 1
-                    if first_nonfinite_parameter is None:
-                        first_nonfinite_parameter = name
-        grad_norm = torch.sqrt(squared_norm)
+                gradient_names.append(name)
+                gradients.append(parameter.grad.detach())
+        if gradients:
+            try:
+                parameter_norms = torch._foreach_norm(gradients, 2.0)
+            except (AttributeError, RuntimeError):
+                parameter_norms = [
+                    torch.linalg.vector_norm(gradient) for gradient in gradients
+                ]
+            stacked_norms = torch.stack(
+                [norm.to(device=self.device, dtype=torch.float32) for norm in parameter_norms]
+            )
+            grad_norm = torch.linalg.vector_norm(stacked_norms)
+        else:
+            stacked_norms = torch.zeros(0, device=self.device, dtype=torch.float32)
+            grad_norm = torch.zeros((), device=self.device, dtype=torch.float32)
+        grad_norm_value = float(grad_norm.item())
+        first_nonfinite_parameter = None
+        if not math.isfinite(grad_norm_value):
+            for name, norm in zip(gradient_names, stacked_norms):
+                if not math.isfinite(float(norm.item())):
+                    first_nonfinite_parameter = name
+                    break
+            if first_nonfinite_parameter is None:
+                first_nonfinite_parameter = "<aggregate_gradient_norm>"
         clip_value = float(getattr(self.trainer, "gradient_clip_val", 0.0) or 0.0)
-        clip_trigger = gradient_clip_triggered(grad_norm.item(), clip_value)
+        clip_trigger = gradient_clip_triggered(grad_norm_value, clip_value)
         self._grad_clip_trigger_count += int(clip_trigger)
         self._grad_clip_step_count += 1
-        grad_norm_value = float(grad_norm.item())
         if math.isfinite(grad_norm_value):
             self._grad_norm_finite_step_count += 1
             self._grad_norm_sum += grad_norm_value
@@ -357,7 +576,7 @@ class TactileTrainingModule(DinoTactileModel):
             on_step=True,
             on_epoch=False,
             logger=True,
-            sync_dist=True,
+            sync_dist=False,
         )
         self.log(
             "train/grad_clip_trigger",
@@ -365,7 +584,7 @@ class TactileTrainingModule(DinoTactileModel):
             on_step=True,
             on_epoch=False,
             logger=True,
-            sync_dist=True,
+            sync_dist=False,
         )
         self.log(
             "train/nonfinite_grad_step",
@@ -373,7 +592,7 @@ class TactileTrainingModule(DinoTactileModel):
             on_step=True,
             on_epoch=False,
             logger=True,
-            sync_dist=True,
+            sync_dist=False,
         )
         self.log(
             "train/effective_lr",
@@ -452,6 +671,19 @@ class TactileTrainingModule(DinoTactileModel):
             logger=True,
             sync_dist=False,
         )
+        for name in (
+            "train/data_wait_fraction_epoch",
+            "train/data_wait_mean_ms_epoch",
+            "train/host_step_mean_ms_epoch",
+        ):
+            self.log(
+                name,
+                global_summary[name],
+                on_step=False,
+                on_epoch=True,
+                logger=True,
+                sync_dist=False,
+            )
 
     def _current_train_epoch_summary(self):
         steps = max(self._grad_clip_step_count, 1)
@@ -480,6 +712,9 @@ class TactileTrainingModule(DinoTactileModel):
                 float(self._nonfinite_grad_step_count),
                 float(self._grad_clip_step_count),
                 float(self._train_metric_weight),
+                self._data_wait_seconds,
+                self._host_step_seconds,
+                float(self._timed_train_batches),
             ],
             dtype=torch.float64,
             device=self.device,
@@ -493,14 +728,29 @@ class TactileTrainingModule(DinoTactileModel):
         finite_steps = gathered[:, 1].sum().clamp_min(1.0)
         total_steps = gathered[:, 6].sum().clamp_min(1.0)
         train_metric_weight = gathered[:, 7].sum().clamp_min(1.0)
+        data_wait_seconds = gathered[:, 8].sum()
+        host_step_seconds = gathered[:, 9].sum()
+        timed_batches = gathered[:, 10].sum().clamp_min(1.0)
         summary = {
             "train/epoch_grad_norm_mean": float((gathered[:, 0].sum() / finite_steps).item()),
             "train/epoch_grad_norm_max": float(gathered[:, 2].max().item()),
             "train/grad_clip_trigger_rate_epoch": float((gathered[:, 3].sum() / total_steps).item()),
             "train/nonfinite_grad_rate_epoch": float((gathered[:, 5].sum() / total_steps).item()),
             "train/effective_lr_epoch_end": float(gathered[:, 4].mean().item()),
+            "train/data_wait_fraction_epoch": float(
+                (
+                    data_wait_seconds
+                    / (data_wait_seconds + host_step_seconds).clamp_min(1e-12)
+                ).item()
+            ),
+            "train/data_wait_mean_ms_epoch": float(
+                (1000.0 * data_wait_seconds / timed_batches).item()
+            ),
+            "train/host_step_mean_ms_epoch": float(
+                (1000.0 * host_step_seconds / timed_batches).item()
+            ),
         }
-        for index, name in enumerate(metric_names, start=8):
+        for index, name in enumerate(metric_names, start=11):
             summary[name] = float((gathered[:, index].sum() / train_metric_weight).item())
         # Compatibility alias for existing dashboards and report readers.
         current_name = "train/loss_current_ramp_epoch_global"
@@ -524,10 +774,32 @@ class TactileTrainingModule(DinoTactileModel):
         output = self.forward_step(batch, train=True)
         loss = self.compute_loss(batch, output, train=True)
         if not bool(torch.isfinite(loss.detach()).all().item()):
+            nonfinite_outputs = [
+                name
+                for name in ("pred_logits", "pred_tactile")
+                if name in output
+                and not bool(torch.isfinite(output[name].detach()).all().item())
+            ]
+            nonfinite_components = [
+                name
+                for name, value in output.get("losses", {}).items()
+                if torch.is_tensor(value)
+                and not bool(torch.isfinite(value.detach()).all().item())
+            ]
+            nonfinite_inputs = [
+                name
+                for name in ("img", "tactile_signal", "palm_mask")
+                if name in batch
+                and torch.is_tensor(batch[name])
+                and not bool(torch.isfinite(batch[name].detach()).all().item())
+            ]
+            sample_ids = list(batch.get("sample_uid", ()))[:8]
             raise FloatingPointError(
                 "Non-finite training loss detected before backward: "
                 f"epoch={self.current_epoch}, global_step={self.global_step}, "
-                f"batch_idx={batch_idx}, precision={self.trainer.precision}."
+                f"batch_idx={batch_idx}, precision={self.trainer.precision}, "
+                f"outputs={nonfinite_outputs}, components={nonfinite_components}, "
+                f"inputs={nonfinite_inputs}, sample_uids={sample_ids}."
             )
         batch_size = int(batch["img"].shape[0])
         metric_values = {
@@ -565,8 +837,22 @@ class TactileTrainingModule(DinoTactileModel):
                 self._train_metric_sums[name].add_(weighted)
         self._train_metric_weight += batch_size
         
-        self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=self.sync_train_logs)
-        self._log_tactile_loss_breakdown("train", output, on_step=True)
+        self.log(
+            "train/loss",
+            loss,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+            sync_dist=self.sync_train_logs,
+            batch_size=batch_size,
+        )
+        self._log_tactile_loss_breakdown(
+            "train",
+            output,
+            on_step=True,
+            batch_size=batch_size,
+        )
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -584,10 +870,27 @@ class TactileTrainingModule(DinoTactileModel):
         has_tactile = batch['has_tactile']
         palm_mask = batch['palm_mask']
 
-        self.log('val/loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-        self._log_tactile_loss_breakdown("val", output, on_step=False)
+        batch_size = int(batch["img"].shape[0])
+        self.log(
+            "val/loss",
+            loss,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+            sync_dist=True,
+            batch_size=batch_size,
+        )
+        self._log_tactile_loss_breakdown(
+            "val",
+            output,
+            on_step=False,
+            batch_size=batch_size,
+        )
         diagnostics = self.tactile_head.feature_diagnostics()
-        layer_indices = self.tactile_head.refinement_layer_indices
+        layer_indices = tuple(
+            getattr(self.tactile_head, "refinement_layer_indices", ())
+        )
         for diagnostic_key, metric_name in (
             ("level_weight", "rezero_level_weight"),
             ("projected_rms", "rezero_projected_rms"),
@@ -606,6 +909,7 @@ class TactileTrainingModule(DinoTactileModel):
                     on_epoch=True,
                     logger=True,
                     sync_dist=True,
+                    batch_size=batch_size,
                 )
         for diagnostic_key, metric_name in (
             ("gate_raw", "rezero_gate_raw"),
@@ -626,6 +930,7 @@ class TactileTrainingModule(DinoTactileModel):
                     on_epoch=True,
                     logger=True,
                     sync_dist=True,
+                    batch_size=batch_size,
                 )
         self._accumulate_val_eval_stats(
             pred_tactile,
@@ -1128,6 +1433,7 @@ class TactileTrainingModule(DinoTactileModel):
                 [item[2] for item in domain_core_metrics]
             ).mean()
         eval_metrics.update(domain_metrics)
+
         for name, value in eval_metrics.items():
             self.log(
                 name,
@@ -1139,21 +1445,28 @@ class TactileTrainingModule(DinoTactileModel):
                 sync_dist=True,
             )
 
-    def _log_tactile_loss_breakdown(self, prefix, output, on_step):
+    def _log_tactile_loss_breakdown(
+        self,
+        prefix,
+        output,
+        on_step,
+        batch_size,
+    ):
         mapping = {
             "loss_smooth_l1_raw": "loss/smooth_l1_raw",
             "loss_logit_bce_raw": "loss/logit_bce_raw",
             "loss_base_tactile": "loss/base_tactile",
             "loss_weighted_tactile": "loss/weighted_tactile",
             "loss_background": "loss/background",
-            "loss_tail_l1_raw": "loss/tail_l1_raw",
-            "loss_tail_l1_weighted": "loss/tail_l1_weighted",
             "loss_location_raw": "loss/location_raw",
             "loss_location_weighted": "loss/location_weighted",
             "loss_contact_raw": "loss/contact_raw",
             "loss_contact_weighted": "loss/contact_weighted",
-            "diagnostics_tail_fraction": "diagnostics/tail_fraction",
             "diagnostics_location_eligible_fraction": "diagnostics/location_eligible_fraction",
+            "diagnostics_pressure_weight_mean": "pressure_weight_mean",
+            "diagnostics_pressure_weight_max": "pressure_weight_max",
+            "diagnostics_pressure_weight_fraction_gt2": "pressure_weight_fraction_gt2",
+            "diagnostics_weighted_to_direct_loss_ratio": "weighted_to_direct_loss_ratio",
             "loss_tactile": "loss/total",
             "loss_ramp": "schedule/loss_ramp",
             "loss_full_ramp_reference": "loss_full_ramp_reference",
@@ -1172,17 +1485,53 @@ class TactileTrainingModule(DinoTactileModel):
                     on_epoch=True,
                     logger=True,
                     sync_dist=self.sync_train_logs if prefix == "train" else True,
+                    batch_size=int(batch_size),
                 )
-        
+
     def configure_optimizers(self):
         optim_groups = optimizer_parameter_groups(
             self.named_parameters(),
             self.optimizer_weight_decay,
         )
-                    
-        optimizer = torch.optim.AdamW(
-            optim_groups,
-            lr=self.learning_rate
+
+        gradient_clip_val = float(
+            getattr(self.trainer, "gradient_clip_val", 0.0) or 0.0
+        )
+        optimizer_kwargs = {
+            "lr": self.learning_rate,
+        }
+        optimizer_backend = "default"
+        if torch.cuda.is_available() and gradient_clip_val <= 0.0:
+            optimizer_kwargs["fused"] = True
+            optimizer_backend = "fused"
+        elif torch.cuda.is_available():
+            # Lightning 2.1 cannot externally unscale and clip gradients for
+            # fused AdamW because that optimizer performs AMP unscaling
+            # internally. Foreach keeps the batched CUDA update without that
+            # conflict and preserves the requested clipping semantics.
+            optimizer_kwargs["foreach"] = True
+            optimizer_backend = "foreach"
+        try:
+            optimizer = torch.optim.AdamW(optim_groups, **optimizer_kwargs)
+        except (TypeError, RuntimeError) as exc:
+            accelerated_flag = (
+                optimizer_kwargs.pop("fused", False)
+                or optimizer_kwargs.pop("foreach", False)
+            )
+            if not accelerated_flag:
+                raise
+            print(
+                f"{optimizer_backend} AdamW unavailable; "
+                f"falling back to default AdamW: {exc}",
+                flush=True,
+            )
+            optimizer_backend = "default"
+            optimizer = torch.optim.AdamW(optim_groups, **optimizer_kwargs)
+        self.optimizer_backend = optimizer_backend
+        print(
+            "AdamW backend: "
+            f"{optimizer_backend} (gradient_clip_val={gradient_clip_val:g})",
+            flush=True,
         )
 
         total_steps = self.trainer.estimated_stepping_batches
@@ -1302,8 +1651,22 @@ def load_compatible_state_dict(model, checkpoint_path, load_backbone=False):
         raise ValueError("Only compact format=tactile_trainable_v2 checkpoints are supported")
     if checkpoint.get("visual_backbone") != "dinov3_hplus":
         raise ValueError("Checkpoint must use visual_backbone=dinov3_hplus")
-    if checkpoint.get("tactile_head_type") != "dense_v2_dino_rezero":
-        raise ValueError("Checkpoint must use tactile_head_type=dense_v2_dino_rezero")
+    checkpoint_head_type = checkpoint.get("tactile_head_type")
+    if checkpoint_head_type not in {"dense_v2", "dense_v2_dino_rezero"}:
+        raise ValueError("Checkpoint uses an unsupported tactile head type")
+    if checkpoint_head_type != getattr(model, "tactile_head_type", None):
+        raise ValueError(
+            f"Tactile head mismatch: checkpoint={checkpoint_head_type}, "
+            f"model={getattr(model, 'tactile_head_type', None)}"
+        )
+    checkpoint_resolution = parse_input_resolution(
+        checkpoint.get("input_resolution", (256, 192))
+    )
+    if checkpoint_resolution != tuple(getattr(model, "input_resolution", (256, 192))):
+        raise ValueError(
+            f"Input resolution mismatch: checkpoint={checkpoint_resolution}, "
+            f"model={getattr(model, 'input_resolution', None)}"
+        )
     expected_hash = str(checkpoint.get("backbone_sha256", "") or "")
     actual_hash = str(getattr(model, "backbone_weights_sha256", "") or "")
     if expected_hash and actual_hash and expected_hash != actual_hash:
@@ -1389,6 +1752,39 @@ def parse_args():
         help="Keep DataLoader workers alive between epochs; disabled by default to bound worker memory growth.",
     )
     parser.add_argument("--prefetch_factor", type=int, default=4, help="DataLoader prefetch factor when num_workers > 0")
+    parser.add_argument(
+        "--data_backend",
+        choices=("auto", "legacy_dirs", "sequence_hdf5"),
+        default="auto",
+        help=(
+            "Dataset storage backend. auto prefers <processed_root>/manifests/"
+            "<split>.queries.jsonl when present and otherwise keeps the legacy directory reader."
+        ),
+    )
+    parser.add_argument(
+        "--query_manifests",
+        type=str,
+        default="",
+        help=(
+            "Optional comma-separated sequence-HDF5 query manifests. Each manifest row "
+            "represents one frame/hand query and replaces filesystem index discovery."
+        ),
+    )
+    parser.add_argument(
+        "--hdf5_handle_cache_size",
+        type=int,
+        default=4,
+        help="Maximum read-only sequence HDF5 handles retained by each DataLoader worker.",
+    )
+    parser.add_argument(
+        "--hdf5_manifest_cache_dir",
+        type=str,
+        default=os.path.join(ft_dir, "hdf5_manifest_cache"),
+        help=(
+            "Shared mmap cache for normalized HDF5 query-manifest rows. This is "
+            "separate from the legacy directory index cache."
+        ),
+    )
     parser.add_argument("--index_workers", type=int, default=1, help="Workers for initial meta.json index scanning")
     parser.add_argument("--index_backend", type=str, default="process", choices=["process", "thread"], help="Parallel backend for initial index scanning")
     parser.add_argument("--index_chunksize", type=int, default=256, help="Chunk size for parallel index scanning")
@@ -1448,9 +1844,50 @@ def parse_args():
             "training on very large datasets."
         ),
     )
-    parser.add_argument("--rebuild_index", action="store_true", help="Force rank 0 to rebuild the index cache")
+    parser.add_argument(
+        "--rebuild_index",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Force rank 0 to rebuild the index cache; disabled by default.",
+    )
     parser.add_argument("--index_cache_timeout", type=int, default=3600, help="Seconds nonzero ranks wait for index cache")
     parser.add_argument("--use_wandb", action="store_true", help="Enable Weights & Biases logging")
+    parser.add_argument(
+        "--wandb_mode",
+        choices=("async", "online", "offline", "disabled"),
+        default="async",
+        help=(
+            "async/online uploads durable epoch snapshots from an isolated "
+            "process; offline queues snapshots without uploading; CSV logging "
+            "is always enabled."
+        ),
+    )
+    parser.add_argument(
+        "--wandb_sync_on_finish",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Launch one final asynchronous upload attempt when fitting ends.",
+    )
+    parser.add_argument("--wandb_sync_retries", type=int, default=24)
+    parser.add_argument("--wandb_sync_interval", type=int, default=300)
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default="",
+        help="Exact tactile_resume_v1 checkpoint to restore.",
+    )
+    parser.add_argument(
+        "--auto_resume",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Resume checkpoints/<exp_name>/resume.ckpt when it exists.",
+    )
+    parser.add_argument(
+        "--resume_save_every_n_epochs",
+        type=int,
+        default=1,
+        help="Frequency for atomic optimizer/scheduler/loop resume checkpoints.",
+    )
     parser.add_argument(
         "--exp_name",
         type=str,
@@ -1460,7 +1897,7 @@ def parse_args():
     parser.add_argument("--quick_test", action="store_true", help="Run a quick test training")
     parser.add_argument(
         "--tactile_head_type",
-        choices=("dense_v2_dino_rezero",),
+        choices=("dense_v2", "dense_v2_dino_rezero"),
         default="dense_v2_dino_rezero",
     )
     parser.add_argument(
@@ -1473,10 +1910,23 @@ def parse_args():
     parser.add_argument("--dino_residual_rms_budget", type=float, default=0.50)
     parser.add_argument(
         "--pool_layout",
-        choices=("fullgrid32",),
+        choices=("legacy5", "fullgrid32"),
         default="fullgrid32",
-        help="Preserve the complete 16x12 DINO grid before the dense decoder.",
+        help="Use original V2 5x5/21-cell pooling or preserve the full DINO grid.",
     )
+    parser.add_argument(
+        "--input_resolution",
+        type=str,
+        default="256x192",
+        help="DINO input in HEIGHTxWIDTH form: 256x192, 320x240, or 384x288.",
+    )
+    parser.add_argument(
+        "--accumulate_grad_batches",
+        type=int,
+        default=1,
+        help="Number of batches accumulated before each optimizer step.",
+    )
+    parser.add_argument("--pool_output_channels", type=int, default=32)
     parser.add_argument(
         "--decoder_dropout_scale",
         type=float,
@@ -1493,7 +1943,10 @@ def parse_args():
         "--bbox_rescale_factor",
         type=float,
         default=2.0,
-        help="Square crop side relative to the query bbox longest side; must lie in [1.0, 4.0].",
+        help=(
+            "Crop height relative to the query bbox longest side; the crop width is "
+            "75% of its height. Must lie in [1.0, 4.0]."
+        ),
     )
     parser.add_argument(
         "--visual_backbone",
@@ -1514,6 +1967,12 @@ def parse_args():
     parser.add_argument("--max_steps", type=int, default=-1)
     parser.add_argument("--skip_validation", action="store_true")
     parser.add_argument("--skip_checkpointing", action="store_true")
+    parser.add_argument(
+        "--save_contact_best",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save the optional TouchAnything contact-best compact checkpoint.",
+    )
     parser.add_argument("--ddp_find_unused_parameters", action="store_true", help="Use DDP unused-parameter detection")
     parser.add_argument("--sync_train_logs", action="store_true", help="Synchronize train logs across distributed workers")
     parser.add_argument("--check_val_every_n_epoch", type=int, default=1, help="Validation frequency in epochs")
@@ -1524,6 +1983,13 @@ def parse_args():
     parser.add_argument("--background_pred_margin", type=float, default=0.02)
     parser.add_argument("--active_pressure_weight", type=float, default=1.0)
     parser.add_argument("--active_pressure_gamma", type=float, default=1.0)
+    parser.add_argument(
+        "--pressure_weight_mode",
+        choices=("hump", "plateau", "capped_linear"),
+        default="hump",
+    )
+    parser.add_argument("--active_pressure_tail_thr", type=float, default=0.70)
+    parser.add_argument("--active_pressure_tail_max", type=float, default=3.0)
     parser.add_argument("--background_loss_weight", type=float, default=1.0)
     parser.add_argument("--logit_bce_weight", type=float, default=0.1)
     parser.add_argument("--loss_ramp_epochs", type=int, default=5)
@@ -1531,8 +1997,6 @@ def parse_args():
     parser.add_argument("--frame_high_volume_thr", type=float, default=150.0, help="GT frame volume threshold for high-volume validation diagnostics")
     parser.add_argument("--opentouch_high_pressure_thr", type=float, default=0.9)
     parser.add_argument("--opentouch_high_pressure_weight", type=float, default=0.3)
-    parser.add_argument("--tail_pressure_thr", type=float, default=0.2)
-    parser.add_argument("--tail_l1_weight", type=float, default=0.0)
     parser.add_argument("--location_loss_weight", type=float, default=0.0)
     parser.add_argument("--location_gt_volume_thr", type=float, default=1.0)
     parser.add_argument("--location_distribution_power", type=float, default=1.0)
@@ -1558,13 +2022,14 @@ def tactile_loss_config_from_args(args):
         background_pred_margin=args.background_pred_margin,
         active_pressure_weight=args.active_pressure_weight,
         active_pressure_gamma=args.active_pressure_gamma,
+        pressure_weight_mode=args.pressure_weight_mode,
+        active_pressure_tail_thr=args.active_pressure_tail_thr,
+        active_pressure_tail_max=args.active_pressure_tail_max,
         background_loss_weight=args.background_loss_weight,
         logit_bce_weight=args.logit_bce_weight,
         loss_ramp_epochs=args.loss_ramp_epochs,
         opentouch_high_pressure_thr=args.opentouch_high_pressure_thr,
         opentouch_high_pressure_weight=args.opentouch_high_pressure_weight,
-        tail_pressure_thr=args.tail_pressure_thr,
-        tail_l1_weight=args.tail_l1_weight,
         location_loss_weight=args.location_loss_weight,
         location_gt_volume_thr=args.location_gt_volume_thr,
         location_distribution_power=args.location_distribution_power,
@@ -1623,8 +2088,10 @@ def model_summary(model):
         f"pool_layout: {getattr(model, 'pool_layout', None)}",
         f"pool_grid_size: {getattr(model, 'pool_grid_size', None)}",
         f"pool_valid_tokens: {getattr(model, 'pool_valid_tokens', None)}",
+        f"input_resolution: {getattr(model, 'input_resolution', None)}",
+        f"decoder_input_dim: {getattr(model, 'decoder_input_dim', None)}",
+        f"pool_output_channels: {getattr(model, 'pool_output_channels', None)}",
         f"decoder_dropout_scale: {getattr(model, 'decoder_dropout_scale', None)}",
-        f"dino_rezero_source: {getattr(model, 'dino_rezero_source', None)}",
         f"dino_residual_max_scale: {getattr(model, 'dino_residual_max_scale', None)}",
         f"dino_residual_rms_budget: {getattr(model, 'dino_residual_rms_budget', None)}",
         f"bbox_rescale_factor: {getattr(model, 'bbox_rescale_factor', None)}",
@@ -1659,7 +2126,7 @@ def write_run_provenance(args, data_dirs, tactile_loss_config, model, ckpt_dir, 
         "loss-best": {"metric": "val/loss_full_ramp_reference", "mode": "min"},
     }
     requested_datasets = set(getattr(model, "dataset_filter", ()))
-    if "TouchAnything" in requested_datasets:
+    if args.save_contact_best and "TouchAnything" in requested_datasets:
         checkpoint_monitors["contact-best"] = {
             "metric": "val/touchanything/touchanything_protocol_contact_iou",
             "mode": "max",
@@ -1676,8 +2143,14 @@ def write_run_provenance(args, data_dirs, tactile_loss_config, model, ckpt_dir, 
         "lr_scaled": lr_scaled,
         "optimizer_config": {
             "name": "AdamW",
+            "backend": (
+                "foreach"
+                if num_gpus > 0 and float(args.gradient_clip_val) > 0.0
+                else "fused_if_cuda"
+            ),
             "weight_decay": float(args.optimizer_weight_decay),
             "no_decay_weight_decay": 0.0,
+            "gradient_clip_val": float(args.gradient_clip_val),
         },
         "lr_scheduler_config": {
             "name": str(args.lr_scheduler),
@@ -1714,23 +2187,34 @@ def write_run_provenance(args, data_dirs, tactile_loss_config, model, ckpt_dir, 
             else int(getattr(model, "pool_grid_size", 0))
         ),
         "pool_valid_tokens": int(getattr(model, "pool_valid_tokens", 0)),
+        "input_resolution": list(getattr(model, "input_resolution", (256, 192))),
+        "decoder_input_dim": int(getattr(model, "decoder_input_dim", 6144)),
+        "pool_output_channels": int(getattr(model, "pool_output_channels", 32)),
         "decoder_dropout_scale": float(getattr(model, "decoder_dropout_scale", 1.0)),
         "backbone_feature_layers": list(getattr(model, "backbone_feature_layers", ())),
-        "dino_rezero_source": str(getattr(model, "dino_rezero_source", "multilevel")),
         "dino_residual_max_scale": float(getattr(model, "dino_residual_max_scale", 0.10)),
         "dino_residual_rms_budget": float(getattr(model, "dino_residual_rms_budget", 0.50)),
+        "accumulate_grad_batches": int(args.accumulate_grad_batches),
         "index_schema_version": int(getattr(model, "index_schema_version", INDEX_CACHE_VERSION)),
         "index_cache_key": str(getattr(model, "index_cache_key", "")),
         "indexed_sample_count": int(getattr(model, "indexed_sample_count", 0)),
         "index_manifest_sha256": str(getattr(model, "index_manifest_sha256", "")),
+        "data_backend": str(getattr(model, "data_backend", "legacy_dirs")),
+        "query_manifest_sha256": dict(getattr(model, "query_manifest_sha256", {})),
+        "hdf5_schema_version": str(getattr(model, "hdf5_schema_version", "")),
+        "hdf5_handle_cache_size": int(getattr(model, "hdf5_handle_cache_size", 4)),
+        "hdf5_manifest_cache_dir": str(
+            getattr(model, "hdf5_manifest_cache_dir", "")
+        ),
+        "hdf5_manifest_cache_key": str(
+            getattr(model, "hdf5_manifest_cache_key", "")
+        ),
         "bbox_manifest_sha256": dict(getattr(model, "bbox_manifest_sha256", {})),
         "lazy_index_records": bool(getattr(model, "lazy_index_records", False)),
         "dataset_filter": list(getattr(model, "dataset_filter", ())),
         "train_augmentation": bool(getattr(model, "train_augmentation", True)),
         "bbox_rescale_factor": float(getattr(model, "bbox_rescale_factor", 2.0)),
         "bbox_source_policy": str(getattr(model, "bbox_source_policy", "any")),
-        "tail_pressure_thr": float(tactile_loss_config.tail_pressure_thr),
-        "tail_l1_weight": float(tactile_loss_config.tail_l1_weight),
         "location_loss_weight": float(tactile_loss_config.location_loss_weight),
         "location_gt_volume_thr": float(tactile_loss_config.location_gt_volume_thr),
         "location_distribution_power": float(tactile_loss_config.location_distribution_power),
@@ -1781,6 +2265,7 @@ def make_dataloader(
         "sampler": sampler,
         "num_workers": num_workers,
         "pin_memory": True,
+        "worker_init_fn": initialize_worker_parent_death_signal,
     }
     if num_workers > 0:
         kwargs["persistent_workers"] = bool(persistent_workers)
@@ -1853,23 +2338,45 @@ def _compact_checkpoint_payload(module, epoch, global_step, reason, monitor=None
         "backbone_sha256": str(getattr(module, "backbone_weights_sha256", "") or ""),
         "tactile_head_type": str(getattr(module, "tactile_head_type", "")),
         "backbone_feature_layers": list(getattr(module, "backbone_feature_layers", ())),
-        "dino_rezero_source": str(getattr(module, "dino_rezero_source", "multilevel")),
         "dino_residual_max_scale": float(getattr(module, "dino_residual_max_scale", 0.10)),
         "dino_residual_rms_budget": float(getattr(module, "dino_residual_rms_budget", 0.50)),
         "pool_layout": str(getattr(module, "pool_layout", "fullgrid32")),
+        "input_resolution": list(getattr(module, "input_resolution", (256, 192))),
+        "pool_grid_size": list(getattr(module, "pool_grid_size", (16, 12))),
+        "pool_valid_tokens": int(getattr(module, "pool_valid_tokens", 192)),
+        "decoder_input_dim": int(getattr(module, "decoder_input_dim", 6144)),
+        "pool_output_channels": int(getattr(module, "pool_output_channels", 32)),
         "decoder_dropout_scale": float(getattr(module, "decoder_dropout_scale", 1.0)),
+        "accumulate_grad_batches": int(getattr(module, "accumulate_grad_batches_config", 1)),
         "index_schema_version": int(getattr(module, "index_schema_version", INDEX_CACHE_VERSION)),
         "index_cache_key": str(getattr(module, "index_cache_key", "")),
         "indexed_sample_count": int(getattr(module, "indexed_sample_count", 0)),
         "index_manifest_sha256": str(getattr(module, "index_manifest_sha256", "")),
+        "data_backend": str(getattr(module, "data_backend", "legacy_dirs")),
+        "query_manifest_sha256": dict(getattr(module, "query_manifest_sha256", {})),
+        "hdf5_schema_version": str(getattr(module, "hdf5_schema_version", "")),
+        "hdf5_handle_cache_size": int(getattr(module, "hdf5_handle_cache_size", 4)),
+        "hdf5_manifest_cache_dir": str(
+            getattr(module, "hdf5_manifest_cache_dir", "")
+        ),
+        "hdf5_manifest_cache_key": str(
+            getattr(module, "hdf5_manifest_cache_key", "")
+        ),
         "bbox_manifest_sha256": dict(getattr(module, "bbox_manifest_sha256", {})),
         "lazy_index_records": bool(getattr(module, "lazy_index_records", False)),
         "dataset_filter": list(getattr(module, "dataset_filter", ())),
         "train_augmentation": bool(getattr(module, "train_augmentation", True)),
         "bbox_rescale_factor": float(getattr(module, "bbox_rescale_factor", 2.0)),
         "bbox_source_policy": str(getattr(module, "bbox_source_policy", "any")),
-        "tail_pressure_thr": float(module.tactile_loss_config.tail_pressure_thr),
-        "tail_l1_weight": float(module.tactile_loss_config.tail_l1_weight),
+        "pressure_weight_mode": str(
+            module.tactile_loss_config.pressure_weight_mode
+        ),
+        "active_pressure_tail_thr": float(
+            module.tactile_loss_config.active_pressure_tail_thr
+        ),
+        "active_pressure_tail_max": float(
+            module.tactile_loss_config.active_pressure_tail_max
+        ),
         "location_loss_weight": float(module.tactile_loss_config.location_loss_weight),
         "location_gt_volume_thr": float(module.tactile_loss_config.location_gt_volume_thr),
         "location_distribution_power": float(
@@ -1894,23 +2401,38 @@ def _compact_checkpoint_payload(module, epoch, global_step, reason, monitor=None
             "visual_backbone": str(getattr(module, "visual_backbone", "dinov3_hplus")),
             "visual_backbone_model_name": str(getattr(module, "visual_backbone_model_name", "")),
             "backbone_feature_layers": list(getattr(module, "backbone_feature_layers", ())),
-            "dino_rezero_source": str(getattr(module, "dino_rezero_source", "multilevel")),
             "dino_residual_max_scale": float(getattr(module, "dino_residual_max_scale", 0.10)),
             "dino_residual_rms_budget": float(getattr(module, "dino_residual_rms_budget", 0.50)),
             "pool_layout": str(getattr(module, "pool_layout", "fullgrid32")),
+            "input_resolution": list(getattr(module, "input_resolution", (256, 192))),
+            "pool_grid_size": list(getattr(module, "pool_grid_size", (16, 12))),
+            "pool_valid_tokens": int(getattr(module, "pool_valid_tokens", 192)),
+            "decoder_input_dim": int(getattr(module, "decoder_input_dim", 6144)),
+            "pool_output_channels": int(getattr(module, "pool_output_channels", 32)),
             "decoder_dropout_scale": float(getattr(module, "decoder_dropout_scale", 1.0)),
+            "accumulate_grad_batches": int(
+                getattr(module, "accumulate_grad_batches_config", 1)
+            ),
             "index_schema_version": int(getattr(module, "index_schema_version", INDEX_CACHE_VERSION)),
             "index_cache_key": str(getattr(module, "index_cache_key", "")),
             "indexed_sample_count": int(getattr(module, "indexed_sample_count", 0)),
             "index_manifest_sha256": str(getattr(module, "index_manifest_sha256", "")),
+            "data_backend": str(getattr(module, "data_backend", "legacy_dirs")),
+            "query_manifest_sha256": dict(getattr(module, "query_manifest_sha256", {})),
+            "hdf5_schema_version": str(getattr(module, "hdf5_schema_version", "")),
+            "hdf5_handle_cache_size": int(getattr(module, "hdf5_handle_cache_size", 4)),
+            "hdf5_manifest_cache_dir": str(
+                getattr(module, "hdf5_manifest_cache_dir", "")
+            ),
+            "hdf5_manifest_cache_key": str(
+                getattr(module, "hdf5_manifest_cache_key", "")
+            ),
             "bbox_manifest_sha256": dict(getattr(module, "bbox_manifest_sha256", {})),
             "lazy_index_records": bool(getattr(module, "lazy_index_records", False)),
             "dataset_filter": list(getattr(module, "dataset_filter", ())),
             "train_augmentation": bool(getattr(module, "train_augmentation", True)),
             "bbox_rescale_factor": float(getattr(module, "bbox_rescale_factor", 2.0)),
             "bbox_source_policy": str(getattr(module, "bbox_source_policy", "any")),
-            "tail_pressure_thr": float(module.tactile_loss_config.tail_pressure_thr),
-            "tail_l1_weight": float(module.tactile_loss_config.tail_l1_weight),
             "location_loss_weight": float(module.tactile_loss_config.location_loss_weight),
             "location_gt_volume_thr": float(module.tactile_loss_config.location_gt_volume_thr),
             "location_distribution_power": float(
@@ -1942,6 +2464,7 @@ def _compact_checkpoint_payload(module, epoch, global_step, reason, monitor=None
         "reason": str(reason),
         "monitor": str(monitor or ""),
         "score": None if score is None else float(score),
+        "wandb_run_id": str(getattr(module, "wandb_run_id", "") or ""),
     }
 
 
@@ -1956,6 +2479,150 @@ def _atomic_torch_save(payload, destination):
         raise RuntimeError(f"Failed to persist compact checkpoint: {destination}")
 
 
+def _scalar_metric_value(value):
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1:
+            return None
+        value = value.detach().float().cpu().item()
+    elif not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    return value if math.isfinite(value) else None
+
+
+class WandbEpochSyncCallback(Callback):
+    """Durably queue epoch metrics and upload them outside the trainer process."""
+
+    def __init__(
+        self,
+        queue_dir,
+        run_id,
+        project,
+        run_name,
+        config_path,
+        mode,
+        retries,
+        interval,
+        sync_on_finish=True,
+        local_logger=None,
+    ):
+        super().__init__()
+        self.queue_dir = Path(queue_dir)
+        self.run_id = str(run_id)
+        self.project = str(project)
+        self.run_name = str(run_name)
+        self.config_path = Path(config_path)
+        self.mode = "async" if str(mode) == "online" else str(mode)
+        self.retries = max(int(retries), 1)
+        self.interval = max(int(interval), 1)
+        self.sync_on_finish = bool(sync_on_finish)
+        self.local_logger = local_logger
+        self._last_payload_key = None
+        self.queue_dir.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def uploads_enabled(self):
+        return self.mode == "async"
+
+    def _collect_metrics(self, trainer, pl_module):
+        metrics = {}
+        for name, value in trainer.callback_metrics.items():
+            scalar = _scalar_metric_value(value)
+            if scalar is not None:
+                metrics[str(name)] = scalar
+        for name, value in getattr(pl_module, "_train_epoch_summary", {}).items():
+            scalar = _scalar_metric_value(value)
+            if scalar is not None:
+                metrics[str(name)] = scalar
+        metrics["trainer/epoch"] = float(trainer.current_epoch)
+        metrics["trainer/global_step"] = float(trainer.global_step)
+        return dict(sorted(metrics.items()))
+
+    def _enqueue(self, trainer, pl_module):
+        if not trainer.is_global_zero or trainer.sanity_checking:
+            return False
+        key = (int(trainer.current_epoch), int(trainer.global_step))
+        if key == self._last_payload_key:
+            return False
+        if self.local_logger is not None:
+            try:
+                self.local_logger.save()
+            except Exception as exc:
+                print(f"Warning: failed to flush local CSV logger: {exc}", flush=True)
+        payload_path = self.queue_dir / (
+            f"epoch_{key[0]:04d}_step_{key[1]:012d}.json"
+        )
+        _atomic_write_json(
+            payload_path,
+            {
+                "format": "tactile_wandb_epoch_v1",
+                "run_id": self.run_id,
+                "epoch": key[0],
+                "global_step": key[1],
+                "created_unix": time.time(),
+                "metrics": self._collect_metrics(trainer, pl_module),
+            },
+        )
+        self._last_payload_key = key
+        return True
+
+    def _launch_uploader(self):
+        if not self.uploads_enabled:
+            return
+        log_path = self.queue_dir / "upload.log"
+        command = [
+            sys.executable,
+            str(Path(__file__).resolve().parent / "wandb_epoch_sync.py"),
+            "--queue-dir",
+            str(self.queue_dir),
+            "--run-id",
+            self.run_id,
+            "--project",
+            self.project,
+            "--name",
+            self.run_name,
+            "--config",
+            str(self.config_path),
+            "--retries",
+            str(self.retries),
+            "--interval",
+            str(self.interval),
+        ]
+        with log_path.open("ab", buffering=0) as log_file:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                close_fds=True,
+                start_new_session=True,
+            )
+        print(
+            f"Queued WandB epoch upload via pid={process.pid}; "
+            f"run_id={self.run_id}, log={log_path}",
+            flush=True,
+        )
+
+    def on_fit_start(self, trainer, pl_module):
+        if trainer.is_global_zero:
+            self._launch_uploader()
+
+    def on_validation_end(self, trainer, pl_module):
+        if self._enqueue(trainer, pl_module):
+            self._launch_uploader()
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if self._enqueue(trainer, pl_module):
+            self._launch_uploader()
+
+    def on_fit_end(self, trainer, pl_module):
+        if not trainer.is_global_zero:
+            return
+        self._enqueue(trainer, pl_module)
+        if self.sync_on_finish:
+            self._launch_uploader()
+
+
 class CompactBestCheckpoint(Callback):
     def __init__(self, dirpath, filename, monitor, mode):
         super().__init__()
@@ -1965,6 +2632,26 @@ class CompactBestCheckpoint(Callback):
         self.mode = str(mode)
         self.best_model_path = ""
         self.best_model_score = None
+
+    @property
+    def state_key(self):
+        return (
+            f"{self.__class__.__qualname__}:"
+            f"{self.filename}:{self.monitor}:{self.mode}"
+        )
+
+    def state_dict(self):
+        return {
+            "best_model_path": self.best_model_path,
+            "best_model_score": self.best_model_score,
+        }
+
+    def load_state_dict(self, state_dict):
+        self.best_model_path = str(state_dict.get("best_model_path", "") or "")
+        score = state_dict.get("best_model_score")
+        if isinstance(score, torch.Tensor):
+            score = float(score.detach().cpu().item())
+        self.best_model_score = None if score is None else float(score)
 
     def _improved(self, score):
         if self.best_model_score is None:
@@ -1995,6 +2682,66 @@ class CompactBestCheckpoint(Callback):
         self.best_model_score = score
         self.best_model_path = str(path)
         print(f"Compact best checkpoint: {self.monitor}={score:.8g} -> {path}", flush=True)
+
+
+class AtomicResumeCheckpoint(Callback):
+    """Persist an exact, backbone-stripped Lightning resume checkpoint."""
+
+    def __init__(self, dirpath, every_n_epochs=1):
+        super().__init__()
+        self.dirpath = Path(dirpath)
+        self.every_n_epochs = max(int(every_n_epochs), 1)
+        self.last_saved_step = -1
+
+    @property
+    def state_key(self):
+        return f"{self.__class__.__qualname__}:{self.dirpath}"
+
+    def state_dict(self):
+        return {"last_saved_step": int(self.last_saved_step)}
+
+    def load_state_dict(self, state_dict):
+        self.last_saved_step = int(state_dict.get("last_saved_step", -1))
+
+    def _save(self, trainer):
+        if int(trainer.global_step) == self.last_saved_step:
+            return
+        self.dirpath.mkdir(parents=True, exist_ok=True)
+        destination = self.dirpath / "resume.ckpt"
+        temporary = self.dirpath / ".resume.ckpt.tmp"
+        trainer.save_checkpoint(str(temporary), weights_only=False)
+        trainer.strategy.barrier("tactile_resume_checkpoint_written")
+        if trainer.is_global_zero:
+            os.replace(temporary, destination)
+            _fsync_dir(str(self.dirpath))
+            _atomic_write_json(
+                self.dirpath / "resume_checkpoint_info.json",
+                {
+                    "format": "tactile_resume_v1",
+                    "epoch": int(trainer.current_epoch),
+                    "global_step": int(trainer.global_step),
+                    "path": str(destination),
+                    "wandb_run_id": str(
+                        getattr(trainer.lightning_module, "wandb_run_id", "")
+                        or ""
+                    ),
+                    "time_unix": time.time(),
+                },
+            )
+            print(
+                f"Atomic resume checkpoint: epoch={trainer.current_epoch}, "
+                f"global_step={trainer.global_step} -> {destination}",
+                flush=True,
+            )
+        trainer.strategy.barrier("tactile_resume_checkpoint_materialized")
+        self.last_saved_step = int(trainer.global_step)
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if (int(trainer.current_epoch) + 1) % self.every_n_epochs == 0:
+            self._save(trainer)
+
+    def on_fit_end(self, trainer, pl_module):
+        self._save(trainer)
 
 
 def save_materialized_last_checkpoint(
@@ -2107,8 +2854,30 @@ def main():
         raise ValueError("--decoder_dropout_scale must lie in [0, 1]")
     if not 1.0 <= float(args.bbox_rescale_factor) <= 4.0:
         raise ValueError("--bbox_rescale_factor must lie in [1.0, 4.0]")
+    args.input_resolution = parse_input_resolution(args.input_resolution)
+    if int(args.accumulate_grad_batches) < 1:
+        raise ValueError("--accumulate_grad_batches must be at least 1")
+    if int(args.resume_save_every_n_epochs) < 1:
+        raise ValueError("--resume_save_every_n_epochs must be at least 1")
+    if int(args.wandb_sync_retries) < 1:
+        raise ValueError("--wandb_sync_retries must be at least 1")
+    if int(args.wandb_sync_interval) < 1:
+        raise ValueError("--wandb_sync_interval must be at least 1")
+    if int(args.pool_output_channels) < 1:
+        raise ValueError("--pool_output_channels must be positive")
     if args.index_manifest:
         args.index_manifest = str(Path(args.index_manifest).expanduser().resolve(strict=False))
+    if args.query_manifests:
+        args.query_manifests = ",".join(
+            str(Path(path).expanduser().resolve(strict=False))
+            for path in _split_csv(args.query_manifests)
+        )
+    if args.hdf5_manifest_cache_dir:
+        args.hdf5_manifest_cache_dir = str(
+            Path(args.hdf5_manifest_cache_dir).expanduser().resolve(strict=False)
+        )
+    if int(args.hdf5_handle_cache_size) < 1:
+        raise ValueError("--hdf5_handle_cache_size must be at least 1")
     args.expected_datasets = list(canonical_dataset_filter(args.expected_datasets))
     if not args.dino_weights:
         raise ValueError("--dino_weights is required")
@@ -2139,10 +2908,13 @@ def main():
     model_cfg_path = os.path.join(workspace_dir, 'hamer/_DATA/hamer_ckpts/model_config.yaml')
     model_cfg = get_config(model_cfg_path, update_cachedir=True)
     
-    if (model_cfg.MODEL.BACKBONE.TYPE == 'vit') and ('BBOX_SHAPE' not in model_cfg.MODEL):
-        model_cfg.defrost()
-        model_cfg.MODEL.BBOX_SHAPE = [192, 256]
-        model_cfg.freeze()
+    model_cfg.defrost()
+    model_cfg.MODEL.IMAGE_SIZE = int(args.input_resolution[0])
+    model_cfg.MODEL.BBOX_SHAPE = [
+        int(args.input_resolution[1]),
+        int(args.input_resolution[0]),
+    ]
+    model_cfg.freeze()
         
     if ('PRETRAINED_WEIGHTS' in model_cfg.MODEL.BACKBONE):
         model_cfg.defrost()
@@ -2166,11 +2938,16 @@ def main():
         rebuild_index=args.rebuild_index,
         index_cache_timeout=args.index_cache_timeout,
         tactile_only=True,
+        input_resolution=args.input_resolution,
         bbox_rescale_factor=args.bbox_rescale_factor,
         bbox_source_policy=args.bbox_source_policy,
         bbox_manifests=args.bbox_manifests,
         lazy_index_records=args.lazy_index_records,
         augmentation_enabled=args.train_augmentation,
+        data_backend=args.data_backend,
+        query_manifests=args.query_manifests,
+        hdf5_handle_cache_size=args.hdf5_handle_cache_size,
+        hdf5_manifest_cache_dir=args.hdf5_manifest_cache_dir,
     )
     index_metadata = train_dataset.index_cache_metadata()
 
@@ -2191,11 +2968,16 @@ def main():
             rebuild_index=args.rebuild_index,
             index_cache_timeout=args.index_cache_timeout,
             tactile_only=True,
+            input_resolution=args.input_resolution,
             bbox_rescale_factor=args.bbox_rescale_factor,
             bbox_source_policy=args.bbox_source_policy,
             bbox_manifests=args.bbox_manifests,
             lazy_index_records=args.lazy_index_records,
             augmentation_enabled=False,
+            data_backend=args.data_backend,
+            query_manifests=args.query_manifests,
+            hdf5_handle_cache_size=args.hdf5_handle_cache_size,
+            hdf5_manifest_cache_dir=args.hdf5_manifest_cache_dir,
         )
 
     print("Initializing standalone DINO tactile model...")
@@ -2215,13 +2997,14 @@ def main():
         backbone_feature_layers=backbone_feature_layers,
         visual_backbone=args.visual_backbone,
         dino_weights=args.dino_weights or "",
-        dino_rezero_source="multilevel",
         dino_residual_max_scale=args.dino_residual_max_scale,
         dino_residual_rms_budget=args.dino_residual_rms_budget,
         bbox_rescale_factor=args.bbox_rescale_factor,
         bbox_source_policy=args.bbox_source_policy,
         pool_layout=args.pool_layout,
         decoder_dropout_scale=args.decoder_dropout_scale,
+        input_resolution=args.input_resolution,
+        pool_output_channels=args.pool_output_channels,
         optimizer_weight_decay=args.optimizer_weight_decay,
         lr_scheduler=args.lr_scheduler,
         lr_decay_milestones=args.lr_decay_milestones,
@@ -2231,22 +3014,39 @@ def main():
     model.backbone_weights_path = args.dino_weights
     print(f"Computing backbone SHA256: {model.backbone_weights_path}")
     model.backbone_weights_sha256 = file_sha256(model.backbone_weights_path)
+    model.accumulate_grad_batches_config = int(args.accumulate_grad_batches)
+    model.batch_size_config = int(args.batch_size)
     model.index_schema_version = int(index_metadata["index_schema_version"])
     model.bbox_source_policy = str(index_metadata["bbox_source_policy"])
     model.index_cache_key = str(index_metadata["index_cache_key"])
     model.indexed_sample_count = int(index_metadata["indexed_sample_count"])
     model.index_manifest_sha256 = str(index_metadata.get("index_manifest_sha256", ""))
+    model.data_backend = str(index_metadata.get("data_backend", args.data_backend))
+    model.query_manifest_sha256 = dict(index_metadata.get("query_manifest_sha256", {}))
+    storage_schema_version = index_metadata.get("storage_schema_version", "")
+    if isinstance(storage_schema_version, (list, tuple)):
+        storage_schema_version = ",".join(str(value) for value in storage_schema_version)
+    model.hdf5_schema_version = str(storage_schema_version)
+    model.hdf5_handle_cache_size = int(args.hdf5_handle_cache_size)
+    model.hdf5_manifest_cache_dir = str(args.hdf5_manifest_cache_dir or "")
+    model.hdf5_manifest_cache_key = str(
+        index_metadata.get("hdf5_manifest_cache_key", "")
+    )
     model.bbox_manifest_sha256 = dict(index_metadata.get("bbox_manifest_sha256", {}))
     model.lazy_index_records = bool(index_metadata.get("lazy_index_records", False))
     model.dataset_filter = tuple(index_metadata.get("dataset_filter", ()))
     model.train_augmentation = bool(args.train_augmentation)
-    
     # Validate the complete feature/head shape before allocating DataLoader workers.
-    dummy_input = torch.zeros(1, 3, model_cfg.MODEL.IMAGE_SIZE, model_cfg.MODEL.IMAGE_SIZE)
+    dummy_input = torch.zeros(1, 3, *args.input_resolution)
     with torch.no_grad():
-        dummy_feat = model._extract_tactile_features(dummy_input[:, :, :, 32:-32])
+        dummy_feat = model._extract_tactile_features(dummy_input)
         model.tactile_head(dummy_feat)
-        print(f"Tactile head initialized with output dim: {model.tactile_dim}")
+        print(
+            "Tactile head initialized: "
+            f"output_dim={model.tactile_dim}, input={model.input_resolution}, "
+            f"grid={model.pool_grid_size}, tokens={model.pool_valid_tokens}, "
+            f"decoder_input={model.decoder_input_dim}"
+        )
 
     if args.quick_test:
         train_dataset.samples = train_dataset.samples[:64]
@@ -2298,8 +3098,70 @@ def main():
         print("Validation dataset is empty; training will run without validation metrics/checkpoint monitoring.")
     
     ckpt_dir = os.path.join(ft_dir, "checkpoints", args.exp_name) if not args.quick_test else os.path.join(ft_dir, "checkpoints_test")
+    resume_checkpoint = ""
+    resume_wandb_run_id = ""
+    if args.resume_from_checkpoint:
+        resume_checkpoint = str(
+            Path(args.resume_from_checkpoint).expanduser().resolve(strict=False)
+        )
+    elif args.auto_resume:
+        candidate = Path(ckpt_dir) / "resume.ckpt"
+        if candidate.is_file():
+            resume_checkpoint = str(candidate.resolve())
+    if resume_checkpoint:
+        if not Path(resume_checkpoint).is_file():
+            raise FileNotFoundError(
+                f"Resume checkpoint not found: {resume_checkpoint}"
+            )
+        resume_header = torch.load(resume_checkpoint, map_location="cpu")
+        if resume_header.get("format") != "tactile_resume_v1":
+            raise ValueError(
+                "--resume_from_checkpoint requires format=tactile_resume_v1; "
+                "compact loss-best/last checkpoints cannot restore optimizer state"
+            )
+        resume_wandb_run_id = str(
+            resume_header.get("wandb_run_id", "") or ""
+        )
+        del resume_header
+        print(f"Exact training resume enabled: {resume_checkpoint}", flush=True)
+    args.resolved_resume_checkpoint = resume_checkpoint
+    wandb_enabled = args.use_wandb and args.wandb_mode != "disabled"
+    wandb_run_id = ""
+    wandb_root = Path(ckpt_dir) / "wandb"
+    run_id_path = Path(ckpt_dir) / "wandb_run_id.txt"
+    if wandb_enabled:
+        wandb_root.mkdir(parents=True, exist_ok=True)
+        if resume_checkpoint:
+            wandb_run_id = resume_wandb_run_id
+            if not wandb_run_id and run_id_path.is_file():
+                wandb_run_id = run_id_path.read_text(
+                    encoding="utf-8"
+                ).strip()
+        if not wandb_run_id:
+            wandb_run_id = uuid.uuid4().hex[:8]
+        run_id_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_run_id_path = run_id_path.with_name(
+            f".{run_id_path.name}.tmp-{os.getpid()}"
+        )
+        temporary_run_id_path.write_text(
+            wandb_run_id + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary_run_id_path, run_id_path)
+        _fsync_dir(str(run_id_path.parent))
+        print(
+            f"WandB epoch queue: mode={args.wandb_mode}, "
+            f"run_id={wandb_run_id}, resume={bool(resume_checkpoint)}",
+            flush=True,
+        )
+    args.wandb_run_id = wandb_run_id
+    model.wandb_run_id = wandb_run_id
     provenance = write_run_provenance(args, data_dirs, tactile_loss_config, model, ckpt_dir, num_gpus, lr_scaled)
-    val_metrics_text_logger = ValidationMetricsTextLogger(os.path.join(ckpt_dir, "val_metrics.txt"), config_record=provenance)
+    val_metrics_text_logger = ValidationMetricsTextLogger(
+        os.path.join(ckpt_dir, "val_metrics.txt"),
+        config_record=provenance,
+        append=bool(resume_checkpoint),
+    )
     checkpoint_callbacks = {}
     if val_loader is not None and not args.skip_checkpointing:
         print("Primary checkpoint monitor: val/loss_full_ramp_reference (min)")
@@ -2310,7 +3172,7 @@ def main():
             mode="min",
         )
         requested_datasets = set(model.dataset_filter)
-        if "TouchAnything" in requested_datasets:
+        if args.save_contact_best and "TouchAnything" in requested_datasets:
             print(
                 "Secondary checkpoint monitor: "
                 "val/touchanything/touchanything_protocol_contact_iou (max)"
@@ -2323,10 +3185,15 @@ def main():
             )
     lr_monitor = LearningRateMonitor(logging_interval="step")
     materialized_last_callback = None
+    resume_checkpoint_callback = None
     if not args.skip_checkpointing:
         materialized_last_callback = MaterializedLastCheckpointCallback(
             ckpt_dir=ckpt_dir,
             checkpoint_callbacks=checkpoint_callbacks,
+        )
+        resume_checkpoint_callback = AtomicResumeCheckpoint(
+            dirpath=ckpt_dir,
+            every_n_epochs=args.resume_save_every_n_epochs,
         )
     
     if num_gpus > 1:
@@ -2334,18 +3201,33 @@ def main():
     else:
         strategy = "auto"
     
-    if args.use_wandb:
-        # Pass config through WandbLogger/wandb.init instead of depending on the
-        # version-specific shape of logger.experiment.config.
-        logger = WandbLogger(
-            project="opentouch-hamer-tactile-ft",
-            name=args.exp_name,
-            config=provenance,
+    local_logger = CSVLogger(
+        save_dir=os.path.join(ckpt_dir, "local_logs"),
+        name="metrics",
+    )
+    wandb_epoch_callback = None
+    if wandb_enabled:
+        queue_dir = (
+            wandb_root / "epoch_queue" / wandb_run_id
         )
-    else:
-        logger = True
-    
+        wandb_epoch_callback = WandbEpochSyncCallback(
+            queue_dir=queue_dir,
+            run_id=wandb_run_id,
+            project="opentouch-hamer-tactile-ft",
+            run_name=args.exp_name,
+            config_path=Path(ckpt_dir) / "run_config.json",
+            mode=args.wandb_mode,
+            retries=args.wandb_sync_retries,
+            interval=args.wandb_sync_interval,
+            sync_on_finish=args.wandb_sync_on_finish,
+            local_logger=local_logger,
+        )
+
     callbacks = [*checkpoint_callbacks.values(), lr_monitor, val_metrics_text_logger]
+    if wandb_epoch_callback is not None:
+        callbacks.append(wandb_epoch_callback)
+    if resume_checkpoint_callback is not None:
+        callbacks.append(resume_checkpoint_callback)
     if materialized_last_callback is not None:
         callbacks.append(materialized_last_callback)
     trainer = pl.Trainer(
@@ -2355,7 +3237,7 @@ def main():
         devices=num_gpus,
         strategy=strategy,
         precision=args.trainer_precision,
-        logger=logger,
+        logger=local_logger,
         callbacks=callbacks,
         enable_checkpointing=False,
         enable_progress_bar=True,
@@ -2363,13 +3245,23 @@ def main():
         check_val_every_n_epoch=args.check_val_every_n_epoch,
         gradient_clip_val=args.gradient_clip_val,
         gradient_clip_algorithm="norm",
+        accumulate_grad_batches=args.accumulate_grad_batches,
         use_distributed_sampler=True,
     )
     
     if val_loader is None:
-        trainer.fit(model, train_dataloaders=train_loader)
+        trainer.fit(
+            model,
+            train_dataloaders=train_loader,
+            ckpt_path=resume_checkpoint or None,
+        )
     else:
-        trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+        trainer.fit(
+            model,
+            train_dataloaders=train_loader,
+            val_dataloaders=val_loader,
+            ckpt_path=resume_checkpoint or None,
+        )
 
     final_last_path = materialized_last_callback.last_checkpoint_path if materialized_last_callback else None
     if not args.skip_checkpointing and trainer.is_global_zero and final_last_path is None:

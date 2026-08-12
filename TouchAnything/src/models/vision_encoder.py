@@ -50,16 +50,30 @@ class VisionEncoder(nn.Module):
     def _load_dinov2(self, model_name: str, pretrained_path: Optional[str] = None):
         """Load DINOv2 model from a local hub cache to avoid implicit network access."""
         hub_dir = torch.hub.get_dir()
-        local_repo_candidates = [
+        explicit_repo = os.environ.get('TOUCHANYTHING_DINOV2_REPO', '').strip()
+        local_repo_candidates = []
+        if explicit_repo:
+            local_repo_candidates.append(os.path.abspath(os.path.expanduser(explicit_repo)))
+        local_repo_candidates.extend([
             os.path.join(hub_dir, 'facebookresearch_dinov2_main'),
             os.path.join(hub_dir, 'facebookresearch_dinov2_master'),
-        ]
-        local_repo = next((p for p in local_repo_candidates if os.path.isdir(p)), None)
+        ])
+        local_repo = next(
+            (
+                p
+                for p in local_repo_candidates
+                if os.path.isfile(os.path.join(p, 'hubconf.py'))
+            ),
+            None,
+        )
 
         if local_repo is None:
+            searched = ', '.join(local_repo_candidates)
             raise ValueError(
-                f"Cannot load {model_name}: local DINOv2 torch.hub repo cache not found under {hub_dir}. "
-                "Populate the hub cache first instead of relying on an implicit online download."
+                f"Cannot load {model_name}: no local DINOv2 source repository with hubconf.py "
+                f"was found. Searched: {searched}. Clone the official facebookresearch/dinov2 "
+                "repository and set TOUCHANYTHING_DINOV2_REPO to that directory; implicit "
+                "online downloads are intentionally disabled."
             )
 
         try:

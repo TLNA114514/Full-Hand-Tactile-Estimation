@@ -531,6 +531,31 @@ def make_frame_hand_meta(seq, frame_idx, hand, frame, bbox_record, gaussian_npz,
     }
 
 
+def make_archive_frame_meta(seq, frame_idx, frame):
+    return {
+        "dataset": "EgoTactile",
+        "split": seq["split"],
+        "rel_seq": seq["rel_seq"],
+        "seq_dir": seq["seq_dir"],
+        "data_json": seq["data_json"],
+        "video_path": seq["video_path"],
+        "gaussian_npz": seq["gaussian_npz"],
+        "frame_idx": frame_idx,
+        "task_hand": frame.get("task_hand"),
+        "hand": "archive",
+        "is_right": 1,
+        "sensor_valid": False,
+        "bbox": None,
+        "bbox_score": 0.0,
+        "image": "image.jpg",
+        "gaussian_pressure": None,
+        "original_frame_record": frame,
+        "keypoints_3d_cam": np.zeros((21, 3), dtype=np.float32),
+        "valid_mask": np.zeros(21, dtype=bool),
+        "archive_only": True,
+    }
+
+
 def extract_sequence_to_disk_worker(args):
     (
         seq,
@@ -612,17 +637,21 @@ def extract_sequence_to_disk_worker(args):
             for frame_idx in range(frame_count):
                 frame = frames[frame_idx]
                 bbox_record = seq_bboxes.get(str(frame_idx), {})
+                frame_has_sensor = False
                 for hand in ("left", "right"):
                     raw_sensor = frame_hand_sensor(frame, hand)
                     npz_valid = get_npz_valid(gaussian_npz, f"{hand}_sensor_valid", frame_idx)
                     has_sensor = raw_sensor is not None if npz_valid is None else bool(npz_valid)
                     if not has_sensor:
                         continue
+                    frame_has_sensor = True
                     hand_bbox = (bbox_record or {}).get(hand, {})
                     has_bbox = hand_bbox.get("bbox") is not None
                     if not has_bbox and not keep_no_bbox:
                         continue
                     expected_samples.append((frame_idx, hand))
+                if keep_no_bbox and not frame_has_sensor:
+                    expected_samples.append((frame_idx, "archive"))
 
         if trust_registry and expected_samples and all(sample in existing_samples for sample in expected_samples):
             return {
@@ -648,7 +677,7 @@ def extract_sequence_to_disk_worker(args):
             frame_needs_image = any(
                 (frame_idx, hand) in expected_samples_set
                 and (not trust_registry or (frame_idx, hand) not in existing_samples)
-                for hand in ("left", "right")
+                for hand in ("left", "right", "archive")
             )
 
             ok, frame_bgr = cap.read() if frame_needs_image else (cap.grab(), None)
@@ -721,6 +750,40 @@ def extract_sequence_to_disk_worker(args):
                     }
                 )
                 written += 1
+
+            if (frame_idx, "archive") in expected_samples_set:
+                if trust_registry and (frame_idx, "archive") in existing_samples:
+                    skipped += 1
+                else:
+                    folder_name = "__".join(
+                        sanitize_component(x)
+                        for x in [*seq["rel_parts"], f"{frame_idx:06d}", "archive"]
+                    )
+                    sample_dir = output_dir / seq["split"] / folder_name
+                    meta_path = sample_dir / "meta.json"
+                    if not target_mode and sample_is_complete(sample_dir):
+                        skipped += 1
+                    else:
+                        sample_dir.mkdir(parents=True, exist_ok=True)
+                        cv2.imwrite(str(sample_dir / "image.jpg"), frame_bgr)
+                        meta = make_archive_frame_meta(seq, frame_idx, frame)
+                        write_json_atomic(
+                            meta_path, np_to_json(meta), indent=meta_indent
+                        )
+                        registry_entries.append(
+                            {
+                                "split": seq["split"],
+                                "rel_seq": seq["rel_seq"],
+                                "frame_idx": frame_idx,
+                                "hand": "archive",
+                                "is_right": 1,
+                                "sample_dir": str(sample_dir),
+                                "has_bbox": False,
+                                "has_gaussian": False,
+                                "archive_only": True,
+                            }
+                        )
+                        written += 1
 
     except Exception as exc:
         failed += 1
@@ -850,17 +913,21 @@ def expected_samples_for_sequence(
         for frame_idx in range(frame_count):
             frame = frames[frame_idx]
             bbox_record = seq_bboxes.get(str(frame_idx), {})
+            frame_has_sensor = False
             for hand in ("left", "right"):
                 raw_sensor = frame_hand_sensor(frame, hand)
                 npz_valid = get_npz_valid(gaussian_npz, f"{hand}_sensor_valid", frame_idx)
                 has_sensor = raw_sensor is not None if npz_valid is None else bool(npz_valid)
                 if not has_sensor:
                     continue
+                frame_has_sensor = True
                 hand_bbox = (bbox_record or {}).get(hand, {})
                 has_bbox = hand_bbox.get("bbox") is not None
                 if not has_bbox and not keep_no_bbox:
                     continue
                 expected.append((frame_idx, hand))
+            if keep_no_bbox and not frame_has_sensor:
+                expected.append((frame_idx, "archive"))
 
         missing = [sample for sample in expected if sample not in existing_samples]
         return {

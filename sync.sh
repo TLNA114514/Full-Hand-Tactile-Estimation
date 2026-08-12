@@ -1,8 +1,9 @@
 #!/bin/bash
 
 # 1. 定义源（大仓）与目标（GitHub仓）的根目录
-SRC_BASE="/code/users/jiangrui/Full-Hand-Tactile-Estimation"
-DEST_BASE="/code/users/jiangrui/full_hand_tactile_estimation"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SRC_BASE="${SYNC_SOURCE_ROOT:-$SCRIPT_DIR}"
+DEST_BASE="${SYNC_DEST_ROOT:-/code/users/jiangrui/full_hand_tactile_estimation}"
 
 # 2. 【核心配置项】在这里指定需要同步的文件夹（支持相对路径）
 # 以后如果想同步新的文件夹，直接在这里换行添加名字即可！
@@ -12,8 +13,9 @@ SYNC_DIRS=(
     "hamer_tactile_infiller"
     "opentouch_hamer_ft"
     "preprocess"
-    “sam3_bbox_reconstruction”
+    "sam3_bbox_reconstruction"
     "scratch"
+    "tactile_input_priors"
     # "未来你想同步的新文件夹A"
     # "未来你想同步的新文件夹B"
 )
@@ -35,20 +37,7 @@ for DIR in "${SYNC_DIRS[@]}"; do
         
         # 使用 rsync 增量同步，排除 .git 文件、缓存文件、模型权重/Checkpoints 以及大文件
         rsync -av --delete \
-            --exclude='.git' \
-            --exclude='__pycache__' \
-            --exclude='*.pyc' \
-            --exclude='.DS_Store' \
-            --exclude='*checkpoint*' \
-            --exclude='*ckpt*' \
-            --exclude='*weights*' \
-            --exclude='*.ckpt' \
-            --exclude='*.pt' \
-            --exclude='*.pth' \
-            --exclude='*.pkl' \
-            --exclude='wandb/' \
-            --exclude='logs/' \
-            --exclude='lightning_logs/' \
+            --filter="merge $SRC_BASE/.rsync-filter" \
             --exclude='*.h5' \
             --exclude='*.hdf5' \
             --exclude='*.npy' \

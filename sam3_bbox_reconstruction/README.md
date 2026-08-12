@@ -16,8 +16,23 @@ predictor.handle_stream_request({"type": "propagate_in_video", ...})
 ```
 
 It is not a cloud service. The scripts in this folder wrap that interface, so the
-normal user-facing command is `run_pilot.sh`. SAM3 cannot be run without some
+only user-facing shell entry is `run.sh`. SAM3 cannot be run without some
 model API internally, but callers do not need to use it directly.
+
+## Unified command entry
+
+All reconstruction and writeback workflows use one launcher:
+
+```bash
+./sam3_bbox_reconstruction/run.sh pilot [run_pilot.py options]
+./sam3_bbox_reconstruction/run.sh domain opentouch|touchanything|both [pilot options]
+./sam3_bbox_reconstruction/run.sh full opentouch|touchanything|both [full options]
+./sam3_bbox_reconstruction/run.sh apply [apply_bbox_manifest.py options]
+```
+
+`run_pilot.sh`, `run_domain_pilot.sh`, and `run_full_reconstruction.sh` remain
+as thin compatibility wrappers, so existing jobs and command histories continue
+to work. New commands should use `run.sh`.
 
 Original SAM3 already supports text-prompted video tracking. SAM3.1 primarily
 adds Object Multiplex and optimized multi-object inference. Since this project
@@ -301,10 +316,10 @@ two domains independently so detection quality and TA association quality are
 reported separately:
 
 ```bash
-./sam3_bbox_reconstruction/run_domain_pilot.sh opentouch \
+./sam3_bbox_reconstruction/run.sh domain opentouch \
   --gpus 0,1,2,3,4,5,6,7
 
-./sam3_bbox_reconstruction/run_domain_pilot.sh touchanything \
+./sam3_bbox_reconstruction/run.sh domain touchanything \
   --gpus 0,1,2,3,4,5,6,7
 ```
 
@@ -319,7 +334,7 @@ To inspect more sequences, set the count per selected split. For example, this
 selects 10 sequences from each of the four TouchAnything splits (40 jobs):
 
 ```bash
-./sam3_bbox_reconstruction/run_domain_pilot.sh touchanything \
+./sam3_bbox_reconstruction/run.sh domain touchanything \
   --samples-per-split 10 \
   --gpus 0,1,2,3,4,5,6,7
 ```
@@ -341,13 +356,16 @@ creates a rollback backup before updating existing extracted metadata. Use
 the same invocation.
 
 ```bash
-./sam3_bbox_reconstruction/run_full_reconstruction.sh opentouch
-./sam3_bbox_reconstruction/run_full_reconstruction.sh touchanything
+./sam3_bbox_reconstruction/run.sh full opentouch
+./sam3_bbox_reconstruction/run.sh full touchanything
 
 # Later, write existing manifests back without touching GPUs:
-./sam3_bbox_reconstruction/run_full_reconstruction.sh opentouch --apply
-./sam3_bbox_reconstruction/run_full_reconstruction.sh touchanything --apply
+./sam3_bbox_reconstruction/run.sh full opentouch --apply
+./sam3_bbox_reconstruction/run.sh full touchanything --apply
 ```
+
+All full runs default to
+`sam3_bbox_reconstruction/outputs/full_reconstruction_flow/<domain>`.
 
 Run those two commands on separate shared-filesystem servers, or use `both` to
 run them sequentially on one server. `--workers-per-gpu` is also available on
@@ -406,7 +424,7 @@ hard error; the pilot does not silently start a gated Hugging Face download.
 environment check first:
 
 ```bash
-./sam3_bbox_reconstruction/run_domain_pilot.sh opentouch \
+./sam3_bbox_reconstruction/run.sh domain opentouch \
   --gpus 0 \
   --max-frames 32
 ```
@@ -426,7 +444,7 @@ interactive output caches retain history. For an unchunked forward pass, use the
 bounded continuous policy (the TouchAnything full wrapper already does this):
 
 ```bash
-./sam3_bbox_reconstruction/run_domain_pilot.sh touchanything \
+./sam3_bbox_reconstruction/run.sh domain touchanything \
   --video-chunk-frames 0 \
   --video-chunk-overlap 0 \
   --continuous-state-memory bounded \
@@ -523,7 +541,7 @@ are saved under
 For SAM3.1:
 
 ```bash
-./sam3_bbox_reconstruction/run_pilot.sh \
+./sam3_bbox_reconstruction/run.sh pilot \
   --sam-version sam3.1 \
   --gpus 0,1,2,3,4,5,6,7
 ```
@@ -641,7 +659,7 @@ and pressure target; an index cache alone cannot create missing examples.
 For already extracted TouchAnything samples, first generate a writeback plan:
 
 ```bash
-python sam3_bbox_reconstruction/apply_bbox_manifest.py \
+./sam3_bbox_reconstruction/run.sh apply \
   --manifest sam3_bbox_reconstruction/outputs/pilot_touchanything/manifests/touchanything_sam3_v1_highconf.jsonl
 ```
 
@@ -649,7 +667,7 @@ Inspect `manifests/writeback/bbox_writeback_plan.jsonl` and the skipped rows.
 Then apply the reviewed plan atomically:
 
 ```bash
-python sam3_bbox_reconstruction/apply_bbox_manifest.py \
+./sam3_bbox_reconstruction/run.sh apply \
   --manifest sam3_bbox_reconstruction/outputs/pilot_touchanything/manifests/touchanything_sam3_v1_highconf.jsonl \
   --apply
 ```
@@ -669,7 +687,7 @@ The command writes a timestamped `bbox_writeback_backup_*.jsonl` before changing
 the first `meta.json`. Roll back with:
 
 ```bash
-python sam3_bbox_reconstruction/apply_bbox_manifest.py \
+./sam3_bbox_reconstruction/run.sh apply \
   --restore-backup path/to/bbox_writeback_backup_TIMESTAMP.jsonl
 ```
 
@@ -697,7 +715,7 @@ filled only when projections from two prompt-accepted SAM anchors agree.
 Run a review pilot before changing a full writeback manifest:
 
 ```bash
-./sam3_bbox_reconstruction/run_domain_pilot.sh both \
+./sam3_bbox_reconstruction/run.sh domain both \
   --samples-per-split 4 \
   --gpus 0,1,2,3,4,5,6,7 \
   --flow-assist \

@@ -62,6 +62,7 @@ from train import (
     file_sha256,
     load_compatible_state_dict,
 )
+from hamer_tactile import parse_input_resolution
 
 class ViTDetDataset(torch.utils.data.Dataset):
     def __init__(self, cfg, img_cv2, boxes, right, rescale_factor=2.0):
@@ -82,15 +83,22 @@ class ViTDetDataset(torch.utils.data.Dataset):
         scale_pixels = max(bbox[2] - bbox[0], bbox[3] - bbox[1])
         bbox_size = scale_pixels * self.rescale_factor
         
-        res = self.cfg.MODEL.IMAGE_SIZE
+        output_height = int(self.cfg.MODEL.IMAGE_SIZE)
+        output_width = int(self.cfg.MODEL.BBOX_SHAPE[0])
+        res = output_height
         t = np.zeros((2, 3), dtype=np.float32)
         t[0, 0] = float(res) / bbox_size
         t[1, 1] = float(res) / bbox_size
-        t[0, 2] = res * (-float(center[0]) / bbox_size + 0.5)
+        t[0, 2] = -res * float(center[0]) / bbox_size + output_width * 0.5
         t[1, 2] = res * (-float(center[1]) / bbox_size + 0.5)
         
         img_rgb = cv2.cvtColor(self.img_cv2, cv2.COLOR_BGR2RGB)
-        img_patch = cv2.warpAffine(img_rgb, t, (res, res), flags=cv2.INTER_LINEAR)
+        img_patch = cv2.warpAffine(
+            img_rgb,
+            t,
+            (output_width, output_height),
+            flags=cv2.INTER_LINEAR,
+        )
         img_patch = img_patch.astype(np.float32) / 255.0
         
         if is_right == 0:
@@ -308,10 +316,11 @@ def _load_tactile_model_metadata(checkpoint_path):
             "backbone_sha256",
             "tactile_head_type",
             "backbone_feature_layers",
-            "dino_rezero_source",
             "dino_residual_max_scale",
             "dino_residual_rms_budget",
             "pool_layout",
+            "input_resolution",
+            "pool_output_channels",
             "decoder_dropout_scale",
             "bbox_rescale_factor",
         ):
@@ -332,16 +341,17 @@ def load_models(
     print(">>> Loading model config...")
     model_cfg_path = os.path.join(hamer_dir, '_DATA/hamer_ckpts/model_config.yaml')
     model_cfg = get_config(model_cfg_path, update_cachedir=True)
-    if (model_cfg.MODEL.BACKBONE.TYPE == 'vit') and ('BBOX_SHAPE' not in model_cfg.MODEL):
-        model_cfg.defrost()
-        model_cfg.MODEL.BBOX_SHAPE = [192, 256]
-        model_cfg.freeze()
     if 'PRETRAINED_WEIGHTS' in model_cfg.MODEL.BACKBONE:
         model_cfg.defrost()
         model_cfg.MODEL.BACKBONE.pop('PRETRAINED_WEIGHTS')
         model_cfg.freeze()
 
     metadata = _load_tactile_model_metadata(checkpoint_path)
+    input_resolution = parse_input_resolution(metadata.get("input_resolution", (256, 192)))
+    model_cfg.defrost()
+    model_cfg.MODEL.IMAGE_SIZE = input_resolution[0]
+    model_cfg.MODEL.BBOX_SHAPE = [input_resolution[1], input_resolution[0]]
+    model_cfg.freeze()
     tactile_head_type = str(metadata.get("tactile_head_type", "dense_v2_dino_rezero"))
     visual_backbone = str(metadata.get("visual_backbone", "dinov3_hplus"))
     backbone_feature_layers = tuple(int(layer) for layer in metadata.get("backbone_feature_layers", [8, 16, 24, 32]))
@@ -349,6 +359,7 @@ def load_models(
     dino_residual_rms_budget = float(metadata.get("dino_residual_rms_budget", 0.50))
     pool_layout = str(metadata.get("pool_layout", "fullgrid32"))
     decoder_dropout_scale = float(metadata.get("decoder_dropout_scale", 1.0))
+    pool_output_channels = int(metadata.get("pool_output_channels", 32))
     resolved_bbox_rescale_factor = float(
         bbox_rescale_factor
         if bbox_rescale_factor is not None
@@ -391,11 +402,12 @@ def load_models(
         backbone_feature_layers=backbone_feature_layers,
         visual_backbone=visual_backbone,
         dino_weights=str(backbone_weights),
-        dino_rezero_source="multilevel",
         dino_residual_max_scale=dino_residual_max_scale,
         dino_residual_rms_budget=dino_residual_rms_budget,
         pool_layout=pool_layout,
         decoder_dropout_scale=decoder_dropout_scale,
+        input_resolution=input_resolution,
+        pool_output_channels=pool_output_channels,
         bbox_rescale_factor=resolved_bbox_rescale_factor,
     )
     model.visual_backbone_model_name = str(metadata.get("visual_backbone_model_name", ""))
@@ -403,9 +415,9 @@ def load_models(
     expected_hash = str(metadata.get("backbone_sha256", "") or "")
     model.backbone_weights_sha256 = file_sha256(backbone_weights) if expected_hash else ""
 
-    dummy_input = torch.zeros(1, 3, model_cfg.MODEL.IMAGE_SIZE, model_cfg.MODEL.IMAGE_SIZE)
+    dummy_input = torch.zeros(1, 3, *input_resolution)
     with torch.no_grad():
-        dummy_feat = model._extract_tactile_features(dummy_input[:, :, :, 32:-32])
+        dummy_feat = model._extract_tactile_features(dummy_input)
         model.tactile_head(dummy_feat)
         print(f">>> Tactile head initialized with output dim: {model.tactile_dim}")
     print(f">>> Loading weights from checkpoint: {checkpoint_path}")

@@ -19,13 +19,14 @@ class TactileLossConfig:
     background_pred_margin: float = 0.02
     active_pressure_weight: float = 1.0
     active_pressure_gamma: float = 1.0
+    pressure_weight_mode: str = "hump"
+    active_pressure_tail_thr: float = 0.70
+    active_pressure_tail_max: float = 3.0
     background_loss_weight: float = 1.0
     logit_bce_weight: float = 0.1
     loss_ramp_epochs: int = 5
     opentouch_high_pressure_thr: float = 0.9
     opentouch_high_pressure_weight: float = 0.3
-    tail_pressure_thr: float = 0.2
-    tail_l1_weight: float = 0.0
     location_loss_weight: float = 0.0
     location_gt_volume_thr: float = 1.0
     location_distribution_power: float = 1.0
@@ -40,6 +41,22 @@ class TactileLossConfig:
             raise ValueError("Only loss_mode=dense_v2 is supported")
         if not 0.0 <= self.active_pressure_thr < self.active_pressure_peak < self.active_pressure_high <= 1.0:
             raise ValueError("Expected active_pressure_thr < active_pressure_peak < active_pressure_high")
+        if self.pressure_weight_mode not in {"hump", "plateau", "capped_linear"}:
+            raise ValueError(
+                "pressure_weight_mode must be one of: hump, plateau, capped_linear"
+            )
+        if not self.active_pressure_peak < self.active_pressure_tail_thr <= 1.0:
+            raise ValueError(
+                "active_pressure_tail_thr must lie in (active_pressure_peak, 1]"
+            )
+        peak_total_weight = 1.0 + float(self.active_pressure_weight)
+        if not math.isfinite(float(self.active_pressure_tail_max)) or (
+            float(self.active_pressure_tail_max) < peak_total_weight
+        ):
+            raise ValueError(
+                "active_pressure_tail_max must be finite and at least "
+                "1 + active_pressure_weight"
+            )
         if not 0.0 <= self.background_pressure_thr <= self.background_pred_margin <= 1.0:
             raise ValueError("Background thresholds must lie in [0, 1]")
         for name in (
@@ -47,14 +64,11 @@ class TactileLossConfig:
             "active_pressure_gamma",
             "background_loss_weight",
             "logit_bce_weight",
-            "tail_l1_weight",
             "location_loss_weight",
             "contact_loss_weight",
         ):
             if float(getattr(self, name)) < 0.0:
                 raise ValueError(f"{name} must be nonnegative")
-        if not 0.0 <= self.tail_pressure_thr <= 1.0:
-            raise ValueError("tail_pressure_thr must lie in [0, 1]")
         if self.location_gt_volume_thr < 0.0:
             raise ValueError("location_gt_volume_thr must be nonnegative")
         if not math.isfinite(float(self.location_distribution_power)) or not (
@@ -188,10 +202,39 @@ def dataset_weight_like(target: torch.Tensor, dataset_batch: Any, config: Tactil
 def pressure_weight_like(target: torch.Tensor, config: TactileLossConfig, ramp: float) -> torch.Tensor:
     active = (target >= config.active_pressure_thr).to(target.dtype)
     rising = (target - config.active_pressure_thr) / (config.active_pressure_peak - config.active_pressure_thr)
-    falling = (config.active_pressure_high - target) / (config.active_pressure_high - config.active_pressure_peak)
-    hump = torch.where(target <= config.active_pressure_peak, rising, falling)
-    active_strength = torch.clamp(hump, min=0.0, max=1.0).pow(config.active_pressure_gamma) * active
-    return 1.0 + float(ramp) * config.active_pressure_weight * active_strength
+    rising_strength = torch.clamp(rising, min=0.0, max=1.0).pow(
+        config.active_pressure_gamma
+    ) * active
+    peak_additive = float(config.active_pressure_weight)
+
+    if config.pressure_weight_mode == "hump":
+        falling = (config.active_pressure_high - target) / (
+            config.active_pressure_high - config.active_pressure_peak
+        )
+        hump = torch.where(target <= config.active_pressure_peak, rising, falling)
+        active_strength = (
+            torch.clamp(hump, min=0.0, max=1.0).pow(config.active_pressure_gamma)
+            * active
+        )
+        additive = peak_additive * active_strength
+    elif config.pressure_weight_mode == "plateau":
+        additive = peak_additive * rising_strength
+    else:
+        tail_progress = torch.clamp(
+            (target - config.active_pressure_peak)
+            / (config.active_pressure_tail_thr - config.active_pressure_peak),
+            min=0.0,
+            max=1.0,
+        )
+        tail_additive = peak_additive + tail_progress * (
+            float(config.active_pressure_tail_max) - 1.0 - peak_additive
+        )
+        additive = torch.where(
+            target <= config.active_pressure_peak,
+            peak_additive * rising_strength,
+            tail_additive * active,
+        )
+    return 1.0 + float(ramp) * additive
 
 
 def global_conditional_mean(local_sum: torch.Tensor, local_count: torch.Tensor) -> torch.Tensor:
@@ -323,6 +366,14 @@ def compute_tactile_loss(
     weighted_tactile = (direct * weights * mask).sum() / denom
     weighted_tactile_full_ramp = (direct * full_ramp_weights * mask).sum() / denom
     base_tactile = (direct * mask).sum() / denom
+    pressure_weight_mean = (pressure_weight * mask).sum() / denom
+    pressure_weight_max = (pressure_weight * mask).amax()
+    pressure_weight_fraction_gt2 = (
+        ((pressure_weight > 2.0).to(mask.dtype) * mask).sum() / denom
+    )
+    weighted_to_direct_loss_ratio = weighted_tactile / base_tactile.detach().clamp_min(
+        1e-12
+    )
     smooth_l1_raw = (smooth * mask).sum() / denom
     logit_bce_raw = (logit_bce * mask).sum() / denom
 
@@ -333,18 +384,7 @@ def compute_tactile_loss(
     ).sum() / background_denom
     background = background_raw * (ramp * config.background_loss_weight)
 
-    tail_mask = (target >= config.tail_pressure_thr).to(target.dtype) * mask
-    tail_count_local = tail_mask.float().sum()
-    if config.tail_l1_weight > 0.0:
-        tail_abs_sum = (torch.abs(pred.float() - target.float()) * tail_mask.float()).sum()
-        tail_l1_raw = global_conditional_mean(tail_abs_sum, tail_count_local)
-        tail_l1_weighted = tail_l1_raw * (ramp * config.tail_l1_weight)
-    else:
-        # Preserve the baseline graph and avoid an unnecessary collective.
-        tail_l1_raw = pred.sum() * 0.0
-        tail_l1_weighted = tail_l1_raw
-
-    total = weighted_tactile + background + tail_l1_weighted
+    total = weighted_tactile + background
 
     location_mask = palm.float() * (valid > 0.0).float()
     location_gt_raw = target.float().clamp_min(0.0) * location_mask
@@ -409,7 +449,6 @@ def compute_tactile_loss(
     full_ramp_total = (
         weighted_tactile_full_ramp
         + background_raw * config.background_loss_weight
-        + tail_l1_raw * config.tail_l1_weight
         + location_loss_raw * config.location_loss_weight
         + contact_loss_raw * config.contact_loss_weight
     )
@@ -419,10 +458,11 @@ def compute_tactile_loss(
         "loss_logit_bce_raw": logit_bce_raw.detach(),
         "loss_base_tactile": base_tactile.detach(),
         "loss_weighted_tactile": weighted_tactile.detach(),
+        "diagnostics_pressure_weight_mean": pressure_weight_mean.detach(),
+        "diagnostics_pressure_weight_max": pressure_weight_max.detach(),
+        "diagnostics_pressure_weight_fraction_gt2": pressure_weight_fraction_gt2.detach(),
+        "diagnostics_weighted_to_direct_loss_ratio": weighted_to_direct_loss_ratio.detach(),
         "loss_background": background.detach(),
-        "loss_tail_l1_raw": tail_l1_raw.detach(),
-        "loss_tail_l1_weighted": tail_l1_weighted.detach(),
-        "diagnostics_tail_fraction": tail_count_local.detach() / mask.sum().detach().clamp_min(1.0),
         "loss_location_raw": location_loss_raw.detach(),
         "loss_location_weighted": location_loss_weighted.detach(),
         "diagnostics_location_eligible_fraction": location_eligible_fraction.detach(),

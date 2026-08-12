@@ -22,10 +22,7 @@ shift
 
 if (( $# > 0 )); then
     CKPT_SELECTORS=("$@")
-elif [[ -f "$SCRIPT_DIR/checkpoints/$EXP_NAME/best_contact.ckpt" ]]; then
-    CKPT_SELECTORS=(loss-best contact-best)
 else
-    # OpenTouch-only runs do not produce a TouchAnything contact checkpoint.
     CKPT_SELECTORS=(loss-best last)
 fi
 
@@ -46,13 +43,20 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 GPUS="${GPUS:-0,1,2,3,4,5,6,7}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
 INDEX_WORKERS="${INDEX_WORKERS:-128}"
-NUM_WORKERS="${NUM_WORKERS:-8}"
+NUM_WORKERS="${NUM_WORKERS:-32}"
+DATA_BACKEND="${DATA_BACKEND:-auto}"
+QUERY_MANIFESTS="${QUERY_MANIFESTS:-}"
+HDF5_HANDLE_CACHE_SIZE="${HDF5_HANDLE_CACHE_SIZE:-4}"
+HDF5_MANIFEST_CACHE_DIR="${HDF5_MANIFEST_CACHE_DIR:-$SCRIPT_DIR/hdf5_manifest_cache}"
 DINO_WEIGHTS="${DINO_WEIGHTS:-}"
 BBOX_MANIFESTS="${BBOX_MANIFESTS:-}"
 SAVE_DIAGNOSTICS="${SAVE_DIAGNOSTICS:-1}"
 RUN_SEQUENCE_AUDIT="${RUN_SEQUENCE_AUDIT:-0}"
+REBUILD_INDEX="${REBUILD_INDEX:-0}"
+PROCESS_GRACE_SECONDS="${PROCESS_GRACE_SECONDS:-30}"
+PROCESS_KILL_WAIT_SECONDS="${PROCESS_KILL_WAIT_SECONDS:-5}"
 
-for flag_name in SAVE_DIAGNOSTICS RUN_SEQUENCE_AUDIT; do
+for flag_name in SAVE_DIAGNOSTICS RUN_SEQUENCE_AUDIT REBUILD_INDEX; do
     flag_value="${!flag_name}"
     if [[ "$flag_value" != "0" && "$flag_value" != "1" ]]; then
         echo "$flag_name must be 0 or 1 (got '$flag_value')." >&2
@@ -105,6 +109,7 @@ echo "GPUs per eval: $GPUS"
 echo "Evaluation tasks: ${EVAL_TASKS[*]}"
 echo "Save diagnostics: $SAVE_DIAGNOSTICS"
 echo "Run sequence audit: $RUN_SEQUENCE_AUDIT"
+echo "Rebuild index: $REBUILD_INDEX"
 echo "Output root: $OUTPUT_ROOT"
 echo
 
@@ -130,13 +135,22 @@ for ckpt in "${CKPT_SELECTORS[@]}"; do
             --batch_size "$BATCH_SIZE"
             --gpus "$GPUS"
             --num_workers "$NUM_WORKERS"
+            --data_backend "$DATA_BACKEND"
+            --hdf5_handle_cache_size "$HDF5_HANDLE_CACHE_SIZE"
+            --hdf5_manifest_cache_dir "$HDF5_MANIFEST_CACHE_DIR"
             --index_workers "$INDEX_WORKERS"
             --exp_name "$EXP_NAME"
             --ckpt "$ckpt"
             --datasets "$dataset"
             --split "$split"
             --report_dir "$task_dir"
+            --eval_output_root "$OUTPUT_ROOT"
         )
+        if [[ "$REBUILD_INDEX" == "1" ]]; then
+            command+=(--rebuild_index)
+        else
+            command+=(--no-rebuild_index)
+        fi
         if [[ "$SAVE_DIAGNOSTICS" == "1" ]]; then
             command+=(--save_diagnostics)
         fi
@@ -146,10 +160,21 @@ for ckpt in "${CKPT_SELECTORS[@]}"; do
         if [[ -n "$BBOX_MANIFESTS" ]]; then
             command+=(--bbox_manifests "$BBOX_MANIFESTS")
         fi
+        if [[ -n "$QUERY_MANIFESTS" ]]; then
+            command+=(--query_manifests "$QUERY_MANIFESTS")
+        fi
 
         echo "Starting $label"
         echo "  log: $log_file"
-        "${command[@]}" >"$log_file" 2>&1 &
+        supervised_command=(
+            "$PYTHON_BIN" hamer_tactile_ft/process_supervisor.py
+            --registry-dir "$SCRIPT_DIR/run_processes"
+            --grace-seconds "$PROCESS_GRACE_SECONDS"
+            --kill-wait-seconds "$PROCESS_KILL_WAIT_SECONDS"
+            --
+            "${command[@]}"
+        )
+        "${supervised_command[@]}" >"$log_file" 2>&1 &
         PIDS+=("$!")
         LABELS+=("$label")
         LOG_FILES+=("$log_file")

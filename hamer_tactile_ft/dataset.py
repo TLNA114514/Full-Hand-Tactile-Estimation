@@ -1,26 +1,53 @@
 import os
 import sys
 import json
-import csv
 import cv2
 import numpy as np
 import torch
 import hashlib
 import time
-import socket
-import gc
-import mmap
-import ctypes
-from functools import lru_cache
-from array import array
+from collections import OrderedDict
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from torch.utils.data import Dataset
 from yacs.config import CfgNode
+
+if __package__:
+    from .process_lifecycle import initialize_worker_parent_death_signal
+else:
+    from process_lifecycle import initialize_worker_parent_death_signal
+
+_workspace_import_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _workspace_import_root not in sys.path:
+    sys.path.append(_workspace_import_root)
+
+try:
+    from tactile_input_priors.depth_sidecar import (
+        SequenceSidecarReader,
+        sequence_sidecar_filename,
+        warp_record_pointnormal,
+    )
+except ImportError:
+    SequenceSidecarReader = None
+    sequence_sidecar_filename = None
+    warp_record_pointnormal = None
 
 try:
     import orjson
 except ImportError:
     orjson = None
+
+try:
+    if __package__:
+        from . import hdf5_storage as _hdf5_storage
+    else:
+        import hdf5_storage as _hdf5_storage
+except ImportError:
+    _hdf5_storage = None
+
+if __package__:
+    from .data.indexing import *
+else:
+    from data.indexing import *
 
 # Add paths
 ft_dir = os.path.dirname(os.path.abspath(__file__))
@@ -29,8 +56,13 @@ sys.path.append(os.path.join(workspace_dir, "hamer"))
 
 # Global keypoint permutation for hand flipping (MediaPipe format)
 FLIP_KEYPOINT_PERMUTATION = list(range(21))
-CANONICAL_SPLITS = ("train", "val", "test")
-INDEX_CACHE_VERSION = 7
+HDF5_STORAGE_SCHEMA_VERSION = str(
+    getattr(
+        _hdf5_storage,
+        "HDF5_SCHEMA_VERSION",
+        getattr(_hdf5_storage, "SCHEMA_VERSION", "tactile_sequence_hdf5_v1"),
+    )
+)
 
 DATASET_ROOTS = {
     "opentouch": "/data1/jiangrui/OpenTouch Data/full_dataset",
@@ -46,1158 +78,15 @@ DATASET_ROOTS = {
     "ego": "/data1/jiangrui/EgoTactile/Raw_data/extracted_frames",
 }
 
-SUBDIV_OBJ_PATH = os.path.join(
-    workspace_dir,
-    "opentouch",
-    "preprocess",
-    "scratch",
-    "mano_right_neutral_subdiv.obj",
-)
-SUBDIV_PALM_FACES_PATH = os.path.join(
-    workspace_dir,
-    "opentouch",
-    "preprocess",
-    "scratch",
-    "auto_calibrated_palm_subdiv_faces.json",
-)
 
-
-def count_obj_vertices(obj_path):
-    count = 0
-    with open(obj_path, "r") as f:
-        for line in f:
-            if line.startswith("v "):
-                count += 1
-    return count
-
-
-EXPECTED_TACTILE_DIM = count_obj_vertices(SUBDIV_OBJ_PATH)
-
-
-def load_subdiv_palm_mask(tactile_dim=EXPECTED_TACTILE_DIM):
-    with open(SUBDIV_PALM_FACES_PATH, "r", encoding="utf-8") as handle:
-        palm_data = json.load(handle)
-    palm_mask = np.zeros(int(tactile_dim), dtype=np.float32)
-    for triplet in palm_data["group_negative"]["face_triplets"]:
-        for vertex_id in triplet:
-            if 0 <= vertex_id < tactile_dim:
-                palm_mask[vertex_id] = 1.0
-    return palm_mask
-
-
-INDEX_PALM_MASK = load_subdiv_palm_mask()
-INDEX_PALM_VERTEX_MASK = INDEX_PALM_MASK > 0.5
-
-
-def load_json_file(path):
-    if orjson is not None:
-        with open(path, "rb") as handle:
-            return orjson.loads(handle.read())
-    with open(path, "r", encoding="utf-8") as handle:
-        return json.load(handle)
-
-
-def canonical_dataset_name(value):
-    raw_name = str(value or "OpenTouch")
-    aliases = {
-        "opentouch": "OpenTouch",
-        "open_touch": "OpenTouch",
-        "touchanything": "TouchAnything",
-        "touch_anything": "TouchAnything",
-        "egotouch": "TouchAnything",
-        "ego_touch": "TouchAnything",
-        "egotactile": "EgoTactile",
-        "ego_tactile": "EgoTactile",
-    }
-    return aliases.get(raw_name.lower(), raw_name)
-
-
-def canonical_dataset_filter(values):
-    if values is None:
-        return ()
-    if isinstance(values, str):
-        values = values.split(",")
-    return tuple(sorted({
-        canonical_dataset_name(value)
-        for value in values
-        if str(value).strip()
-    }))
-
-
-@lru_cache(maxsize=32)
-def sha256_file(path, chunk_size=1024 * 1024):
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        while True:
-            chunk = handle.read(chunk_size)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def valid_bbox(bbox):
-    if bbox is None or (isinstance(bbox, str) and bbox == "null"):
-        return False
-    try:
-        arr = np.array(bbox, dtype=np.float32)
-    except Exception:
-        return False
-    return arr.shape == (4,) and np.isfinite(arr).all() and np.all(arr[2:4] - arr[0:2] > 1.0)
-
-
-def legacy_valid_bbox(bbox):
-    """Reproduce the v2 index condition for data-integrity comparisons only."""
-    if bbox is None or (isinstance(bbox, str) and bbox == "null"):
-        return False
-    try:
-        arr = np.asarray(bbox, dtype=np.float32)
-    except Exception:
-        return False
-    return arr.shape == (4,) and np.isfinite(arr).all() and np.max(arr[2:4] - arr[0:2]) > 1.0
-
-
-def pressure_for_query(meta, dataset_name, hand=None, is_right=None):
-    if dataset_name == "TouchAnything":
-        return meta.get("hands", {}).get(hand or "", {}).get("gaussian_pressure")
-    if is_right is None:
-        is_right = int(meta.get("is_right", 1))
-    side = "right" if int(is_right) == 1 else "left"
-    pressure = meta.get("original_hdf5_data", {}).get(f"{side}_pressure_continuous_subdiv")
-    return pressure if pressure is not None else meta.get("gaussian_pressure")
-
-
-def pressure_array_or_none(pressure, tactile_dim=EXPECTED_TACTILE_DIM):
-    if pressure is None:
-        return None
-    try:
-        value = np.asarray(pressure, dtype=np.float32)
-    except (TypeError, ValueError):
-        return None
-    if value.shape != (int(tactile_dim),) or not bool(np.isfinite(value).all()):
-        return None
-    return value
-
-
-def valid_pressure(pressure, tactile_dim=EXPECTED_TACTILE_DIM):
-    return pressure_array_or_none(pressure, tactile_dim=tactile_dim) is not None
-
-
-def has_pressure(meta, dataset_name, hand=None, is_right=None):
-    return valid_pressure(pressure_for_query(meta, dataset_name, hand=hand, is_right=is_right))
-
-
-def query_sequence_key(meta, dataset_name, hand, sample_dir):
-    query_alias = str(hand or ("right" if int(meta.get("is_right", 1)) else "left"))
-    if dataset_name == "TouchAnything":
-        parts = (
-            dataset_name,
-            meta.get("split", ""),
-            meta.get("scene", ""),
-            meta.get("task", ""),
-            meta.get("clip", meta.get("rel_clip", "")),
-            query_alias,
-        )
-    else:
-        parts = (
-            dataset_name,
-            meta.get("split", ""),
-            meta.get("scene", ""),
-            meta.get("demo", ""),
-            query_alias,
-        )
-    normalized = [str(value).strip() for value in parts if str(value).strip()]
-    if len(normalized) <= 2:
-        normalized.insert(-1, os.path.basename(sample_dir))
-    return "/".join(normalized)
-
-
-def sample_provenance(meta, dataset_name, hand, is_right, sample_dir, pressure):
-    hand_meta = meta.get("hands", {}).get(hand or "", {}) if dataset_name == "TouchAnything" else {}
-    if dataset_name == "TouchAnything":
-        pressure_source_key = hand_meta.get("gaussian_pressure_key") or "gaussian_pressure"
-        bbox_score = hand_meta.get("bbox_score", 0.0)
-    else:
-        side = "right" if int(is_right) == 1 else "left"
-        original = meta.get("original_hdf5_data", {})
-        pressure_source_key = (
-            f"{side}_pressure_continuous_subdiv"
-            if original.get(f"{side}_pressure_continuous_subdiv") is not None
-            else "gaussian_pressure"
-        )
-        bbox_score = meta.get("bbox_score", 0.0)
-    pressure_array = pressure if isinstance(pressure, np.ndarray) else np.asarray(pressure, dtype=np.float32)
-    palm_pressure = np.clip(pressure_array[INDEX_PALM_VERTEX_MASK], 0.0, 1.0)
-    return {
-        "sequence_key": query_sequence_key(meta, dataset_name, hand, sample_dir),
-        "frame_idx": int(meta.get("frame_idx", 0) or 0),
-        "query_alias": str(hand or ("right" if int(is_right) else "left")),
-        "bbox_score": float(bbox_score or 0.0),
-        "pressure_source_key": str(pressure_source_key),
-        "source_frame_idx": meta.get("jq_pressure_frame_index"),
-        "timestamp": meta.get("timestamp"),
-        "max_pressure": float(palm_pressure.max()),
-        "target_volume": float(palm_pressure.sum()),
-        "target_active_count": int(np.count_nonzero(palm_pressure >= 0.05)),
-    }
-
-
-SAM3_BBOX_SOURCE_SCHEMA = "sam3_bbox_source_v1"
-BBOX_SOURCE_POLICIES = ("any", "sam3_only")
-
-
-def bbox_source_for_query(meta, dataset_name, hand=None):
-    if dataset_name == "TouchAnything":
-        return meta.get("hands", {}).get(hand or "", {}).get("bbox_source")
-    return meta.get("bbox_source")
-
-
-def bbox_source_allowed(
-    meta,
-    dataset_name,
-    hand=None,
-    policy="any",
-    allowed_manifest_sha256=None,
-):
-    policy = str(policy or "any").lower()
-    if policy not in BBOX_SOURCE_POLICIES:
-        raise ValueError(
-            f"Unsupported bbox_source_policy={policy!r}; choose one of {BBOX_SOURCE_POLICIES}"
-        )
-    if policy == "any":
-        return True
-    source = bbox_source_for_query(meta, dataset_name, hand=hand)
-    if not isinstance(source, dict) or source.get("schema") != SAM3_BBOX_SOURCE_SCHEMA:
-        return False
-    allowed_hashes = set(allowed_manifest_sha256 or ())
-    return not allowed_hashes or source.get("source_manifest_sha256") in allowed_hashes
-
-
-def _strict_samples_from_meta(
-    sample_dir,
-    meta,
-    bbox_source_policy="any",
-    allowed_manifest_sha256=None,
-):
-    samples = []
-    dataset_name = canonical_dataset_name(meta.get("dataset", "OpenTouch"))
-    if dataset_name == "TouchAnything":
-        image_name = meta.get("views", {}).get("chest", "chest.jpg")
-        if not os.path.isfile(os.path.join(sample_dir, image_name)):
-            return []
-        for hand in ("left", "right"):
-            hand_meta = meta.get("hands", {}).get(hand, {})
-            bbox = hand_meta.get("bbox_chest")
-            is_right = int(hand_meta.get("is_right", 1 if hand == "right" else 0))
-            pressure = pressure_array_or_none(pressure_for_query(meta, dataset_name, hand=hand))
-            if (
-                valid_bbox(bbox)
-                and pressure is not None
-                and bbox_source_allowed(
-                    meta,
-                    dataset_name,
-                    hand=hand,
-                    policy=bbox_source_policy,
-                    allowed_manifest_sha256=allowed_manifest_sha256,
-                )
-            ):
-                record = {
-                    "sample_dir": sample_dir,
-                    "dataset": dataset_name,
-                    "hand": hand,
-                    "is_right": is_right,
-                    "bbox_source_policy": str(bbox_source_policy),
-                }
-                record.update(sample_provenance(meta, dataset_name, hand, is_right, sample_dir, pressure))
-                samples.append(record)
-    else:
-        is_right = int(meta.get("is_right", 1))
-        hand = "right" if is_right else "left"
-        image_name = meta.get("image", "image.jpg")
-        pressure = pressure_array_or_none(pressure_for_query(meta, dataset_name, is_right=is_right))
-        if (
-            os.path.isfile(os.path.join(sample_dir, image_name))
-            and valid_bbox(meta.get("bbox"))
-            and pressure is not None
-            and bbox_source_allowed(
-                meta,
-                dataset_name,
-                hand=hand,
-                policy=bbox_source_policy,
-                allowed_manifest_sha256=allowed_manifest_sha256,
-            )
-        ):
-            record = {
-                "sample_dir": sample_dir,
-                "dataset": dataset_name,
-                "hand": hand,
-                "is_right": is_right,
-                "bbox_source_policy": str(bbox_source_policy),
-            }
-            record.update(sample_provenance(meta, dataset_name, hand, is_right, sample_dir, pressure))
-            samples.append(record)
-    return samples
-
-
-def scan_sample_dir(
-    sample_dir,
-    bbox_source_policy="any",
-    allowed_manifest_sha256=None,
-):
-    if not os.path.isdir(sample_dir):
-        return []
-    meta_path = os.path.join(sample_dir, "meta.json")
-    if not os.path.exists(meta_path):
-        return []
-    try:
-        meta = load_json_file(meta_path)
-    except Exception:
-        return []
-    return _strict_samples_from_meta(
-        sample_dir,
-        meta,
-        bbox_source_policy,
-        allowed_manifest_sha256=allowed_manifest_sha256,
-    )
-
-
-def scan_sample_dirs_batch(
-    sample_dirs,
-    bbox_source_policy="any",
-    allowed_manifest_sha256=None,
-):
-    """Build compact training-index records without data-integrity sidecars."""
-    samples = []
-    for sample_dir in sample_dirs:
-        samples.extend(
-            scan_sample_dir(
-                sample_dir,
-                bbox_source_policy,
-                allowed_manifest_sha256=allowed_manifest_sha256,
-            )
-        )
-    return {
-        "sample_dir_count": len(sample_dirs),
-        "samples": samples,
-    }
-
-
-def sample_dirs_from_bbox_manifests(
-    paths,
-    *,
-    split,
-    expected_datasets=None,
-    progress_every=100000,
-    progress_callback=None,
-):
-    """Read candidate sample directories directly from reviewed SAM3 manifests."""
-
-    expected = set(canonical_dataset_filter(expected_datasets))
-    selected_dirs = set()
-    selected_datasets = set()
-    rows_seen = 0
-    started = time.monotonic()
-    for path in paths:
-        with open(path, "rb") as handle:
-            for line_number, line in enumerate(handle, start=1):
-                if not line.strip():
-                    continue
-                try:
-                    row = orjson.loads(line) if orjson is not None else json.loads(line)
-                except Exception as exc:
-                    raise ValueError(f"Invalid SAM3 manifest row {path}:{line_number}: {exc}") from exc
-                rows_seen += 1
-                if rows_seen % int(progress_every) == 0:
-                    elapsed = max(time.monotonic() - started, 1e-6)
-                    print(
-                        f"[{split}] SAM3 manifests read {rows_seen} rows, selected "
-                        f"{len(selected_dirs)} sample dirs ({rows_seen / elapsed:.0f} rows/s)...",
-                        flush=True,
-                    )
-                    if progress_callback:
-                        progress_callback(rows_seen)
-                if str(row.get("split", "")) != str(split):
-                    continue
-                dataset_name = canonical_dataset_name(row.get("dataset"))
-                if expected and dataset_name not in expected:
-                    continue
-                sample_dir = str(row.get("sample_dir") or "").strip()
-                if not sample_dir:
-                    continue
-                selected_dirs.add(os.path.realpath(os.path.abspath(os.path.expanduser(sample_dir))))
-                selected_datasets.add(dataset_name)
-    missing = sorted(expected - selected_datasets)
-    if missing:
-        raise ValueError(
-            f"SAM3 manifests contain no split={split!r} samples for expected datasets {missing}"
-        )
-    print(
-        f"[{split}] SAM3 manifests selected {len(selected_dirs)} unique sample dirs "
-        f"from {rows_seen} rows.",
-        flush=True,
-    )
-    if progress_callback:
-        progress_callback(rows_seen)
-    return sorted(selected_dirs)
-
-
-def _audit_record_from_sample(sample, meta):
-    dataset_name = sample["dataset"]
-    hand = sample["hand"]
-    is_right = int(sample["is_right"])
-    pressure = pressure_for_query(meta, dataset_name, hand=hand, is_right=is_right)
-    pressure_array = np.clip(np.asarray(pressure, dtype=np.float32), 0.0, 1.0)
-    masked_pressure = pressure_array * INDEX_PALM_MASK
-    if dataset_name == "TouchAnything":
-        hand_meta = meta.get("hands", {}).get(hand, {})
-        bbox = hand_meta.get("bbox_chest")
-        image_name = meta.get("views", {}).get("chest", "chest.jpg")
-        other_hand = "right" if hand == "left" else "left"
-        other_meta = meta.get("hands", {}).get(other_hand, {})
-        other_bbox = other_meta.get("bbox_chest") if valid_bbox(other_meta.get("bbox_chest")) else None
-        other_pressure = other_meta.get("gaussian_pressure")
-        other_volume = 0.0
-        if valid_pressure(other_pressure):
-            other_array = np.clip(np.asarray(other_pressure, dtype=np.float32), 0.0, 1.0)
-            other_volume = float((other_array * INDEX_PALM_MASK).sum())
-        required_fields = ("frame_idx", "scene", "task", "clip")
-    else:
-        bbox = meta.get("bbox")
-        image_name = meta.get("image", "image.jpg")
-        other_bbox = None
-        other_volume = 0.0
-        required_fields = ("frame_idx", "scene", "demo")
-    bbox_array = np.asarray(bbox, dtype=np.float32)
-    missing_fields = [name for name in required_fields if meta.get(name) in (None, "")]
-    return {
-        "sample_dir": sample["sample_dir"],
-        "dataset": dataset_name,
-        "hand": hand,
-        "is_right": is_right,
-        "sequence_key": sample["sequence_key"],
-        "query_alias": sample["query_alias"],
-        "frame_idx": sample["frame_idx"],
-        "bbox_score": sample["bbox_score"],
-        "pressure_source_key": sample["pressure_source_key"],
-        "source_frame_idx": sample.get("source_frame_idx"),
-        "timestamp": sample.get("timestamp"),
-        "query_bbox": bbox_array.tolist(),
-        "co_visible_bbox": None if other_bbox is None else np.asarray(other_bbox, dtype=np.float32).tolist(),
-        "co_visible_gt_volume": other_volume,
-        "image_name": image_name,
-        "target_checksum": hashlib.sha256(np.ascontiguousarray(masked_pressure).tobytes()).hexdigest(),
-        "target_volume": float(masked_pressure.sum()),
-        "target_active_count": int((masked_pressure >= 0.05).sum()),
-        "max_pressure": float(masked_pressure.max()),
-        "metadata_missing_fields": missing_fields,
-        "pressure_npz_frame_index": meta.get("pressure_npz_frame_index", meta.get("npz_array_index")),
-        "rgb_timestamp": meta.get("rgb_timestamp", meta.get("frame_timestamp")),
-        "pressure_timestamp": meta.get("pressure_timestamp"),
-    }
-
-
-def scan_sample_dir_integrity(sample_dir):
-    """Report records admitted by the old index but rejected by the strict index."""
-    empty_result = {
-        "samples": [],
-        "audit_rows": [],
-        "legacy_candidate_count": 0,
-        "strict_sample_count": 0,
-        "rejections": [],
-    }
-    meta_path = os.path.join(sample_dir, "meta.json")
-    if not os.path.isfile(meta_path):
-        return empty_result
-    try:
-        meta = load_json_file(meta_path)
-    except Exception:
-        return empty_result
-
-    dataset_name = canonical_dataset_name(meta.get("dataset", "OpenTouch"))
-    strict_samples = _strict_samples_from_meta(sample_dir, meta)
-    strict_keys = {(sample["hand"], int(sample["is_right"])) for sample in strict_samples}
-    candidates = []
-    if dataset_name == "TouchAnything":
-        image_name = meta.get("views", {}).get("chest", "chest.jpg")
-        for hand in ("left", "right"):
-            hand_meta = meta.get("hands", {}).get(hand, {})
-            is_right = int(hand_meta.get("is_right", 1 if hand == "right" else 0))
-            pressure = hand_meta.get("gaussian_pressure")
-            bbox = hand_meta.get("bbox_chest")
-            if legacy_valid_bbox(bbox) and pressure is not None:
-                candidates.append((hand, is_right, bbox, pressure, image_name))
-    else:
-        is_right = int(meta.get("is_right", 1))
-        hand = "right" if is_right else "left"
-        pressure = pressure_for_query(meta, dataset_name, is_right=is_right)
-        bbox = meta.get("bbox")
-        if legacy_valid_bbox(bbox) and pressure is not None:
-            candidates.append((hand, is_right, bbox, pressure, meta.get("image", "image.jpg")))
-
-    rejections = []
-    for hand, is_right, bbox, pressure, image_name in candidates:
-        if (hand, is_right) in strict_keys:
-            continue
-        reasons = []
-        if not os.path.isfile(os.path.join(sample_dir, image_name)):
-            reasons.append("image_missing")
-        if not valid_bbox(bbox):
-            reasons.append("bbox_invalid_strict")
-        if not valid_pressure(pressure):
-            reasons.append("pressure_invalid")
-        rejections.append({
-            "sample_dir": sample_dir,
-            "dataset": dataset_name,
-            "hand": hand,
-            "is_right": is_right,
-            "reason": ",".join(reasons) or "unknown_strict_rejection",
-        })
-    return {
-        "samples": strict_samples,
-        "audit_rows": [_audit_record_from_sample(sample, meta) for sample in strict_samples],
-        "legacy_candidate_count": len(candidates),
-        "strict_sample_count": len(strict_samples),
-        "rejections": rejections,
-    }
-
-
-def scan_sample_dirs_integrity_batch(sample_dirs):
-    """Scan and serialize a directory batch inside one worker process."""
-    samples = []
-    audit_lines = []
-    legacy_candidate_count = 0
-    rejections = []
-    for sample_dir in sample_dirs:
-        result = scan_sample_dir_integrity(sample_dir)
-        samples.extend(result["samples"])
-        legacy_candidate_count += int(result["legacy_candidate_count"])
-        rejections.extend(result["rejections"])
-        audit_lines.extend(
-            json.dumps(row, separators=(",", ":"), ensure_ascii=False) + "\n"
-            for row in result["audit_rows"]
-        )
-    return {
-        "sample_dir_count": len(sample_dirs),
-        "samples": samples,
-        "audit_jsonl": "".join(audit_lines),
-        "legacy_candidate_count": legacy_candidate_count,
-        "strict_sample_count": len(samples),
-        "rejections": rejections,
-    }
-
-
-def filter_sample_groups_by_bbox_source_batch(payload):
-    """Filter compact-index groups while reading each sample meta.json only once."""
-
-    sample_groups, policy = payload
-    kept = []
-    rejected = 0
-    for group in sample_groups:
-        if not group:
-            continue
-        meta_path = os.path.join(group[0]["sample_dir"], "meta.json")
-        try:
-            meta = load_json_file(meta_path)
-        except Exception:
-            rejected += len(group)
-            continue
-        for sample in group:
-            dataset_name = canonical_dataset_name(
-                sample.get("dataset", meta.get("dataset", "OpenTouch"))
-            )
-            if bbox_source_allowed(
-                meta,
-                dataset_name,
-                hand=sample.get("hand"),
-                policy=policy,
-            ):
-                kept.append({**sample, "bbox_source_policy": policy})
-            else:
-                rejected += 1
-    return {"samples": kept, "rejected": rejected}
-
-
-COMPACT_INDEX_FIELDS = (
-    "sample_dir",
-    "dataset",
-    "hand",
-    "is_right",
-    "sequence_key",
-    "frame_idx",
-    "query_alias",
-    "bbox_score",
-    "pressure_source_key",
-    "source_frame_idx",
-    "timestamp",
-    "max_pressure",
-    "target_volume",
-    "target_active_count",
-)
-
-
-def _optional_manifest_value(value):
-    value = str(value or "").strip()
-    return value if value else None
-
-
-def read_compact_index_from_audit_csv(
-    path,
-    split,
-    data_roots,
-    expected_datasets=None,
-    progress_label=None,
-    progress_every=100000,
-    progress_callback=None,
-):
-    """Convert a completed data-integrity CSV into the compact training index."""
-    path = os.path.abspath(path)
-    stem_summary_path = os.path.splitext(path)[0] + ".summary.json"
-    summary_path = (
-        stem_summary_path
-        if os.path.isfile(stem_summary_path)
-        else os.path.join(os.path.dirname(path), "summary.json")
-    )
-    if not os.path.isfile(summary_path):
-        raise FileNotFoundError(f"Audit manifest summary is missing: {summary_path}")
-    summary = load_json_file(summary_path)
-    blocking_reasons = summary.get("blocking_reasons", [])
-    if blocking_reasons:
-        raise ValueError(f"Audit manifest has blocking reasons: {blocking_reasons}")
-    for name in (
-        "target_mismatch_count",
-        "indexed_invalid_bbox_count",
-        "indexed_sample_failure_count",
-        "jpeg_decode_failure_count",
-    ):
-        if int(summary.get(name, 0)) != 0:
-            raise ValueError(f"Audit manifest is not clean: {name}={summary.get(name)}")
-
-    split_summary = next(
-        (item for item in summary.get("split_summaries", []) if item.get("split") == split),
-        None,
-    )
-    if split_summary is None:
-        raise ValueError(f"Audit manifest does not contain split={split!r}")
-    expected_count = int(split_summary.get("indexed_samples", split_summary.get("audited_samples", -1)))
-    if expected_count < 0:
-        raise ValueError(f"Audit manifest has no indexed sample count for split={split!r}")
-
-    expected_dataset_filter = canonical_dataset_filter(expected_datasets)
-    manifest_dataset_filter = canonical_dataset_filter(summary.get("dataset_filter"))
-    dataset_counts = summary.get("dataset_counts")
-    manifest_dataset_coverage = manifest_dataset_filter
-    if not manifest_dataset_coverage and isinstance(dataset_counts, dict):
-        try:
-            manifest_dataset_coverage = canonical_dataset_filter(
-                dataset
-                for dataset, count in dataset_counts.items()
-                if int(count) > 0
-            )
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"Audit manifest has invalid dataset_counts: {dataset_counts!r}") from exc
-    if expected_dataset_filter and not manifest_dataset_coverage:
-        raise ValueError(
-            "Audit manifest does not declare dataset_filter or usable dataset_counts; "
-            f"cannot verify requested filter {expected_dataset_filter}"
-        )
-    if expected_dataset_filter and manifest_dataset_coverage != expected_dataset_filter:
-        raise ValueError(
-            "Audit manifest dataset filter does not match requested filter: "
-            f"manifest={manifest_dataset_coverage}, requested={expected_dataset_filter}"
-        )
-
-    expected_roots = {os.path.realpath(os.path.abspath(root)) for root in data_roots}
-    manifest_roots = {
-        os.path.realpath(os.path.abspath(root)) for root in split_summary.get("roots", [])
-    }
-    root_remap = None
-    if manifest_roots != expected_roots and (
-        len(manifest_roots) == 1
-        and len(expected_roots) == 1
-        and len(manifest_dataset_coverage) == 1
-    ):
-        root_remap = (next(iter(manifest_roots)), next(iter(expected_roots)))
-        print(
-            f"[{split}] Relocating verified {manifest_dataset_coverage[0]} manifest root: "
-            f"{root_remap[0]} -> {root_remap[1]}",
-            flush=True,
-        )
-    elif manifest_roots != expected_roots:
-        raise ValueError(
-            "Audit manifest roots do not match requested data roots: "
-            f"manifest={sorted(manifest_roots)}, requested={sorted(expected_roots)}"
-        )
-
-    samples = []
-    rows_seen = 0
-    start = time.monotonic()
-    with open(path, "r", encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle)
-        required = {
-            "sample_dir",
-            "dataset",
-            "split",
-            "sequence_key",
-            "query_alias",
-            "is_right",
-            "frame_idx",
-            "bbox_score",
-            "pressure_source_key",
-            "target_volume",
-            "target_active_count",
-            "max_pressure",
-        }
-        missing = sorted(required.difference(reader.fieldnames or ()))
-        if missing:
-            raise ValueError(f"Audit manifest is missing required columns: {missing}")
-        for row in reader:
-            rows_seen += 1
-            row_dataset = canonical_dataset_name(row["dataset"])
-            if expected_dataset_filter and row_dataset not in expected_dataset_filter:
-                raise ValueError(
-                    f"Audit manifest contains unexpected dataset {row_dataset!r}; "
-                    f"expected only {expected_dataset_filter}"
-                )
-            if row["split"] == split:
-                query_alias = str(row["query_alias"] or "query")
-                sample_dir = os.path.realpath(os.path.abspath(row["sample_dir"]))
-                if root_remap is not None:
-                    source_root, target_root = root_remap
-                    relative = os.path.relpath(sample_dir, source_root)
-                    if relative == os.pardir or relative.startswith(os.pardir + os.sep):
-                        raise ValueError(
-                            f"Manifest sample is outside declared root {source_root}: {sample_dir}"
-                        )
-                    sample_dir = os.path.join(target_root, relative)
-                samples.append({
-                    "sample_dir": sample_dir,
-                    "dataset": row_dataset,
-                    "hand": query_alias,
-                    "is_right": int(row["is_right"]),
-                    "sequence_key": row["sequence_key"],
-                    "frame_idx": int(row["frame_idx"]),
-                    "query_alias": query_alias,
-                    "bbox_score": float(row["bbox_score"] or 0.0),
-                    "pressure_source_key": row["pressure_source_key"],
-                    "source_frame_idx": _optional_manifest_value(row.get("jq_pressure_frame_idx")),
-                    "timestamp": _optional_manifest_value(row.get("timestamp")),
-                    "max_pressure": float(row["max_pressure"]),
-                    "target_volume": float(row["target_volume"]),
-                    "target_active_count": int(row["target_active_count"]),
-                })
-            if rows_seen % int(progress_every) == 0:
-                if progress_label:
-                    elapsed = max(time.monotonic() - start, 1e-6)
-                    print(
-                        f"{progress_label} read {rows_seen} audit rows, selected {len(samples)} "
-                        f"({rows_seen / elapsed:.0f} rows/s)...",
-                        flush=True,
-                    )
-                if progress_callback:
-                    progress_callback(rows_seen)
-    if len(samples) != expected_count:
-        raise ValueError(
-            f"Audit manifest selected {len(samples)} samples for split={split}, expected {expected_count}"
-        )
-    return samples
-
-
-def read_compact_index_from_integrity_sidecar(
-    path,
-    progress_label=None,
-    progress_every=100000,
-    progress_callback=None,
-):
-    samples = []
-    start = time.monotonic()
-    with open(path, "rb") as handle:
-        for line_number, line in enumerate(handle, start=1):
-            if not line.strip():
-                continue
-            row = orjson.loads(line) if orjson is not None else json.loads(line)
-            missing = [field for field in COMPACT_INDEX_FIELDS if field not in row]
-            if missing:
-                raise ValueError(
-                    f"Integrity sidecar row {line_number} is missing compact index fields: {missing}"
-                )
-            samples.append({field: row[field] for field in COMPACT_INDEX_FIELDS})
-            if progress_label and line_number % int(progress_every) == 0:
-                elapsed = max(time.monotonic() - start, 1e-6)
-                print(
-                    f"{progress_label} converted {line_number} records "
-                    f"({line_number / elapsed:.0f} records/s)...",
-                    flush=True,
-                )
-            if progress_callback and line_number % int(progress_every) == 0:
-                progress_callback(line_number)
-    return samples
-
-
-def write_jsonl_atomic(
-    path,
-    rows,
-    progress_label=None,
-    progress_every=100000,
-    progress_callback=None,
-):
-    path = os.path.abspath(path)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp_path = f"{path}.tmp.{os.getpid()}"
-    start = time.monotonic()
-    open_kwargs = {} if orjson is not None else {"encoding": "utf-8"}
-    mode = "wb" if orjson is not None else "w"
-    with open(tmp_path, mode, **open_kwargs) as f:
-        for index, row in enumerate(rows, start=1):
-            if orjson is not None:
-                f.write(orjson.dumps(row) + b"\n")
-            else:
-                f.write(json.dumps(row, separators=(",", ":"), ensure_ascii=False) + "\n")
-            if progress_label and index % int(progress_every) == 0:
-                elapsed = max(time.monotonic() - start, 1e-6)
-                print(
-                    f"{progress_label} wrote {index} records ({index / elapsed:.0f} records/s)...",
-                    flush=True,
-                )
-            if progress_callback and index % int(progress_every) == 0:
-                progress_callback(index)
-    os.replace(tmp_path, path)
-
-
-def write_json_atomic(path, payload):
-    path = os.path.abspath(path)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp_path = f"{path}.tmp.{os.getpid()}"
-    with open(tmp_path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, sort_keys=True)
-        handle.write("\n")
-    os.replace(tmp_path, path)
-
-
-def read_jsonl(path, progress_label=None, progress_every=100000):
-    rows = []
-    start = time.monotonic()
-    with open(path, "rb") as f:
-        for line_number, line in enumerate(f, start=1):
-            line = line.strip()
-            if line:
-                rows.append(orjson.loads(line) if orjson is not None else json.loads(line))
-            if progress_label and line_number % int(progress_every) == 0:
-                elapsed = max(time.monotonic() - start, 1e-6)
-                print(
-                    f"{progress_label} loaded {line_number} records "
-                    f"({line_number / elapsed:.0f} records/s)...",
-                    flush=True,
-                )
-    return rows
-
-
-class MMapJsonlRecords:
-    """Random-access JSONL records without a per-worker Python object graph."""
-
-    def __init__(self, path):
-        self.path = os.path.realpath(os.path.abspath(path))
-        self._mapping = None
-        self._offsets = None
-        self._open()
-
-    def _open(self):
-        file_size = os.path.getsize(self.path)
-        offsets = array("Q", [0])
-        if file_size == 0:
-            self._mapping = None
-            self._offsets = offsets
-            return
-        with open(self.path, "rb") as handle:
-            mapping = mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ)
-        position = 0
-        while True:
-            newline = mapping.find(b"\n", position)
-            if newline < 0:
-                if position < file_size:
-                    offsets.append(file_size)
-                break
-            position = newline + 1
-            offsets.append(position)
-            if position >= file_size:
-                break
-        self._mapping = mapping
-        self._offsets = offsets
-
-    def __len__(self):
-        return max(0, len(self._offsets) - 1)
-
-    def __getitem__(self, index):
-        if isinstance(index, slice):
-            return [self[item] for item in range(*index.indices(len(self)))]
-        index = int(index)
-        if index < 0:
-            index += len(self)
-        if index < 0 or index >= len(self):
-            raise IndexError(index)
-        start = int(self._offsets[index])
-        end = int(self._offsets[index + 1])
-        raw = self._mapping[start:end].strip()
-        return orjson.loads(raw) if orjson is not None else json.loads(raw)
-
-    def __iter__(self):
-        for index in range(len(self)):
-            yield self[index]
-
-    def __getstate__(self):
-        return {"path": self.path}
-
-    def __setstate__(self, state):
-        self.path = state["path"]
-        self._mapping = None
-        self._offsets = None
-        self._open()
-
-    def close(self):
-        mapping = getattr(self, "_mapping", None)
-        if mapping is not None:
-            mapping.close()
-            self._mapping = None
-
-    def __del__(self):
-        try:
-            self.close()
-        except Exception:
-            pass
-
-
-def release_unused_python_heap():
-    """Return freed eager-index arenas before DataLoader workers are forked."""
-
-    gc.collect()
-    try:
-        libc = ctypes.CDLL(None)
-        malloc_trim = getattr(libc, "malloc_trim", None)
-        if malloc_trim is not None:
-            malloc_trim.argtypes = [ctypes.c_size_t]
-            malloc_trim.restype = ctypes.c_int
-            malloc_trim(0)
-    except Exception:
-        pass
-
-
-def ddp_global_rank():
-    for name in ("RANK", "SLURM_PROCID", "OMPI_COMM_WORLD_RANK"):
-        value = os.environ.get(name)
-        if value is not None:
-            try:
-                return int(value)
-            except ValueError:
-                pass
-    local_rank = os.environ.get("LOCAL_RANK")
-    if local_rank is not None:
-        try:
-            local_rank = int(local_rank)
-            node_rank = int(os.environ.get("NODE_RANK", os.environ.get("GROUP_RANK", "0")))
-            local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
-            return node_rank * local_world_size + local_rank
-        except ValueError:
-            pass
-    return 0
-
-
-def wait_for_file(path, timeout_sec=3600, poll_sec=5, progress_label=None):
-    start = time.time()
-    last_report = start
-    while True:
-        if os.path.exists(path) and os.path.getsize(path) > 0:
-            return
-        now = time.time()
-        if now - start > timeout_sec:
-            raise TimeoutError(f"Timed out waiting for index cache: {path}")
-        if progress_label and now - last_report >= 30.0:
-            print(f"{progress_label} still waiting ({now - start:.0f}s elapsed)...", flush=True)
-            last_report = now
-        time.sleep(poll_sec)
-
-
-def wait_for_shared_cache(
-    cache_path,
-    done_path,
-    lock_dir,
-    timeout_sec=3600,
-    poll_sec=5,
-    stale_heartbeat_sec=600,
-):
-    start = time.time()
-    last_report = start
-    while True:
-        builder_active = os.path.isdir(lock_dir)
-        cache_ready = os.path.isfile(cache_path) and os.path.isfile(done_path)
-        if not builder_active and cache_ready:
-            return
-        now = time.time()
-        if now - last_report >= 30.0:
-            owner = SharedCacheBuildLock(lock_dir).owner_description()
-            print(
-                f"Waiting for shared index cache ({now - start:.0f}s elapsed; {owner})...",
-                flush=True,
-            )
-            last_report = now
-        owner = SharedCacheBuildLock.read_owner(lock_dir)
-        heartbeat = owner.get("heartbeat_unix", owner.get("created_unix")) if owner else None
-        if builder_active and heartbeat is not None and now - float(heartbeat) > stale_heartbeat_sec:
-            raise RuntimeError(
-                f"Shared index builder heartbeat is stale for {now - float(heartbeat):.0f}s: "
-                f"{lock_dir} ({SharedCacheBuildLock(lock_dir).owner_description()}). "
-                "Verify that the builder process has stopped, then remove this stale lock directory."
-            )
-        if now - start > timeout_sec:
-            raise TimeoutError(
-                f"Timed out waiting for shared index cache: {cache_path} "
-                f"(builder_active={builder_active})"
-            )
-        time.sleep(poll_sec)
-
-
-class SharedCacheBuildLock:
-    """Cross-host cache-build lock backed by an atomic shared-filesystem mkdir."""
-
-    def __init__(self, lock_dir, timeout_sec=3600, poll_sec=5):
-        self.lock_dir = os.path.abspath(lock_dir)
-        self.timeout_sec = int(timeout_sec)
-        self.poll_sec = float(poll_sec)
-        self.acquired = False
-        self._owner = None
-
-    def try_acquire(self):
-        try:
-            os.makedirs(self.lock_dir)
-        except FileExistsError:
-            if not self._reclaim_dead_local_owner():
-                return False
-            try:
-                os.makedirs(self.lock_dir)
-            except FileExistsError:
-                return False
-        self.acquired = True
-        self._owner = {
-            "hostname": socket.gethostname(),
-            "pid": os.getpid(),
-            "created_unix": time.time(),
-            "heartbeat_unix": time.time(),
-            "stage": "acquired",
-        }
-        try:
-            self._write_owner()
-        except Exception:
-            self.release()
-            raise
-        return True
-
-    @staticmethod
-    def read_owner(lock_dir):
-        owner_path = os.path.join(os.path.abspath(lock_dir), "owner.json")
-        try:
-            with open(owner_path, "r", encoding="utf-8") as handle:
-                return json.load(handle)
-        except Exception:
-            return None
-
-    @staticmethod
-    def _pid_is_alive(pid):
-        try:
-            os.kill(int(pid), 0)
-        except ProcessLookupError:
-            return False
-        except (PermissionError, ValueError, TypeError):
-            return True
-        return True
-
-    def _reclaim_dead_local_owner(self):
-        owner = self.read_owner(self.lock_dir)
-        if not owner or owner.get("hostname") != socket.gethostname():
-            return False
-        pid = owner.get("pid")
-        if self._pid_is_alive(pid):
-            return False
-        stale_dir = f"{self.lock_dir}.stale.{int(time.time())}.{pid}"
-        try:
-            os.replace(self.lock_dir, stale_dir)
-        except (FileNotFoundError, FileExistsError, OSError):
-            return False
-        try:
-            os.remove(os.path.join(stale_dir, "owner.json"))
-        except FileNotFoundError:
-            pass
-        try:
-            os.rmdir(stale_dir)
-        except OSError:
-            pass
-        print(
-            f"Reclaimed stale local index lock from dead pid={pid}: {self.lock_dir}",
-            flush=True,
-        )
-        return True
-
-    def _write_owner(self):
-        owner_path = os.path.join(self.lock_dir, "owner.json")
-        tmp_path = f"{owner_path}.tmp.{os.getpid()}"
-        with open(tmp_path, "w", encoding="utf-8") as handle:
-            json.dump(self._owner, handle, sort_keys=True)
-            handle.write("\n")
-        os.replace(tmp_path, owner_path)
-
-    def heartbeat(self, stage, completed=None, total=None):
-        if not self.acquired:
-            return
-        self._owner["heartbeat_unix"] = time.time()
-        self._owner["stage"] = str(stage)
-        if completed is not None:
-            self._owner["completed"] = int(completed)
-        if total is not None:
-            self._owner["total"] = int(total)
-        self._write_owner()
-
-    def release(self):
-        if not self.acquired:
-            return
-        owner_path = os.path.join(self.lock_dir, "owner.json")
-        try:
-            os.remove(owner_path)
-        except FileNotFoundError:
-            pass
-        try:
-            for name in os.listdir(self.lock_dir):
-                if name.startswith(f"owner.json.tmp.{os.getpid()}"):
-                    os.remove(os.path.join(self.lock_dir, name))
-        except FileNotFoundError:
-            pass
-        try:
-            os.rmdir(self.lock_dir)
-        except FileNotFoundError:
-            pass
-        except OSError as exc:
-            print(f"Warning: could not remove index lock directory {self.lock_dir}: {exc}", flush=True)
-        self.acquired = False
-        self._owner = None
-
-    def owner_description(self):
-        try:
-            owner = self.read_owner(self.lock_dir)
-            if owner is None:
-                raise ValueError("owner metadata unavailable")
-            heartbeat = owner.get("heartbeat_unix", owner.get("created_unix"))
-            age = time.time() - float(heartbeat) if heartbeat is not None else float("nan")
-            return (
-                f"host={owner.get('hostname')}, pid={owner.get('pid')}, "
-                f"stage={owner.get('stage', 'unknown')}, heartbeat_age={age:.0f}s"
-            )
-        except Exception:
-            return "owner metadata unavailable"
-
-
-class OpenTouchTactileDataset(Dataset):
+class OpenTouchTactileDataset(DatasetIndexingMixin, Dataset):
     def __init__(self, cfg: CfgNode, split: str = "train", 
                  data_dir: str = None, train: bool = True, index_workers: int = 1,
                  index_chunksize: int = 256, index_cache_dir: str = None,
                  rebuild_index: bool = False, index_cache_timeout: int = 3600,
                  index_backend: str = "process",
                  sample_records=None, tactile_only: bool = False,
+                 input_resolution=None,
                  bbox_rescale_factor: float = 2.0,
                  bbox_source_policy: str = "any",
                  bbox_manifests=None,
@@ -1205,7 +94,14 @@ class OpenTouchTactileDataset(Dataset):
                  augmentation_enabled: bool = True,
                  index_process_worker_cap: int = 64,
                  index_manifest: str = None,
-                 expected_datasets=None):
+                 expected_datasets=None,
+                 data_backend: str = "auto",
+                 query_manifests=None,
+                 hdf5_handle_cache_size: int = 4,
+                 hdf5_manifest_cache_dir: str = None,
+                 depth_sidecar_root: str = None,
+                 depth_control: str = "none",
+                 depth_output_hw=(32, 24)):
         super().__init__()
         self.cfg = cfg
         self.split = split
@@ -1218,6 +114,41 @@ class OpenTouchTactileDataset(Dataset):
         if self.index_backend not in ("process", "thread"):
             raise ValueError(f"Unsupported index_backend: {index_backend!r}. Use 'process' or 'thread'.")
         self.index_cache_dir = index_cache_dir
+        self.hdf5_manifest_cache_dir = (
+            os.path.realpath(
+                os.path.abspath(os.path.expanduser(str(hdf5_manifest_cache_dir)))
+            )
+            if hdf5_manifest_cache_dir and str(hdf5_manifest_cache_dir).strip()
+            else None
+        )
+        self.depth_sidecar_root = (
+            os.path.realpath(os.path.abspath(os.path.expanduser(str(depth_sidecar_root))))
+            if depth_sidecar_root and str(depth_sidecar_root).strip()
+            else None
+        )
+        self.depth_control = str(depth_control or "none")
+        if self.depth_control not in ("none", "sample_spatial_shuffle"):
+            raise ValueError(
+                "depth_control must be none or sample_spatial_shuffle"
+            )
+        self.depth_output_hw = tuple(int(value) for value in depth_output_hw)
+        if len(self.depth_output_hw) != 2 or min(self.depth_output_hw) <= 0:
+            raise ValueError(
+                f"depth_output_hw must contain two positive integers, got "
+                f"{depth_output_hw!r}"
+            )
+        if self.depth_sidecar_root is not None:
+            if SequenceSidecarReader is None:
+                raise ImportError(
+                    "Depth sidecars require tactile_input_priors.depth_sidecar"
+                )
+            if not os.path.isdir(self.depth_sidecar_root):
+                raise FileNotFoundError(
+                    f"Depth sidecar root does not exist: {self.depth_sidecar_root}"
+                )
+        self._depth_sidecar_pid = None
+        self._depth_sidecar_readers = OrderedDict()
+        self.depth_sidecar_contract = {}
         self.index_process_worker_cap = max(0, int(index_process_worker_cap))
         self.index_manifest = (
             os.path.abspath(os.path.expanduser(str(index_manifest)))
@@ -1235,7 +166,13 @@ class OpenTouchTactileDataset(Dataset):
         self._active_cache_lock = None
         self.lazy_index_records = bool(lazy_index_records)
         
-        self.img_size = cfg.MODEL.IMAGE_SIZE
+        if input_resolution is None:
+            self.input_resolution = (int(cfg.MODEL.IMAGE_SIZE), int(cfg.MODEL.IMAGE_SIZE))
+        else:
+            if len(input_resolution) != 2:
+                raise ValueError("input_resolution must contain height and width")
+            self.input_resolution = tuple(int(value) for value in input_resolution)
+        self.img_size = self.input_resolution[0]
         self.mean = 255. * np.array(cfg.MODEL.IMAGE_MEAN)
         self.std = 255. * np.array(cfg.MODEL.IMAGE_STD)
         self.rescale_factor = float(bbox_rescale_factor)
@@ -1262,9 +199,11 @@ class OpenTouchTactileDataset(Dataset):
                 "SAM3 bbox manifest(s) are missing: " + ", ".join(missing_bbox_manifests)
             )
         self.bbox_manifest_sha256 = {
-            path: sha256_file(path) for path in self.bbox_manifests
+            path: persistent_sha256_file(path, self.hdf5_manifest_cache_dir)
+            for path in self.bbox_manifests
         }
-        
+        self._bbox_manifest_overlay_index = None
+
         if data_dir is None:
             data_dirs = ["/data1/jiangrui/OpenTouch Data/extracted_dataset"]
         elif isinstance(data_dir, (list, tuple)):
@@ -1272,515 +211,436 @@ class OpenTouchTactileDataset(Dataset):
         else:
             data_dirs = [d.strip() for d in str(data_dir).split(",") if d.strip()]
         self.data_dirs = data_dirs
-            
+
+        requested_backend = str(data_backend or "legacy_dirs").strip().lower()
+        if requested_backend not in ("legacy_dirs", "sequence_hdf5", "auto"):
+            raise ValueError(
+                "data_backend must be one of legacy_dirs|sequence_hdf5|auto, "
+                f"got {data_backend!r}"
+            )
+        self.query_manifest_specs = self._normalize_query_manifest_specs(query_manifests)
+        if not self.query_manifest_specs and requested_backend in ("auto", "sequence_hdf5"):
+            self.query_manifest_specs = self._discover_query_manifest_specs()
+        if requested_backend == "auto":
+            has_hdf5_records = False
+            if isinstance(sample_records, (list, tuple)) and sample_records:
+                first_record = sample_records[0]
+                has_hdf5_records = (
+                    isinstance(first_record, dict)
+                    and ("h5_path" in first_record or "h5_relpath" in first_record)
+                )
+            self.data_backend = (
+                "sequence_hdf5"
+                if self.query_manifest_specs or has_hdf5_records
+                else "legacy_dirs"
+            )
+        else:
+            self.data_backend = requested_backend
+        if self.data_backend == "sequence_hdf5" and sample_records is None and not self.query_manifest_specs:
+            raise ValueError(
+                "data_backend='sequence_hdf5' requires query_manifests; "
+                "HDF5 mode never scans directories or reuses the legacy index cache"
+            )
+        if self.data_backend == "sequence_hdf5":
+            print(
+                f"[{self.split}] HDF5 query manifests are the authoritative sample "
+                "index; legacy index_workers/index_manifest/rebuild_index are ignored.",
+                flush=True,
+            )
+            if self.lazy_index_records:
+                cache_label = self.hdf5_manifest_cache_dir or "<disabled>"
+                print(
+                    f"[{self.split}] Normalized HDF5 manifest mmap cache: {cache_label}",
+                    flush=True,
+                )
+        self.hdf5_handle_cache_size = max(1, int(hdf5_handle_cache_size))
+        self._hdf5_handle_pid = None
+        self._hdf5_handles = OrderedDict()
+        self._hdf5_validated_paths = set()
+        self._pending_batched_loaded = None
+        self._batched_hdf5_jpeg_cache = None
+        self._resolved_hdf5_paths = {}
+        self.query_manifest_sha256 = {
+            spec["path"]: persistent_sha256_file(
+                spec["path"],
+                self.hdf5_manifest_cache_dir,
+            )
+            for spec in self.query_manifest_specs
+        }
+        self.hdf5_schema_versions = set()
+
         self.tactile_dim = count_obj_vertices(SUBDIV_OBJ_PATH)
         print(f"[{split}] Loading subdiv palm mask for evaluation and loss masking...")
         self.palm_mask = self._load_palm_mask()
-        
+
         if sample_records is None:
-            self.samples = self._load_or_build_index()
+            if self.data_backend == "sequence_hdf5":
+                self.samples = self._load_hdf5_query_manifests()
+            else:
+                self.samples = self._load_or_build_index()
         else:
             self.samples = list(sample_records)
-            if self.bbox_source_policy != "any" and not all(
+            if self.data_backend == "sequence_hdf5":
+                self.samples = [
+                    self._normalize_hdf5_manifest_record(
+                        sample,
+                        manifest_path=None,
+                        root_hint=None,
+                        dataset_hint=None,
+                        line_number=index + 1,
+                    )
+                    for index, sample in enumerate(self.samples)
+                ]
+            elif self.bbox_source_policy != "any" and not all(
                 sample.get("bbox_source_policy") == self.bbox_source_policy
                 for sample in self.samples
             ):
                 self.samples = self._filter_samples_by_bbox_source(self.samples)
         self._validate_dataset_filter()
+        if self.depth_sidecar_root is not None:
+            self._initialize_depth_sidecar_contract()
         source_counts = {}
         if isinstance(self.samples, MMapJsonlRecords):
             source_counts = {"mmap_records": len(self.samples)}
         else:
             for sample in self.samples:
                 source_counts[sample["dataset"]] = source_counts.get(sample["dataset"], 0) + 1
-        print(f"[{split}] Loaded {len(self.samples)} hand samples from {len(self.data_dirs)} root(s): {source_counts}")
-
-    def _validate_dataset_filter(self):
-        if not self.expected_datasets:
-            return
-        if isinstance(self.samples, MMapJsonlRecords):
-            if len(self.samples) == 0:
-                raise RuntimeError(
-                    f"[{self.split}] Dataset filter validation failed: mmap index is empty"
-                )
-            # The cache key binds the expected filter and construction validates
-            # every manifest row before this read-only view is created.
-            return
-        observed = {canonical_dataset_name(sample.get("dataset")) for sample in self.samples}
-        expected = set(self.expected_datasets)
-        unexpected = sorted(observed - expected)
-        missing = sorted(expected - observed)
-        if unexpected or missing:
-            raise RuntimeError(
-                f"[{self.split}] Dataset filter validation failed: expected={sorted(expected)}, "
-                f"observed={sorted(observed)}, unexpected={unexpected}, missing={missing}"
-            )
-
-    def _load_palm_mask(self):
-        return load_subdiv_palm_mask(self.tactile_dim)
-
-    def _has_sample_dirs(self, path):
-        if not os.path.isdir(path):
-            return False
-        with os.scandir(path) as entries:
-            for entry in entries:
-                if entry.is_dir() and os.path.exists(os.path.join(entry.path, "meta.json")):
-                    return True
-        return False
-
-    def _split_dir(self, root):
-        split_path = os.path.join(root, self.split)
-        if os.path.isdir(split_path):
-            return split_path
-
-        has_any_split = any(os.path.isdir(os.path.join(root, name)) for name in CANONICAL_SPLITS)
-        if has_any_split:
-            return None
-
-        if self.split != "train":
-            return None
-
-        all_path = os.path.join(root, "all")
-        if self._has_sample_dirs(all_path):
-            print(f"[{self.split}] No train/val/test under {root}; using {all_path} as train split.")
-            return all_path
-
-        if os.path.isdir(root):
-            print(f"[{self.split}] No train/val/test under {root}; using the full root as train split.")
-            return root
-
-        return None
-
-    def _infer_dataset_name(self, meta):
-        return canonical_dataset_name(meta.get("dataset", "OpenTouch"))
-
-    def _valid_bbox(self, bbox):
-        return valid_bbox(bbox)
-
-    def _has_pressure(self, meta, dataset_name, hand=None, is_right=None):
-        return has_pressure(meta, dataset_name, hand=hand, is_right=is_right)
-
-    def _cache_path(self):
-        if not self.index_cache_dir:
-            return None
-        key_data = {
-            "split": self.split,
-            "data_dirs": [os.path.abspath(path) for path in self.data_dirs],
-            "version": INDEX_CACHE_VERSION,
-            "manifest_sha256": self.index_manifest_sha256,
-            "dataset_filter": list(self.expected_datasets),
-            "bbox_source_policy": self.bbox_source_policy,
-            "bbox_manifest_sha256": getattr(self, "bbox_manifest_sha256", {}),
-        }
-        digest = hashlib.sha1(json.dumps(key_data, sort_keys=True).encode("utf-8")).hexdigest()[:16]
-        return os.path.join(self.index_cache_dir, f"{self.split}_{digest}.jsonl")
-
-    def index_cache_metadata(self):
-        cache_path = self._cache_path()
-        cache_key = os.path.splitext(os.path.basename(cache_path))[0] if cache_path else "uncached"
-        return {
-            "index_schema_version": INDEX_CACHE_VERSION,
-            "index_cache_key": cache_key,
-            "indexed_sample_count": len(self.samples),
-            "index_manifest_sha256": self.index_manifest_sha256,
-            "dataset_filter": list(self.expected_datasets),
-            "bbox_source_policy": self.bbox_source_policy,
-            "bbox_manifest_sha256": dict(getattr(self, "bbox_manifest_sha256", {})),
-            "lazy_index_records": bool(getattr(self, "lazy_index_records", False)),
-        }
-
-    def _read_index_cache(self, cache_path, progress_label):
-        if bool(getattr(self, "lazy_index_records", False)):
-            print(
-                f"[{self.split}] Opening memory-mapped index cache: {cache_path}",
-                flush=True,
-            )
-            return MMapJsonlRecords(cache_path)
-        return read_jsonl(cache_path, progress_label=progress_label)
-
-    def _filter_samples_by_bbox_source(self, samples):
-        if self.bbox_source_policy == "any" or not samples:
-            return samples
-        grouped = {}
-        for sample in samples:
-            grouped.setdefault(sample["sample_dir"], []).append(sample)
-        groups = [grouped[path] for path in sorted(grouped)]
-        batch_size = max(1, self.index_chunksize)
-        batches = [groups[start : start + batch_size] for start in range(0, len(groups), batch_size)]
-        workers = min(max(1, self.index_workers), 64)
-        kept = []
-        rejected = 0
         print(
-            f"[{self.split}] Enforcing bbox_source_policy={self.bbox_source_policy} "
-            f"on {len(samples)} compact index records...",
-            flush=True,
+            f"[{split}] Loaded {len(self.samples)} hand samples with "
+            f"backend={self.data_backend} from {len(self.data_dirs)} root(s): {source_counts}"
         )
-        if workers == 1:
-            results = [
-                filter_sample_groups_by_bbox_source_batch((batch, self.bbox_source_policy))
-                for batch in batches
-            ]
-        else:
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                results = executor.map(
-                    filter_sample_groups_by_bbox_source_batch,
-                    ((batch, self.bbox_source_policy) for batch in batches),
-                )
-        for result in results:
-            kept.extend(result["samples"])
-            rejected += int(result["rejected"])
-        print(
-            f"[{self.split}] SAM3 bbox provenance retained {len(kept)}/{len(samples)} "
-            f"records; rejected {rejected} legacy/unmatched records.",
-            flush=True,
-        )
-        return kept
-
-    def integrity_cache_path(self):
-        cache_path = self._cache_path()
-        return f"{cache_path}.integrity.jsonl" if cache_path else None
-
-    def integrity_summary_path(self):
-        cache_path = self._cache_path()
-        return f"{cache_path}.integrity.json" if cache_path else None
-
-    def _load_or_build_index(self):
-        cache_path = self._cache_path()
-        if cache_path is None:
-            return self._build_index()
-
-        done_path = f"{cache_path}.done"
-        rank = ddp_global_rank()
-        if os.path.exists(cache_path) and os.path.exists(done_path) and not self.rebuild_index:
-            print(f"[{self.split}] Loading index cache: {cache_path}")
-            return self._read_index_cache(cache_path, f"[{self.split}] Index cache")
-
-        if rank == 0:
-            lock = SharedCacheBuildLock(f"{cache_path}.lock", timeout_sec=self.index_cache_timeout)
-            if lock.try_acquire():
-                print(f"[{self.split}] Building index cache under shared lock: {cache_path}")
-                try:
-                    if self.rebuild_index:
-                        for path in (
-                            cache_path,
-                            done_path,
-                        ):
-                            try:
-                                os.remove(path)
-                            except FileNotFoundError:
-                                pass
-                    elif os.path.exists(cache_path) and os.path.exists(done_path):
-                        return self._read_index_cache(cache_path, f"[{self.split}] Index cache")
-                    self._active_cache_lock = lock
-                    samples = None
-                    if self.index_manifest and os.path.isfile(self.index_manifest):
-                        try:
-                            print(
-                                f"[{self.split}] Building compact index from verified audit manifest: "
-                                f"{self.index_manifest}",
-                                flush=True,
-                            )
-                            samples = read_compact_index_from_audit_csv(
-                                self.index_manifest,
-                                split=self.split,
-                                data_roots=self.data_dirs,
-                                expected_datasets=self.expected_datasets,
-                                progress_label=f"[{self.split}] Audit manifest",
-                                progress_callback=lambda count: lock.heartbeat(
-                                    "converting_audit_manifest",
-                                    completed=count,
-                                ),
-                            )
-                        except Exception as exc:
-                            raise RuntimeError(
-                                f"[{self.split}] Verified audit manifest cannot be used: "
-                                f"{self.index_manifest}: {exc}"
-                            ) from exc
-                    elif self.index_manifest and self.expected_datasets:
-                        raise FileNotFoundError(
-                            f"[{self.split}] Required single-domain audit manifest not found: "
-                            f"{self.index_manifest}"
-                        )
-                    elif self.index_manifest:
-                        print(
-                            f"[{self.split}] Audit manifest not found at {self.index_manifest}; "
-                            "falling back to an integrity sidecar or compact metadata scan.",
-                            flush=True,
-                        )
-                    integrity_path = self.integrity_cache_path()
-                    integrity_summary_path = self.integrity_summary_path()
-                    if (
-                        samples is None
-                        and os.path.isfile(integrity_path)
-                        and os.path.isfile(integrity_summary_path)
-                    ):
-                        try:
-                            integrity_summary = load_json_file(integrity_summary_path)
-                            expected_count = int(integrity_summary["strict_sample_count"])
-                            print(
-                                f"[{self.split}] Reusing completed integrity sidecar to build compact index: "
-                                f"{integrity_path}",
-                                flush=True,
-                            )
-                            samples = read_compact_index_from_integrity_sidecar(
-                                integrity_path,
-                                progress_label=f"[{self.split}] Integrity sidecar",
-                                progress_callback=lambda count: lock.heartbeat(
-                                    "converting_integrity_sidecar",
-                                    completed=count,
-                                    total=expected_count,
-                                ),
-                            )
-                            if len(samples) != expected_count:
-                                raise ValueError(
-                                    f"sidecar contains {len(samples)} records, expected {expected_count}"
-                                )
-                        except Exception as exc:
-                            print(
-                                f"[{self.split}] Integrity sidecar reuse failed ({exc}); "
-                                "falling back to a compact metadata scan.",
-                                flush=True,
-                            )
-                            samples = None
-                    if samples is None:
-                        samples = self._build_index()
-                    else:
-                        samples = self._filter_samples_by_bbox_source(samples)
-                        lock.heartbeat("sorting", completed=len(samples), total=len(samples))
-                        print(
-                            f"[{self.split}] Sorting {len(samples)} compact index records...",
-                            flush=True,
-                        )
-                        samples.sort(key=lambda item: (item["sample_dir"], item["hand"]))
-                    lock.heartbeat("writing_cache", completed=0, total=len(samples))
-                    print(
-                        f"[{self.split}] Writing {len(samples)} compact index records to {cache_path}...",
-                        flush=True,
-                    )
-                    write_jsonl_atomic(
-                        cache_path,
-                        samples,
-                        progress_label=f"[{self.split}] Index cache",
-                        progress_callback=lambda count: lock.heartbeat(
-                            "writing_cache",
-                            completed=count,
-                            total=len(samples),
-                        ),
-                    )
-                    write_jsonl_atomic(done_path, [{"complete": True, "num_samples": len(samples)}])
-                    lock.heartbeat("complete", completed=len(samples), total=len(samples))
-                    print(f"[{self.split}] Wrote index cache: {cache_path}", flush=True)
-                    if self.lazy_index_records:
-                        records = MMapJsonlRecords(cache_path)
-                        del samples
-                        release_unused_python_heap()
-                        return records
-                    return samples
-                finally:
-                    self._active_cache_lock = None
-                    lock.release()
-
-            print(
-                f"[{self.split}] Another host is building the shared index cache "
-                f"({lock.owner_description()}); waiting for {done_path}"
-            )
-            wait_for_shared_cache(
-                cache_path,
-                done_path,
-                lock.lock_dir,
-                timeout_sec=self.index_cache_timeout,
-            )
-            return self._read_index_cache(cache_path, f"[{self.split}] Index cache")
-
-        print(f"[{self.split}] Rank {rank} waiting for index cache: {cache_path}")
-        wait_for_shared_cache(
-            cache_path,
-            done_path,
-            f"{cache_path}.lock",
-            timeout_sec=self.index_cache_timeout,
-        )
-        return self._read_index_cache(cache_path, f"[{self.split}] Index cache")
-
-    def _build_index(self):
-        lock = getattr(self, "_active_cache_lock", None)
-        bbox_manifests = tuple(getattr(self, "bbox_manifests", ()))
-        if bbox_manifests:
-            print(
-                f"[{self.split}] Loading sample directories from {len(bbox_manifests)} "
-                "SAM3 bbox manifest(s); filesystem discovery is disabled.",
-                flush=True,
-            )
-            sample_dirs = sample_dirs_from_bbox_manifests(
-                bbox_manifests,
-                split=self.split,
-                expected_datasets=self.expected_datasets,
-                progress_callback=(
-                    (lambda count: lock.heartbeat("reading_bbox_manifests", completed=count))
-                    if lock is not None
-                    else None
-                ),
-            )
-        else:
-            sample_dirs = []
-            print(f"[{self.split}] Discovering sample directories...", flush=True)
-            for root in self.data_dirs:
-                split_path = self._split_dir(root)
-                if split_path is None:
-                    print(f"[{self.split}] Warning: split directory not found under {root}")
-                    continue
-                root_count = 0
-                with os.scandir(split_path) as entries:
-                    for entry in entries:
-                        if entry.is_dir():
-                            sample_dirs.append(entry.path)
-                            root_count += 1
-                            if root_count % 100000 == 0:
-                                print(
-                                    f"[{self.split}] Discovered {root_count} sample dirs under {split_path}...",
-                                    flush=True,
-                                )
-                                if lock is not None:
-                                    lock.heartbeat("discovering", completed=len(sample_dirs))
-                print(
-                    f"[{self.split}] Discovered {root_count} sample dirs under {split_path}.",
-                    flush=True,
-                )
-            sample_dirs.sort()
-        if lock is not None:
-            lock.heartbeat("discovered", completed=len(sample_dirs), total=len(sample_dirs))
-
-        effective_workers = self.index_workers
-        allowed_manifest_sha256 = tuple(
-            getattr(self, "bbox_manifest_sha256", {}).values()
-        )
-        if (
-            self.index_backend == "process"
-            and self.index_process_worker_cap > 0
-            and effective_workers > self.index_process_worker_cap
-        ):
-            effective_workers = self.index_process_worker_cap
-            print(
-                f"[{self.split}] Capping process index workers from {self.index_workers} to "
-                f"{effective_workers}; higher process counts cause shared-filesystem I/O and IPC stalls. "
-                "Set --index_process_worker_cap 0 to disable the cap.",
-                flush=True,
-            )
-        print(
-            f"[{self.split}] Index scan: {len(sample_dirs)} sample dirs with "
-            f"{effective_workers} {self.index_backend} worker(s), chunksize={self.index_chunksize}",
-            flush=True,
-        )
-        samples = []
-
-        def consume_result(result):
-            samples.extend(result["samples"])
-
-        done = 0
-        last_progress_report = 0
-        scan_start = time.monotonic()
-        batch_size = max(1, self.index_chunksize)
-        sample_dir_batches = [
-            sample_dirs[start : start + batch_size]
-            for start in range(0, len(sample_dirs), batch_size)
-        ]
-        try:
-            if effective_workers == 1:
-                for batch in sample_dir_batches:
-                    result = scan_sample_dirs_batch(
-                        batch,
-                        getattr(self, "bbox_source_policy", "any"),
-                        allowed_manifest_sha256,
-                    )
-                    consume_result(result)
-                    done += int(result["sample_dir_count"])
-                    if done - last_progress_report >= 10000:
-                        elapsed = max(time.monotonic() - scan_start, 1e-6)
-                        print(
-                            f"[{self.split}] Indexed {done}/{len(sample_dirs)} sample dirs "
-                            f"({done / elapsed:.0f} dirs/s)...",
-                            flush=True,
-                        )
-                        lock = getattr(self, "_active_cache_lock", None)
-                        if lock is not None:
-                            lock.heartbeat("scanning", completed=done, total=len(sample_dirs))
-                        last_progress_report = done
-            else:
-                executor_cls = ProcessPoolExecutor if self.index_backend == "process" else ThreadPoolExecutor
-                with executor_cls(max_workers=effective_workers) as executor:
-                    batch_iterator = iter(sample_dir_batches)
-                    pending = set()
-                    max_pending = max(1, effective_workers * 2)
-
-                    def submit_next():
-                        try:
-                            batch = next(batch_iterator)
-                        except StopIteration:
-                            return False
-                        pending.add(
-                            executor.submit(
-                                scan_sample_dirs_batch,
-                                batch,
-                                getattr(self, "bbox_source_policy", "any"),
-                                allowed_manifest_sha256,
-                            )
-                        )
-                        return True
-
-                    for _ in range(min(max_pending, len(sample_dir_batches))):
-                        submit_next()
-                    while pending:
-                        completed, pending = wait(pending, return_when=FIRST_COMPLETED)
-                        for future in completed:
-                            result = future.result()
-                            consume_result(result)
-                            done += int(result["sample_dir_count"])
-                            submit_next()
-                        if done - last_progress_report >= 10000:
-                            elapsed = max(time.monotonic() - scan_start, 1e-6)
-                            print(
-                                f"[{self.split}] Indexed {done}/{len(sample_dirs)} sample dirs "
-                                f"({done / elapsed:.0f} dirs/s)...",
-                                flush=True,
-                            )
-                            lock = getattr(self, "_active_cache_lock", None)
-                            if lock is not None:
-                                lock.heartbeat("scanning", completed=done, total=len(sample_dirs))
-                            last_progress_report = done
-            if done != len(sample_dirs):
-                print(f"[{self.split}] Indexed {done}/{len(sample_dirs)} sample dirs...", flush=True)
-            print(
-                f"[{self.split}] Index scan complete in {time.monotonic() - scan_start:.1f}s; "
-                f"collected {len(samples)} hand samples.",
-                flush=True,
-            )
-        except Exception:
-            raise
-
-        lock = getattr(self, "_active_cache_lock", None)
-        if lock is not None:
-            lock.heartbeat("sorting", completed=len(samples), total=len(samples))
-        print(f"[{self.split}] Sorting {len(samples)} compact index records...", flush=True)
-        samples.sort(key=lambda item: (item["sample_dir"], item["hand"]))
-        return samples
 
     def __len__(self):
         return len(self.samples)
 
     @staticmethod
-    def _sample_error(sample_dir, reason):
-        raise RuntimeError(f"Invalid indexed tactile sample at {sample_dir}: {reason}")
+    def _sample_error(sample_ref, reason):
+        raise RuntimeError(f"Invalid indexed tactile sample at {sample_ref}: {reason}")
 
-    def __getitem__(self, idx):
-        sample_record = self.samples[idx]
+    def _close_hdf5_handles(self):
+        handles = getattr(self, "_hdf5_handles", None)
+        if handles is not None:
+            for handle in handles.values():
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+            handles.clear()
+        self._hdf5_handle_pid = None
+
+    def _close_depth_sidecars(self):
+        readers = getattr(self, "_depth_sidecar_readers", None)
+        if readers is not None:
+            for reader in readers.values():
+                try:
+                    reader.close()
+                except Exception:
+                    pass
+            readers.clear()
+        self._depth_sidecar_pid = None
+
+    def _initialize_depth_sidecar_contract(self):
+        if not self.samples:
+            raise RuntimeError(
+                f"[{self.split}] Cannot validate depth sidecars for an empty dataset"
+            )
+        sample = self.samples[0]
+        sequence_key = str(sample.get("sequence_key", "")).strip()
+        if not sequence_key:
+            raise RuntimeError(
+                f"[{self.split}] Depth sidecars require sequence_key in every sample"
+            )
+        path = os.path.join(
+            self.depth_sidecar_root,
+            sequence_sidecar_filename(sequence_key),
+        )
+        if not os.path.isfile(path):
+            raise FileNotFoundError(
+                f"[{self.split}] Depth sidecar contract shard is missing: {path}"
+            )
+        reader = SequenceSidecarReader(path)
+        try:
+            config = reader.config
+            manifest_hashes = set(self.query_manifest_sha256.values())
+            if manifest_hashes and config.manifest_sha256 not in manifest_hashes:
+                raise RuntimeError(
+                    f"[{self.split}] Depth sidecar manifest SHA does not match the "
+                    "authoritative query manifest: "
+                    f"sidecar={config.manifest_sha256}, "
+                    f"query_manifests={sorted(manifest_hashes)}"
+                )
+            self.depth_sidecar_contract = {
+                "teacher_model": str(config.teacher_model),
+                "model_sha256": str(config.model_sha256),
+                "config_sha256": str(config.config_sha256),
+                "semantic_config_sha256": str(config.semantic_config_sha256),
+                "manifest_sha256": str(config.manifest_sha256),
+                "teacher_input_hw": list(config.teacher_input_hw),
+                "stored_grid_hw": list(config.stored_grid_hw),
+                "teacher_bbox_scale": float(config.teacher_bbox_scale),
+                "coordinate_convention": str(config.coordinate_convention),
+                "extra": dict(config.extra),
+            }
+        finally:
+            reader.close()
+        print(
+            f"[{self.split}] Locked depth sidecar contract: "
+            f"model={self.depth_sidecar_contract['model_sha256'][:12]}, "
+            f"config={self.depth_sidecar_contract['config_sha256'][:12]}, "
+            f"manifest={self.depth_sidecar_contract['manifest_sha256'][:12]}",
+            flush=True,
+        )
+
+    def _get_depth_sidecar_reader(self, sequence_key):
+        if self.depth_sidecar_root is None:
+            return None
+        pid = os.getpid()
+        if self._depth_sidecar_pid != pid:
+            self._close_depth_sidecars()
+            self._depth_sidecar_pid = pid
+        key = str(sequence_key)
+        reader = self._depth_sidecar_readers.pop(key, None)
+        if reader is not None:
+            self._depth_sidecar_readers[key] = reader
+            return reader
+        path = os.path.join(
+            self.depth_sidecar_root,
+            sequence_sidecar_filename(key),
+        )
+        if not os.path.isfile(path):
+            raise FileNotFoundError(
+                f"Depth sidecar missing for sequence {key!r}: {path}"
+            )
+        contract = self.depth_sidecar_contract
+        reader = SequenceSidecarReader(
+            path,
+            expected_model_sha256=contract.get("model_sha256"),
+            expected_config_sha256=contract.get("config_sha256"),
+            expected_manifest_sha256=contract.get("manifest_sha256"),
+        )
+        if reader.sequence_key != key:
+            reader.close()
+            raise RuntimeError(
+                f"Depth sidecar sequence mismatch: expected={key!r}, "
+                f"actual={reader.sequence_key!r}, path={path}"
+            )
+        self._depth_sidecar_readers[key] = reader
+        while len(self._depth_sidecar_readers) > self.hdf5_handle_cache_size:
+            _, evicted = self._depth_sidecar_readers.popitem(last=False)
+            evicted.close()
+        return reader
+
+    def __getstate__(self):
+        self._close_hdf5_handles()
+        self._close_depth_sidecars()
+        state = self.__dict__.copy()
+        state["_hdf5_handles"] = OrderedDict()
+        state["_hdf5_handle_pid"] = None
+        state["_hdf5_validated_paths"] = set()
+        state["_pending_batched_loaded"] = None
+        state["_batched_hdf5_jpeg_cache"] = None
+        state["_depth_sidecar_readers"] = OrderedDict()
+        state["_depth_sidecar_pid"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._hdf5_handles = OrderedDict()
+        self._hdf5_handle_pid = None
+        self._hdf5_validated_paths = set()
+        self._pending_batched_loaded = None
+        self._batched_hdf5_jpeg_cache = None
+        self._depth_sidecar_readers = OrderedDict()
+        self._depth_sidecar_pid = None
+
+    def __del__(self):
+        try:
+            self._close_hdf5_handles()
+            self._close_depth_sidecars()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _import_h5py():
+        try:
+            import h5py
+        except ImportError as exc:
+            raise RuntimeError(
+                "data_backend='sequence_hdf5' requires h5py in every DataLoader worker"
+            ) from exc
+        return h5py
+
+    def _get_hdf5_handle(self, path):
+        pid = os.getpid()
+        if self._hdf5_handle_pid != pid:
+            self._close_hdf5_handles()
+            self._hdf5_handle_pid = pid
+        handle = self._hdf5_handles.pop(path, None)
+        if handle is not None:
+            try:
+                if handle.id.valid:
+                    self._hdf5_handles[path] = handle
+                    return handle
+            except Exception:
+                pass
+            try:
+                handle.close()
+            except Exception:
+                pass
+
+        h5py = self._import_h5py()
+        try:
+            opener = getattr(_hdf5_storage, "open_readonly", None)
+            handle = opener(path) if callable(opener) else h5py.File(path, "r")
+        except Exception as exc:
+            raise RuntimeError(f"Could not open HDF5 container read-only: {path}: {exc}") from exc
+        self._hdf5_handles[path] = handle
+        while len(self._hdf5_handles) > self.hdf5_handle_cache_size:
+            _, evicted = self._hdf5_handles.popitem(last=False)
+            try:
+                evicted.close()
+            except Exception:
+                pass
+        return handle
+
+    @staticmethod
+    def _decode_hdf5_attr(value):
+        if isinstance(value, bytes):
+            return value.decode("utf-8")
+        if isinstance(value, np.generic):
+            return value.item()
+        return value
+
+    def _hdf5_dataset_candidates(self, logical_name, defaults):
+        candidates = []
+        custom_paths = getattr(_hdf5_storage, "HDF5_DATASET_PATHS", None)
+        if isinstance(custom_paths, dict):
+            custom = custom_paths.get(logical_name)
+            if isinstance(custom, str):
+                candidates.append(custom)
+            elif custom:
+                candidates.extend(custom)
+        candidates.extend(defaults)
+        return tuple(dict.fromkeys(str(path).lstrip("/") for path in candidates))
+
+    def _find_hdf5_dataset(self, handle, logical_name, defaults, required=True):
+        candidates = self._hdf5_dataset_candidates(logical_name, defaults)
+        for path in candidates:
+            if path in handle:
+                value = handle[path]
+                if hasattr(value, "shape"):
+                    return value
+        if required:
+            raise KeyError(
+                f"HDF5 dataset {logical_name!r} is missing; expected one of {candidates}"
+            )
+        return None
+
+    @staticmethod
+    def _hdf5_hand_slot(record):
+        if "hand_slot" in record:
+            return int(record["hand_slot"])
+        return int(record["is_right"])
+
+    def _read_hdf5_query_array(
+        self,
+        handle,
+        record,
+        logical_name,
+        candidates,
+        required=True,
+    ):
+        dataset = self._find_hdf5_dataset(
+            handle,
+            logical_name,
+            candidates,
+            required=required,
+        )
+        if dataset is None:
+            return None
+        query_row = int(record["query_row"])
+        frame_row = int(record["frame_row"])
+        hand_slot = self._hdf5_hand_slot(record)
+        try:
+            if dataset.ndim == 1:
+                return np.asarray(dataset[...])
+            if (
+                logical_name == "pressure"
+                and dataset.ndim >= 3
+                and int(dataset.shape[1]) == 2
+            ):
+                return np.asarray(dataset[frame_row, hand_slot])
+            return np.asarray(dataset[query_row])
+        except (IndexError, ValueError, TypeError) as exc:
+            raise IndexError(
+                f"Cannot read {logical_name} for query_row={query_row}, "
+                f"frame_row={frame_row}, hand_slot={hand_slot}, shape={dataset.shape}"
+            ) from exc
+        raise ValueError(f"Unsupported {logical_name} dataset shape: {dataset.shape}")
+
+    def _read_hdf5_jpeg(self, handle, record):
+        data = self._find_hdf5_dataset(
+            handle,
+            "jpeg_data",
+            (
+                "images/rgb/jpeg_data",
+                "images/rgb/jpeg_bytes",
+                "images/chest/jpeg_data",
+                "images/chest/jpeg_bytes",
+                "frames/rgb_jpeg/data",
+            ),
+        )
+        offsets = self._find_hdf5_dataset(
+            handle,
+            "jpeg_offsets",
+            (
+                "images/rgb/jpeg_offsets",
+                "images/rgb/offsets",
+                "images/chest/jpeg_offsets",
+                "images/chest/offsets",
+                "frames/rgb_jpeg/offsets",
+            ),
+            required=False,
+        )
+        frame_row = int(record["frame_row"])
+        try:
+            if offsets is not None:
+                if frame_row + 1 >= len(offsets):
+                    raise IndexError(
+                        f"frame_row={frame_row} exceeds JPEG offsets length={len(offsets)}"
+                    )
+                bounds = np.asarray(
+                    offsets[frame_row : frame_row + 2],
+                    dtype=np.uint64,
+                )
+                if bounds.shape != (2,):
+                    raise IndexError(
+                        f"frame_row={frame_row} could not read two JPEG offsets"
+                    )
+                start, end = (int(bounds[0]), int(bounds[1]))
+                if start < 0 or end <= start or end > int(data.shape[0]):
+                    raise ValueError(
+                        f"invalid JPEG byte range [{start}, {end}) for data length={data.shape[0]}"
+                    )
+                encoded = np.asarray(data[start:end], dtype=np.uint8)
+            else:
+                encoded = np.asarray(data[frame_row], dtype=np.uint8).reshape(-1)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not read JPEG for frame_row={frame_row}: {exc}"
+            ) from exc
+        image = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+        if image is None:
+            raise RuntimeError(
+                f"OpenCV could not decode HDF5 JPEG for frame_row={frame_row}"
+            )
+        return image
+
+    def _load_legacy_raw_sample(self, sample_record):
         sample_dir = sample_record["sample_dir"]
-
         meta_path = os.path.join(sample_dir, "meta.json")
-        
-        # 1. Check if files exist (in case extraction is not finished)
         if not os.path.exists(meta_path):
             self._sample_error(sample_dir, "meta.json disappeared after index construction")
-            
-        # 2. Load pre-computed metadata
         meta = load_json_file(meta_path)
 
         dataset_name = sample_record.get("dataset", self._infer_dataset_name(meta))
@@ -1807,8 +667,14 @@ class OpenTouchTactileDataset(Dataset):
         else:
             image_name = meta.get("image", "image.jpg")
             bbox = np.array(meta["bbox"], dtype=np.float32)
-            landmarks_cam = np.array(meta.get("keypoints_3d_cam", np.zeros((21, 3))), dtype=np.float32)
-            valid_mask = np.array(meta.get("valid_mask", np.zeros(21, dtype=bool)), dtype=bool)
+            landmarks_cam = np.array(
+                meta.get("keypoints_3d_cam", np.zeros((21, 3))),
+                dtype=np.float32,
+            )
+            valid_mask = np.array(
+                meta.get("valid_mask", np.zeros(21, dtype=bool)),
+                dtype=bool,
+            )
             side = "right" if is_right else "left"
             tactile_key = f"{side}_pressure_continuous_subdiv"
             pressure_data = meta.get("original_hdf5_data", {}).get(tactile_key)
@@ -1817,12 +683,236 @@ class OpenTouchTactileDataset(Dataset):
 
         img_path = os.path.join(sample_dir, image_name)
         if not os.path.exists(img_path):
-            self._sample_error(sample_dir, f"image disappeared after index construction: {img_path}")
-
-        # 3. Load image using OpenCV
+            self._sample_error(
+                sample_dir,
+                f"image disappeared after index construction: {img_path}",
+            )
         img_bgr = cv2.imread(img_path)
         if img_bgr is None:
             self._sample_error(sample_dir, f"OpenCV could not decode image: {img_path}")
+        return {
+            "sample_ref": sample_dir,
+            "sample_dir": sample_dir,
+            "sample_uid": str(sample_record.get("sample_uid") or sample_dir),
+            "h5_path": "",
+            "frame_row": -1,
+            "query_row": -1,
+            "dataset_name": dataset_name,
+            "hand": hand,
+            "is_right": is_right,
+            "bbox": bbox,
+            "pressure_data": pressure_data,
+            "landmarks_cam": landmarks_cam,
+            "valid_mask": valid_mask,
+            "img_bgr": img_bgr,
+            "frame_idx": int(sample_record.get("frame_idx", meta.get("frame_idx", 0) or 0)),
+        }
+
+    def _load_hdf5_raw_sample(self, sample_record):
+        sample_ref = sample_record["sample_ref"]
+        h5_path = sample_record["h5_path"]
+        try:
+            handle = self._get_hdf5_handle(h5_path)
+            if h5_path not in self._hdf5_validated_paths:
+                expected_schema = str(
+                    sample_record.get("_expected_hdf5_schema_version", "")
+                )
+                actual_schema = self._decode_hdf5_attr(
+                    handle.attrs.get(
+                        "schema_version",
+                        handle.attrs.get("schema_name", expected_schema),
+                    )
+                )
+                if expected_schema and actual_schema and str(actual_schema) != expected_schema:
+                    self._sample_error(
+                        sample_ref,
+                        f"HDF5 schema mismatch: manifest={expected_schema!r}, "
+                        f"container={actual_schema!r}",
+                    )
+                actual_dataset = self._decode_hdf5_attr(
+                    handle.attrs.get("dataset", "")
+                )
+                if (
+                    actual_dataset
+                    and canonical_dataset_name(actual_dataset)
+                    != sample_record["dataset"]
+                ):
+                    self._sample_error(
+                        sample_ref,
+                        f"HDF5 dataset mismatch: manifest={sample_record['dataset']!r}, "
+                        f"container={actual_dataset!r}",
+                    )
+                actual_split = self._decode_hdf5_attr(
+                    handle.attrs.get("split", "")
+                )
+                if actual_split and str(actual_split) != self.split:
+                    self._sample_error(
+                        sample_ref,
+                        f"HDF5 split mismatch: requested={self.split!r}, "
+                        f"container={actual_split!r}",
+                    )
+                self._hdf5_validated_paths.add(h5_path)
+            jpeg_cache = getattr(self, "_batched_hdf5_jpeg_cache", None)
+            jpeg_key = (h5_path, int(sample_record["frame_row"]))
+            img_bgr = jpeg_cache.get(jpeg_key) if jpeg_cache is not None else None
+            if img_bgr is None:
+                img_bgr = self._read_hdf5_jpeg(handle, sample_record)
+                if jpeg_cache is not None:
+                    jpeg_cache[jpeg_key] = img_bgr
+            pressure_data = self._read_hdf5_query_array(
+                handle,
+                sample_record,
+                "pressure",
+                (
+                    "targets/pressure",
+                    "queries/pressure/gaussian_subdiv",
+                    "tactile/pressure",
+                ),
+            )
+
+            bbox_value = sample_record.get("bbox_xyxy", sample_record.get("bbox"))
+            if bbox_value is None:
+                bbox_value = self._read_hdf5_query_array(
+                    handle,
+                    sample_record,
+                    "bbox",
+                    (
+                        "queries/bbox_xyxy",
+                        "queries/bbox",
+                        "queries/bbox_chest",
+                    ),
+                )
+            bbox = np.asarray(bbox_value, dtype=np.float32)
+
+            if self.tactile_only:
+                landmarks_cam = np.zeros((21, 3), dtype=np.float32)
+                valid_mask = np.zeros(21, dtype=bool)
+            else:
+                landmarks_cam = self._read_hdf5_query_array(
+                    handle,
+                    sample_record,
+                    "keypoints_3d_cam",
+                    (
+                        "queries/keypoints_3d_cam",
+                        "queries/keypoints_3d",
+                    ),
+                    required=False,
+                )
+                valid_mask = self._read_hdf5_query_array(
+                    handle,
+                    sample_record,
+                    "keypoints_valid",
+                    (
+                        "queries/keypoints_valid",
+                        "queries/valid_mask",
+                    ),
+                    required=False,
+                )
+                if landmarks_cam is None:
+                    landmarks_cam = np.zeros((21, 3), dtype=np.float32)
+                else:
+                    landmarks_cam = np.asarray(landmarks_cam, dtype=np.float32)
+                    if landmarks_cam.shape != (21, 3):
+                        raise ValueError(
+                            f"keypoints_3d_cam must have shape (21, 3), got "
+                            f"{landmarks_cam.shape}"
+                        )
+                if valid_mask is None:
+                    valid_mask = np.zeros(21, dtype=bool)
+                else:
+                    valid_mask = np.asarray(valid_mask, dtype=bool)
+                    if valid_mask.shape != (21,):
+                        raise ValueError(
+                            f"keypoints_valid must have shape (21,), got "
+                            f"{valid_mask.shape}"
+                        )
+        except Exception as exc:
+            if isinstance(exc, RuntimeError) and str(exc).startswith(
+                "Invalid indexed tactile sample"
+            ):
+                raise
+            self._sample_error(sample_ref, f"HDF5 read failed: {exc}")
+
+        return {
+            "sample_ref": sample_ref,
+            "sample_dir": sample_ref,
+            "sample_uid": sample_record["sample_uid"],
+            "h5_path": h5_path,
+            "frame_row": int(sample_record["frame_row"]),
+            "query_row": int(sample_record["query_row"]),
+            "dataset_name": sample_record["dataset"],
+            "hand": sample_record["hand"],
+            "is_right": int(sample_record["is_right"]),
+            "bbox": bbox,
+            "pressure_data": pressure_data,
+            "landmarks_cam": landmarks_cam,
+            "valid_mask": valid_mask,
+            "img_bgr": img_bgr,
+            "frame_idx": int(sample_record.get("frame_idx", sample_record["frame_row"])),
+        }
+
+    def __getitems__(self, indices):
+        """Read one auto-collated batch with HDF5 container locality.
+
+        Raw HDF5 reads are grouped by container, then item construction resumes
+        in the sampler's original order. This preserves batch membership,
+        collation order and the existing NumPy augmentation RNG sequence.
+        """
+        normalized_indices = [int(index) for index in indices]
+        if self.data_backend != "sequence_hdf5" or len(normalized_indices) <= 1:
+            return [self[index] for index in normalized_indices]
+
+        grouped_positions = OrderedDict()
+        for position, index in enumerate(normalized_indices):
+            sample_record = self.samples[index]
+            grouped_positions.setdefault(sample_record["h5_path"], []).append(
+                (position, index, sample_record)
+            )
+
+        loaded_by_position = [None] * len(normalized_indices)
+        self._batched_hdf5_jpeg_cache = {}
+        try:
+            for entries in grouped_positions.values():
+                for position, _, sample_record in entries:
+                    loaded_by_position[position] = self._load_hdf5_raw_sample(
+                        sample_record
+                    )
+
+            items = []
+            for position, index in enumerate(normalized_indices):
+                self._pending_batched_loaded = (
+                    index,
+                    loaded_by_position[position],
+                )
+                items.append(self[index])
+            return items
+        finally:
+            self._pending_batched_loaded = None
+            self._batched_hdf5_jpeg_cache = None
+
+    def __getitem__(self, idx):
+        idx = int(idx)
+        sample_record = self.samples[idx]
+        pending = getattr(self, "_pending_batched_loaded", None)
+        if pending is not None and int(pending[0]) == idx:
+            loaded = pending[1]
+            self._pending_batched_loaded = None
+        else:
+            loaded = (
+                self._load_hdf5_raw_sample(sample_record)
+                if self.data_backend == "sequence_hdf5"
+                else self._load_legacy_raw_sample(sample_record)
+            )
+        sample_ref = loaded["sample_ref"]
+        sample_dir = loaded["sample_dir"]
+        dataset_name = loaded["dataset_name"]
+        hand = loaded["hand"]
+        is_right = loaded["is_right"]
+        bbox = loaded["bbox"]
+        pressure_data = loaded["pressure_data"]
+        landmarks_cam = loaded["landmarks_cam"]
+        valid_mask = loaded["valid_mask"]
+        img_bgr = loaded["img_bgr"]
         
         # Extract tactile pressure signal on the subdiv MANO mesh.
         tactile_signal = np.zeros(self.tactile_dim, dtype=np.float32)
@@ -1880,16 +970,22 @@ class OpenTouchTactileDataset(Dataset):
             center_y += ty
             
         # Crop and resize image using affine transform
-        res = self.img_size
+        output_height, output_width = self.input_resolution
+        res = output_height
         t = np.zeros((2, 3), dtype=np.float32)
         t[0, 0] = float(res) / bbox_size
         t[1, 1] = float(res) / bbox_size
-        t[0, 2] = res * (-float(center_x) / bbox_size + 0.5)
+        t[0, 2] = -res * float(center_x) / bbox_size + output_width * 0.5
         t[1, 2] = res * (-float(center_y) / bbox_size + 0.5)
         
         # Convert BGR to RGB
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        img_patch = cv2.warpAffine(img_rgb, t, (res, res), flags=cv2.INTER_LINEAR)
+        img_patch = cv2.warpAffine(
+            img_rgb,
+            t,
+            (output_width, output_height),
+            flags=cv2.INTER_LINEAR,
+        )
         
         # Normalize and convert to CHW
         img_patch = img_patch.astype(np.float32) / 255.0
@@ -1908,10 +1004,15 @@ class OpenTouchTactileDataset(Dataset):
         item = {
             'dataset': dataset_name,
             'sample_dir': sample_dir,
+            'sample_uid': str(loaded['sample_uid']),
+            'sample_ref': sample_ref,
+            'h5_path': str(loaded['h5_path']),
+            'frame_row': torch.tensor(int(loaded['frame_row'])),
+            'query_row': torch.tensor(int(loaded['query_row'])),
             'hand': str(hand),
             'sequence_key': str(sample_record.get('sequence_key', '')),
             'query_alias': str(sample_record.get('query_alias', hand or 'query')),
-            'frame_idx': torch.tensor(int(sample_record.get('frame_idx', meta.get('frame_idx', 0) or 0))),
+            'frame_idx': torch.tensor(int(loaded['frame_idx'])),
             'bbox_score': torch.tensor(float(sample_record.get('bbox_score', 0.0))).float(),
             'pressure_source_key': str(sample_record.get('pressure_source_key', '')),
             'query_bbox': torch.from_numpy(bbox.copy()).float(),
@@ -1923,6 +1024,40 @@ class OpenTouchTactileDataset(Dataset):
             'palm_mask': torch.from_numpy(self.palm_mask).float(),
             'right': torch.tensor(float(is_right)).float(),
         }
+        if self.depth_sidecar_root is not None:
+            sequence_key = str(sample_record.get('sequence_key', ''))
+            if not sequence_key:
+                self._sample_error(sample_ref, "depth sidecar requires sequence_key")
+            reader = self._get_depth_sidecar_reader(sequence_key)
+            try:
+                geometry_record = reader.read(
+                    sample_uid=str(loaded['sample_uid']),
+                    query_row=int(loaded['query_row']),
+                )
+                depth_prior = warp_record_pointnormal(
+                    geometry_record,
+                    rgb_affine=t,
+                    rgb_output_hw=self.input_resolution,
+                    output_hw=self.depth_output_hw,
+                    flip_left_to_right=(is_right == 0),
+                    spatial_shuffle_seed=(
+                        521
+                        if self.depth_control == "sample_spatial_shuffle"
+                        else None
+                    ),
+                )
+            except Exception as exc:
+                self._sample_error(
+                    sample_ref,
+                    f"depth sidecar read/warp failed: {exc}",
+                )
+            if not np.isfinite(depth_prior).all():
+                self._sample_error(
+                    sample_ref,
+                    "depth sidecar warp produced non-finite values",
+                )
+            item['depth_prior'] = torch.from_numpy(depth_prior).float()
+            item['crop_affine'] = torch.from_numpy(t.copy()).float()
         if not self.tactile_only:
             img_size_array = np.array([img_bgr.shape[1], img_bgr.shape[0]])
             item.update({
