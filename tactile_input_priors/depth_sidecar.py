@@ -524,7 +524,32 @@ class SequenceSidecarReader:
 
     def _open(self) -> None:
         self.close()
-        handle = h5py.File(self.path, "r", libver="latest", swmr=True)
+        base_kwargs = {
+            "mode": "r",
+            "libver": "latest",
+            "rdcc_nbytes": 256 * 1024,
+            "rdcc_nslots": 521,
+            "rdcc_w0": 0.0,
+        }
+        attempts = (
+            {**base_kwargs, "swmr": True, "locking": False},
+            {**base_kwargs, "locking": False},
+            {**base_kwargs, "swmr": True},
+            base_kwargs,
+        )
+        errors = []
+        handle = None
+        for kwargs in attempts:
+            try:
+                handle = h5py.File(self.path, **kwargs)
+                break
+            except (OSError, TypeError, ValueError) as exc:
+                errors.append(f"{kwargs}: {type(exc).__name__}: {exc}")
+        if handle is None:
+            raise OSError(
+                f"Could not open immutable depth sidecar {self.path}: "
+                + " | ".join(errors)
+            )
         try:
             if _decode_string(handle.attrs.get("schema_name", "")) != SCHEMA_NAME:
                 raise ValueError(f"Not a {SCHEMA_NAME} file: {self.path}")
@@ -582,6 +607,8 @@ class SequenceSidecarReader:
         self._pid = os.getpid()
         self._uid_to_storage = None
         self._query_to_storage = None
+        self._query_rows_sorted = None
+        self._storage_rows_by_query = None
         self.config = config
         self.sequence_key = _decode_string(handle.attrs["sequence_key"])
         self.record_count = record_count
@@ -618,6 +645,54 @@ class SequenceSidecarReader:
         self._uid_to_storage = uid_lookup
         self._query_to_storage = row_lookup
 
+    def _build_sorted_query_lookup(self) -> None:
+        """Load the compact numeric lookup written with every sidecar shard."""
+
+        handle = self._ensure_open()
+        if (
+            "lookup/query_row_sorted" in handle
+            and "lookup/storage_row_by_query" in handle
+        ):
+            query_rows = np.asarray(
+                handle["lookup/query_row_sorted"][:], dtype=np.int64
+            )
+            storage_rows = np.asarray(
+                handle["lookup/storage_row_by_query"][:], dtype=np.int64
+            )
+        else:
+            query_rows_unsorted = np.asarray(
+                handle["queries/query_row"][:], dtype=np.int64
+            )
+            storage_rows = np.argsort(query_rows_unsorted, kind="stable").astype(
+                np.int64, copy=False
+            )
+            query_rows = query_rows_unsorted[storage_rows]
+        if query_rows.shape != storage_rows.shape or query_rows.ndim != 1:
+            raise ValueError(f"Malformed numeric query lookup in {self.path}")
+        if query_rows.size and np.any(query_rows[1:] <= query_rows[:-1]):
+            raise ValueError(f"Query rows are not strictly increasing in {self.path}")
+        if storage_rows.size and (
+            int(storage_rows.min()) < 0
+            or int(storage_rows.max()) >= self.record_count
+        ):
+            raise ValueError(f"Storage rows are out of bounds in {self.path}")
+        self._query_rows_sorted = query_rows
+        self._storage_rows_by_query = storage_rows
+
+    def _storage_row_from_query(self, query_row: int) -> int:
+        if self._query_rows_sorted is None or self._storage_rows_by_query is None:
+            self._build_sorted_query_lookup()
+        assert self._query_rows_sorted is not None
+        assert self._storage_rows_by_query is not None
+        requested = int(query_row)
+        position = int(np.searchsorted(self._query_rows_sorted, requested))
+        if (
+            position >= self._query_rows_sorted.size
+            or int(self._query_rows_sorted[position]) != requested
+        ):
+            raise KeyError(f"query_row not found in {self.path}: {requested}")
+        return int(self._storage_rows_by_query[position])
+
     def storage_row(
         self,
         sample_uid: str | None = None,
@@ -625,21 +700,29 @@ class SequenceSidecarReader:
     ) -> int:
         if sample_uid is None and query_row is None:
             raise ValueError("At least one of sample_uid or query_row is required")
-        if self._uid_to_storage is None or self._query_to_storage is None:
-            self._build_lookup()
-        assert self._uid_to_storage is not None and self._query_to_storage is not None
         uid_position = None
         query_position = None
-        if sample_uid is not None:
+        if query_row is not None:
+            query_position = self._storage_row_from_query(int(query_row))
+        if sample_uid is not None and query_position is not None:
+            handle = self._ensure_open()
+            actual_uid = _decode_string(
+                handle["queries/sample_uid"][query_position]
+            )
+            if actual_uid != str(sample_uid):
+                raise KeyError(
+                    f"sample_uid={sample_uid!r} and query_row={query_row} "
+                    f"identify different records in {self.path}"
+                )
+            uid_position = query_position
+        elif sample_uid is not None:
+            if self._uid_to_storage is None:
+                self._build_lookup()
+            assert self._uid_to_storage is not None
             uid = str(sample_uid)
             if uid not in self._uid_to_storage:
                 raise KeyError(f"sample_uid not found in {self.path}: {uid}")
             uid_position = self._uid_to_storage[uid]
-        if query_row is not None:
-            row = int(query_row)
-            if row not in self._query_to_storage:
-                raise KeyError(f"query_row not found in {self.path}: {row}")
-            query_position = self._query_to_storage[row]
         if uid_position is not None and query_position is not None and uid_position != query_position:
             raise KeyError(
                 f"sample_uid={sample_uid!r} and query_row={query_row} identify different records"
@@ -680,6 +763,8 @@ class SequenceSidecarReader:
         self._pid = None
         self._uid_to_storage = None
         self._query_to_storage = None
+        self._query_rows_sorted = None
+        self._storage_rows_by_query = None
 
     def __enter__(self) -> "SequenceSidecarReader":
         self._ensure_open()
@@ -695,6 +780,8 @@ class SequenceSidecarReader:
         state["_pid"] = None
         state["_uid_to_storage"] = None
         state["_query_to_storage"] = None
+        state["_query_rows_sorted"] = None
+        state["_storage_rows_by_query"] = None
         return state
 
 
@@ -761,18 +848,18 @@ def _validity_aware_warp(
     values = np.asarray(values, dtype=np.float32)
     if values.ndim == 2:
         values = values[..., None]
-    warped = np.empty((height, width, values.shape[-1]), dtype=np.float32)
     denominator = np.maximum(weight, float(epsilon))
-    for channel in range(values.shape[-1]):
-        numerator = cv2.warpAffine(
-            values[..., channel] * valid_float,
-            affine,
-            (width, height),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0.0,
-        )
-        warped[..., channel] = numerator / denominator
+    numerator = cv2.warpAffine(
+        values * valid_float[..., None],
+        affine,
+        (width, height),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0.0,
+    )
+    if numerator.ndim == 2:
+        numerator = numerator[..., None]
+    warped = np.asarray(numerator, dtype=np.float32) / denominator[..., None]
     warped[weight <= epsilon] = 0.0
     return warped, weight
 

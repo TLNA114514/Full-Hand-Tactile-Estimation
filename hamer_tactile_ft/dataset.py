@@ -101,7 +101,9 @@ class OpenTouchTactileDataset(DatasetIndexingMixin, Dataset):
                  hdf5_manifest_cache_dir: str = None,
                  depth_sidecar_root: str = None,
                  depth_control: str = "none",
-                 depth_output_hw=(32, 24)):
+                 depth_output_hw=(32, 24),
+                 io_debug_enabled: bool = False,
+                 hdf5_batch_read_mode: str = "grouped"):
         super().__init__()
         self.cfg = cfg
         self.split = split
@@ -127,6 +129,10 @@ class OpenTouchTactileDataset(DatasetIndexingMixin, Dataset):
             else None
         )
         self.depth_control = str(depth_control or "none")
+        self.io_debug_enabled = bool(io_debug_enabled)
+        self.hdf5_batch_read_mode = str(hdf5_batch_read_mode).strip().lower()
+        if self.hdf5_batch_read_mode not in ("grouped", "streaming"):
+            raise ValueError("hdf5_batch_read_mode must be grouped or streaming")
         if self.depth_control not in ("none", "sample_spatial_shuffle"):
             raise ValueError(
                 "depth_control must be none or sample_spatial_shuffle"
@@ -578,7 +584,7 @@ class OpenTouchTactileDataset(DatasetIndexingMixin, Dataset):
             ) from exc
         raise ValueError(f"Unsupported {logical_name} dataset shape: {dataset.shape}")
 
-    def _read_hdf5_jpeg(self, handle, record):
+    def _read_hdf5_jpeg(self, handle, record, timing=None):
         data = self._find_hdf5_dataset(
             handle,
             "jpeg_data",
@@ -603,6 +609,7 @@ class OpenTouchTactileDataset(DatasetIndexingMixin, Dataset):
             required=False,
         )
         frame_row = int(record["frame_row"])
+        read_started = time.perf_counter_ns() if timing is not None else 0
         try:
             if offsets is not None:
                 if frame_row + 1 >= len(offsets):
@@ -629,11 +636,20 @@ class OpenTouchTactileDataset(DatasetIndexingMixin, Dataset):
             raise RuntimeError(
                 f"Could not read JPEG for frame_row={frame_row}: {exc}"
             ) from exc
+        if timing is not None:
+            timing["jpeg_hdf5_ms"] = (
+                time.perf_counter_ns() - read_started
+            ) / 1e6
+        decode_started = time.perf_counter_ns() if timing is not None else 0
         image = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
         if image is None:
             raise RuntimeError(
                 f"OpenCV could not decode HDF5 JPEG for frame_row={frame_row}"
             )
+        if timing is not None:
+            timing["jpeg_decode_ms"] = (
+                time.perf_counter_ns() - decode_started
+            ) / 1e6
         return image
 
     def _load_legacy_raw_sample(self, sample_record):
@@ -711,8 +727,17 @@ class OpenTouchTactileDataset(DatasetIndexingMixin, Dataset):
     def _load_hdf5_raw_sample(self, sample_record):
         sample_ref = sample_record["sample_ref"]
         h5_path = sample_record["h5_path"]
+        timing = {} if self.io_debug_enabled else None
+        raw_started = time.perf_counter_ns() if timing is not None else 0
         try:
+            source_cached = h5_path in self._hdf5_handles
+            handle_started = time.perf_counter_ns() if timing is not None else 0
             handle = self._get_hdf5_handle(h5_path)
+            if timing is not None:
+                timing["source_handle_ms"] = (
+                    time.perf_counter_ns() - handle_started
+                ) / 1e6
+                timing["source_handle_hit"] = float(source_cached)
             if h5_path not in self._hdf5_validated_paths:
                 expected_schema = str(
                     sample_record.get("_expected_hdf5_schema_version", "")
@@ -756,9 +781,13 @@ class OpenTouchTactileDataset(DatasetIndexingMixin, Dataset):
             jpeg_key = (h5_path, int(sample_record["frame_row"]))
             img_bgr = jpeg_cache.get(jpeg_key) if jpeg_cache is not None else None
             if img_bgr is None:
-                img_bgr = self._read_hdf5_jpeg(handle, sample_record)
+                img_bgr = self._read_hdf5_jpeg(handle, sample_record, timing=timing)
                 if jpeg_cache is not None:
                     jpeg_cache[jpeg_key] = img_bgr
+            elif timing is not None:
+                timing["jpeg_hdf5_ms"] = 0.0
+                timing["jpeg_decode_ms"] = 0.0
+            pressure_started = time.perf_counter_ns() if timing is not None else 0
             pressure_data = self._read_hdf5_query_array(
                 handle,
                 sample_record,
@@ -769,6 +798,10 @@ class OpenTouchTactileDataset(DatasetIndexingMixin, Dataset):
                     "tactile/pressure",
                 ),
             )
+            if timing is not None:
+                timing["pressure_hdf5_ms"] = (
+                    time.perf_counter_ns() - pressure_started
+                ) / 1e6
 
             bbox_value = sample_record.get("bbox_xyxy", sample_record.get("bbox"))
             if bbox_value is None:
@@ -833,6 +866,11 @@ class OpenTouchTactileDataset(DatasetIndexingMixin, Dataset):
                 raise
             self._sample_error(sample_ref, f"HDF5 read failed: {exc}")
 
+        if timing is not None:
+            timing["source_raw_ms"] = (
+                time.perf_counter_ns() - raw_started
+            ) / 1e6
+
         return {
             "sample_ref": sample_ref,
             "sample_dir": sample_ref,
@@ -849,17 +887,22 @@ class OpenTouchTactileDataset(DatasetIndexingMixin, Dataset):
             "valid_mask": valid_mask,
             "img_bgr": img_bgr,
             "frame_idx": int(sample_record.get("frame_idx", sample_record["frame_row"])),
+            "_runtime_io_debug": timing,
         }
 
     def __getitems__(self, indices):
-        """Read one auto-collated batch with HDF5 container locality.
+        """Read one auto-collated batch in grouped or memory-bounded mode.
 
-        Raw HDF5 reads are grouped by container, then item construction resumes
-        in the sampler's original order. This preserves batch membership,
-        collation order and the existing NumPy augmentation RNG sequence.
+        Grouped mode reads raw records by container before item construction.
+        Streaming mode retains only one decoded source frame at a time. Both
+        preserve batch membership, collation order, and NumPy augmentation RNG.
         """
         normalized_indices = [int(index) for index in indices]
         if self.data_backend != "sequence_hdf5" or len(normalized_indices) <= 1:
+            return [self[index] for index in normalized_indices]
+        if self.hdf5_batch_read_mode == "streaming":
+            # Avoid retaining an entire batch of decoded full-resolution images.
+            # Item order and NumPy augmentation RNG order remain unchanged.
             return [self[index] for index in normalized_indices]
 
         grouped_positions = OrderedDict()
@@ -913,6 +956,8 @@ class OpenTouchTactileDataset(DatasetIndexingMixin, Dataset):
         landmarks_cam = loaded["landmarks_cam"]
         valid_mask = loaded["valid_mask"]
         img_bgr = loaded["img_bgr"]
+        timing = loaded.get("_runtime_io_debug")
+        transform_started = time.perf_counter_ns() if timing is not None else 0
         
         # Extract tactile pressure signal on the subdiv MANO mesh.
         tactile_signal = np.zeros(self.tactile_dim, dtype=np.float32)
@@ -1024,16 +1069,33 @@ class OpenTouchTactileDataset(DatasetIndexingMixin, Dataset):
             'palm_mask': torch.from_numpy(self.palm_mask).float(),
             'right': torch.tensor(float(is_right)).float(),
         }
+        if timing is not None:
+            timing["rgb_transform_ms"] = (
+                time.perf_counter_ns() - transform_started
+            ) / 1e6
         if self.depth_sidecar_root is not None:
             sequence_key = str(sample_record.get('sequence_key', ''))
             if not sequence_key:
                 self._sample_error(sample_ref, "depth sidecar requires sequence_key")
+            depth_cached = sequence_key in self._depth_sidecar_readers
+            depth_handle_started = time.perf_counter_ns() if timing is not None else 0
             reader = self._get_depth_sidecar_reader(sequence_key)
+            if timing is not None:
+                timing["depth_handle_ms"] = (
+                    time.perf_counter_ns() - depth_handle_started
+                ) / 1e6
+                timing["depth_handle_hit"] = float(depth_cached)
             try:
+                depth_read_started = time.perf_counter_ns() if timing is not None else 0
                 geometry_record = reader.read(
                     sample_uid=str(loaded['sample_uid']),
                     query_row=int(loaded['query_row']),
                 )
+                if timing is not None:
+                    timing["depth_hdf5_ms"] = (
+                        time.perf_counter_ns() - depth_read_started
+                    ) / 1e6
+                depth_warp_started = time.perf_counter_ns() if timing is not None else 0
                 depth_prior = warp_record_pointnormal(
                     geometry_record,
                     rgb_affine=t,
@@ -1046,6 +1108,10 @@ class OpenTouchTactileDataset(DatasetIndexingMixin, Dataset):
                         else None
                     ),
                 )
+                if timing is not None:
+                    timing["depth_warp_ms"] = (
+                        time.perf_counter_ns() - depth_warp_started
+                    ) / 1e6
             except Exception as exc:
                 self._sample_error(
                     sample_ref,
@@ -1058,6 +1124,22 @@ class OpenTouchTactileDataset(DatasetIndexingMixin, Dataset):
                 )
             item['depth_prior'] = torch.from_numpy(depth_prior).float()
             item['crop_affine'] = torch.from_numpy(t.copy()).float()
+        if timing is not None:
+            timing.setdefault("depth_handle_ms", 0.0)
+            timing.setdefault("depth_handle_hit", 0.0)
+            timing.setdefault("depth_hdf5_ms", 0.0)
+            timing.setdefault("depth_warp_ms", 0.0)
+            timing["getitem_total_ms"] = sum(
+                float(timing.get(name, 0.0))
+                for name in ("source_raw_ms", "rgb_transform_ms", "depth_handle_ms", "depth_hdf5_ms", "depth_warp_ms")
+            )
+            worker = torch.utils.data.get_worker_info()
+            timing["worker_id"] = -1 if worker is None else int(worker.id)
+            timing["worker_pid"] = int(os.getpid())
+            item['_runtime_io_debug'] = {
+                name: torch.tensor(value, dtype=torch.float32)
+                for name, value in timing.items()
+            }
         if not self.tactile_only:
             img_size_array = np.array([img_bgr.shape[1], img_bgr.shape[0]])
             item.update({

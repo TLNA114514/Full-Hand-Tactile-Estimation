@@ -53,6 +53,7 @@ RSYNC_EXCLUDES=(
     --exclude='sam3_bbox_reconstruction/pilot_manifest.recovered.json'
     --exclude='sam3_bbox_reconstruction/index.html'
     --exclude='sam3_bbox_reconstruction/association_index.html'
+    --exclude='tactile_input_priors/runtime_debug'
     --exclude='outputs'
 )
 

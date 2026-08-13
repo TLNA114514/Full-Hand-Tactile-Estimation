@@ -1,0 +1,37 @@
+{
+  "tactile": {
+    "checkpoint": "/home/ma-user/work/cfzhao/Full-Hand-Tactile-Estimation/hamer_tactile_ft/checkpoints/touchanything_dense_v2_dinov3_rezero_fullgrid32_coreloc_sam3_crop12/best_loss.ckpt",
+    "dino_weights": "/home/ma-user/work/cfzhao/Full-Hand-Tactile-Estimation/_DATA/dinov3_vith16plus_pretrain_lvd1689m-7c1da9a5.pth",
+    "mesh_obj": "/home/ma-user/work/cfzhao/Full-Hand-Tactile-Estimation/opentouch/preprocess/scratch/mano_right_neutral_subdiv.obj",
+    "palm_faces": "/home/ma-user/work/cfzhao/Full-Hand-Tactile-Estimation/opentouch/preprocess/scratch/auto_calibrated_palm_subdiv_faces.json",
+    "device": "cuda:0",
+    "batch_size": 8,
+    "precision": "bf16",
+    "single_hand_default": "right",
+    "verify_backbone_sha256": false
+  },
+  "sam3": {
+    "python": "/home/ma-user/anaconda3/envs/sam3bbox/bin/python",
+    "tracker": "/home/ma-user/work/cfzhao/Full-Hand-Tactile-Estimation/sam3_bbox_reconstruction/track_video.py",
+    "checkpoint": "/home/ma-user/work/cfzhao/Full-Hand-Tactile-Estimation/_DATA/sam3/sam3.pt",
+    "gpu": "0",
+    "version": "sam3",
+    "prompt_preset": "gloved",
+    "prompt": null,
+    "max_hands": 2,
+    "min_track_frames": 2,
+    "video_chunk_frames": 256,
+    "video_chunk_overlap": 32,
+    "bare_verification_mode": "filter",
+    "flow_assist": false,
+    "save_mask_previews": true
+  },
+  "input": {
+    "frame_jpeg_quality": 95
+  },
+  "render": {
+    "size": "720x1280",
+    "display_floor": 0.05,
+    "temporal_alpha": 0.0
+  }
+}

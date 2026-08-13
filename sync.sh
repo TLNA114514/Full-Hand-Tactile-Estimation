@@ -16,6 +16,7 @@ SYNC_DIRS=(
     "sam3_bbox_reconstruction"
     "scratch"
     "tactile_input_priors"
+    "tactile_inference"
     # "未来你想同步的新文件夹A"
     # "未来你想同步的新文件夹B"
 )

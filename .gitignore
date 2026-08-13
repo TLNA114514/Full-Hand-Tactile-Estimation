@@ -149,3 +149,4 @@ tactile_input_priors/cache/
 tactile_input_priors/sidecars/
 tactile_input_priors/models/
 tactile_input_priors/envs/
+tactile_input_priors/runtime_debug
