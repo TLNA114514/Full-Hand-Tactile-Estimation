@@ -22,9 +22,8 @@ import re
 import subprocess
 import cv2
 import numpy as np
-import torch
-import trimesh
-# Parse GPU early
+# Parse GPU before importing torch so each dual-hand worker sees only its
+# assigned physical device.
 _gpus = ""
 for i, arg in enumerate(sys.argv):
     if arg == '--gpu' and i + 1 < len(sys.argv):
@@ -32,6 +31,9 @@ for i, arg in enumerate(sys.argv):
         break
 if _gpus:
     os.environ["CUDA_VISIBLE_DEVICES"] = _gpus
+
+import torch
+import trimesh
 
 torch.set_float32_matmul_precision('high')
 from pathlib import Path
@@ -63,6 +65,7 @@ from train import (
     load_compatible_state_dict,
 )
 from hamer_tactile import parse_input_resolution
+from hamer_config_assets import resolve_hamer_model_config_path
 
 class ViTDetDataset(torch.utils.data.Dataset):
     def __init__(self, cfg, img_cv2, boxes, right, rescale_factor=2.0):
@@ -321,7 +324,26 @@ def _load_tactile_model_metadata(checkpoint_path):
             "pool_layout",
             "input_resolution",
             "pool_output_channels",
+            "decoder_hidden_dim",
             "decoder_dropout_scale",
+            "local_anchor_count",
+            "local_anchor_neighbors",
+            "local_logit_delta_max",
+            "local_residual_dropout",
+            "freeze_local_residual_base",
+            "support_selector_mode",
+            "support_selector_thresholds",
+            "support_selector_no_contact_max",
+            "support_selector_contact_min",
+            "support_selector_dropout",
+            "support_selector_monotonicity_weight",
+            "support_selector_architecture",
+            "support_selector_feature_source",
+            "support_selector_neck_channels",
+            "support_selector_hidden_dim",
+            "support_selector_base_conditioning",
+            "init_tactile_checkpoint",
+            "init_tactile_checkpoint_sha256",
             "bbox_rescale_factor",
         ):
             if checkpoint.get(key) not in (None, "", []):
@@ -339,8 +361,8 @@ def load_models(
 ):
     checkpoint_path = Path(checkpoint_path).expanduser().resolve()
     print(">>> Loading model config...")
-    model_cfg_path = os.path.join(hamer_dir, '_DATA/hamer_ckpts/model_config.yaml')
-    model_cfg = get_config(model_cfg_path, update_cachedir=True)
+    model_cfg_path = resolve_hamer_model_config_path(workspace_dir)
+    model_cfg = get_config(str(model_cfg_path), update_cachedir=True)
     if 'PRETRAINED_WEIGHTS' in model_cfg.MODEL.BACKBONE:
         model_cfg.defrost()
         model_cfg.MODEL.BACKBONE.pop('PRETRAINED_WEIGHTS')
@@ -360,6 +382,47 @@ def load_models(
     pool_layout = str(metadata.get("pool_layout", "fullgrid32"))
     decoder_dropout_scale = float(metadata.get("decoder_dropout_scale", 1.0))
     pool_output_channels = int(metadata.get("pool_output_channels", 32))
+    decoder_hidden_dim = int(metadata.get("decoder_hidden_dim", 512))
+    local_anchor_count = int(metadata.get("local_anchor_count", 512))
+    local_anchor_neighbors = int(metadata.get("local_anchor_neighbors", 4))
+    local_logit_delta_max = float(metadata.get("local_logit_delta_max", 6.0))
+    local_residual_dropout = float(metadata.get("local_residual_dropout", 0.10))
+    freeze_local_residual_base = bool(
+        metadata.get("freeze_local_residual_base", True)
+    )
+    support_selector_mode = str(metadata.get("support_selector_mode", "contact"))
+    support_selector_thresholds = tuple(
+        float(value)
+        for value in metadata.get("support_selector_thresholds", (0.10,))
+    )
+    support_selector_no_contact_max = float(
+        metadata.get("support_selector_no_contact_max", 0.02)
+    )
+    support_selector_contact_min = float(
+        metadata.get("support_selector_contact_min", 0.10)
+    )
+    support_selector_dropout = float(
+        metadata.get("support_selector_dropout", 0.10)
+    )
+    support_selector_monotonicity_weight = float(
+        metadata.get("support_selector_monotonicity_weight", 0.10)
+    )
+    support_selector_architecture = str(
+        metadata.get("support_selector_architecture", "linear")
+    )
+    support_selector_feature_source = str(
+        metadata.get("support_selector_feature_source", "fullgrid32")
+    )
+    support_selector_neck_channels = int(
+        metadata.get("support_selector_neck_channels", 64)
+    )
+    support_selector_hidden_dim = int(
+        metadata.get("support_selector_hidden_dim", 512)
+    )
+    support_selector_base_conditioning = str(
+        metadata.get("support_selector_base_conditioning", "real")
+    )
+    init_tactile_checkpoint = str(metadata.get("init_tactile_checkpoint", "") or "")
     resolved_bbox_rescale_factor = float(
         bbox_rescale_factor
         if bbox_rescale_factor is not None
@@ -393,6 +456,7 @@ def load_models(
         ">>> Initializing tactile model: "
         f"head={tactile_head_type}, backbone={visual_backbone}, "
         f"layers={backbone_feature_layers}, pool={pool_layout}, "
+        f"channels={pool_output_channels}, hidden={decoder_hidden_dim}, "
         f"bbox_rescale={resolved_bbox_rescale_factor:g}"
     )
     model = TactileTrainingModule(
@@ -408,6 +472,28 @@ def load_models(
         decoder_dropout_scale=decoder_dropout_scale,
         input_resolution=input_resolution,
         pool_output_channels=pool_output_channels,
+        decoder_hidden_dim=decoder_hidden_dim,
+        local_anchor_count=local_anchor_count,
+        local_anchor_neighbors=local_anchor_neighbors,
+        local_logit_delta_max=local_logit_delta_max,
+        local_residual_dropout=local_residual_dropout,
+        freeze_local_residual_base=freeze_local_residual_base,
+        support_selector_mode=support_selector_mode,
+        support_selector_thresholds=support_selector_thresholds,
+        support_selector_no_contact_max=support_selector_no_contact_max,
+        support_selector_contact_min=support_selector_contact_min,
+        support_selector_dropout=support_selector_dropout,
+        support_selector_monotonicity_weight=(
+            support_selector_monotonicity_weight
+        ),
+        support_selector_architecture=support_selector_architecture,
+        support_selector_feature_source=support_selector_feature_source,
+        support_selector_neck_channels=support_selector_neck_channels,
+        support_selector_hidden_dim=support_selector_hidden_dim,
+        support_selector_base_conditioning=(
+            support_selector_base_conditioning
+        ),
+        init_tactile_checkpoint=init_tactile_checkpoint,
         bbox_rescale_factor=resolved_bbox_rescale_factor,
     )
     model.visual_backbone_model_name = str(metadata.get("visual_backbone_model_name", ""))
@@ -2039,6 +2125,24 @@ def main():
         help="Optional maximum number of selected dataset frames, useful for a quick preview.",
     )
     parser.add_argument("--out_dir", type=str, default="./demo_output", help="Output directory")
+    parser.add_argument(
+        "--output_subdir",
+        type=str,
+        default=None,
+        help=(
+            "Optional relative output directory below --out_dir. Used by the dual-hand "
+            "launcher to isolate left/right results while sharing one RGB sequence."
+        ),
+    )
+    parser.add_argument(
+        "--shared_rgb_dir",
+        type=str,
+        default=None,
+        help=(
+            "Read-only directory containing previously extracted VIDEO_STEM_*.png frames. "
+            "Requires --skip_frame_extraction."
+        ),
+    )
     parser.add_argument("--gpu", type=str, default="4", help="GPU index")
     parser.add_argument(
         "--hand",
@@ -2105,6 +2209,12 @@ def main():
         help="Panel stacking direction. 'auto' is retained as an alias for the default side-by-side layout.",
     )
     parser.add_argument(
+        "--panel_label",
+        type=str,
+        default=None,
+        help="Optional label drawn on the canonical tactile panel.",
+    )
+    parser.add_argument(
         "--rerender_tactile_dir",
         type=str,
         default=None,
@@ -2168,6 +2278,12 @@ def main():
         parser.error("--dataset_fps must be finite and positive")
     if args.video_path and args.dataset_sequence:
         parser.error("Use either --video_path or --dataset_sequence, not both")
+    if args.shared_rgb_dir and not args.skip_frame_extraction:
+        parser.error("--shared_rgb_dir requires --skip_frame_extraction")
+    if args.output_subdir:
+        output_subdir = Path(args.output_subdir)
+        if output_subdir.is_absolute() or ".." in output_subdir.parts:
+            parser.error("--output_subdir must be a relative path without '..'")
 
     print(
         f">>> Demo entry: {Path(__file__).resolve()} "
@@ -2218,8 +2334,13 @@ def main():
     video_rotation = _resolve_video_rotation(args.video_rotation, video_path)
 
     # Ensure output folders
-    out_path = Path(args.out_dir) / demo_id
-    rgb_dir = out_path / "rgb"
+    out_path = (
+        Path(args.out_dir) / args.output_subdir
+        if args.output_subdir
+        else Path(args.out_dir) / demo_id
+    )
+    out_path.mkdir(parents=True, exist_ok=True)
+    rgb_dir = Path(args.shared_rgb_dir).expanduser().resolve() if args.shared_rgb_dir else out_path / "rgb"
     bbox_dir = out_path / "bbox"
     pred_touch_dir = out_path / "pred_touch"
 
@@ -2473,6 +2594,7 @@ def main():
         hand_side=hand_side,
         canonical_view=args.canonical_view,
         valid_frames=valid_frames,
+        panel_label=args.panel_label,
     )
 
     print("\n>>> [5/5] Compiling RGB and canonical tactile visualization...")

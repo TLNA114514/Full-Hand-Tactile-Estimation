@@ -11,15 +11,23 @@ from hamer_tactile_ft.hamer_tactile import DinoTactileModel
 
 from .prior_adapters import (
     AdapterConfig,
+    DepthCausalFiLMAdapter,
+    DepthLocalCrossAttentionAdapter,
     DepthSpatialRectificationAdapter,
     SUPPORTED_PRIOR_CONTROLS,
     VLMLowRankModulationAdapter,
     apply_prior_control,
     detached_diagnostics,
+    per_sample_spatial_permutations,
 )
 
 
-SUPPORTED_PRIOR_ADAPTERS = ("depth_spatial", "vlm_lowrank")
+DEPTH_PRIOR_ADAPTERS = (
+    "depth_spatial",
+    "depth_causal_film",
+    "depth_local_xattn",
+)
+SUPPORTED_PRIOR_ADAPTERS = (*DEPTH_PRIOR_ADAPTERS, "vlm_lowrank")
 
 
 class _CacheOnlyBackbone(nn.Module):
@@ -35,6 +43,9 @@ def smooth_logit_delta(
     raw_fused_logits: torch.Tensor,
     base_logits: torch.Tensor,
     maximum_delta: float,
+    *,
+    valid_mask: Optional[torch.Tensor] = None,
+    zero_mean: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Smoothly cap the adapter-induced change while preserving its sign."""
 
@@ -46,7 +57,31 @@ def smooth_logit_delta(
     if float(maximum_delta) <= 0.0:
         raise ValueError("maximum logit delta must be positive")
     raw_delta = raw_fused_logits - base_logits
+    mask = None
+    if zero_mean:
+        if valid_mask is None:
+            raise ValueError("zero-mean logit residual requires a valid palm mask")
+        mask = valid_mask.to(device=raw_delta.device, dtype=raw_delta.dtype)
+        if mask.ndim == 1:
+            mask = mask[None].expand(raw_delta.shape[0], -1)
+        elif mask.ndim == 2 and mask.shape[0] == 1:
+            mask = mask.expand(raw_delta.shape[0], -1)
+        if mask.shape != raw_delta.shape:
+            raise ValueError(
+                f"palm mask shape {tuple(mask.shape)} does not match logits {tuple(raw_delta.shape)}"
+            )
+        denominator = mask.sum(dim=1, keepdim=True).clamp_min(1.0)
+        raw_delta = (raw_delta - (raw_delta * mask).sum(dim=1, keepdim=True) / denominator) * mask
     bounded_delta = float(maximum_delta) * torch.tanh(raw_delta / float(maximum_delta))
+    if zero_mean:
+        denominator = mask.sum(dim=1, keepdim=True).clamp_min(1.0)
+        bounded_delta = bounded_delta - (
+            bounded_delta * mask
+        ).sum(dim=1, keepdim=True) / denominator
+        bounded_delta = bounded_delta * mask
+        maximum = bounded_delta.abs().amax(dim=1, keepdim=True).clamp_min(1e-12)
+        scale = torch.clamp(float(maximum_delta) / maximum, max=1.0)
+        bounded_delta = bounded_delta * scale
     return base_logits + bounded_delta, bounded_delta
 
 
@@ -62,7 +97,7 @@ class FrozenBasePriorModel(nn.Module):
 
     - ``img``: normalized RGB input for an online base forward.
     - ``frozen_base_grid``: cached fused RGB grid ``[B,256,H,W]``.
-    - ``frozen_base_bottleneck``: cached 512-D decoder bottleneck (VLM only).
+    - ``frozen_base_bottleneck``: cached decoder bottleneck (VLM only).
     - ``frozen_base_logits``: cached base logits.
     - ``depth_prior`` and optional ``depth_valid``/``depth_available``.
     - ``vlm_prior`` and optional ``vlm_available``.
@@ -82,6 +117,9 @@ class FrozenBasePriorModel(nn.Module):
         control_seed: int = 521,
         depth_hidden_channels: int = 128,
         depth_modulation_max_scale: float = 0.10,
+        depth_attention_heads: int = 4,
+        depth_attention_window: int = 5,
+        zero_mean_logit_residual: bool = False,
         vlm_rank: int = 32,
         default_control: str = "real",
     ):
@@ -113,6 +151,7 @@ class FrozenBasePriorModel(nn.Module):
         self.logit_delta_max = float(logit_delta_max)
         self.control_seed = int(control_seed)
         self.default_control = default_control
+        self.zero_mean_logit_residual = bool(zero_mean_logit_residual)
         self._last_prior_diagnostics: Dict[str, torch.Tensor] = {}
         self._base_frozen_verified = False
 
@@ -129,6 +168,23 @@ class FrozenBasePriorModel(nn.Module):
                 feature_channels=self._grid_channels,
                 hidden_channels=depth_hidden_channels,
                 modulation_max_scale=depth_modulation_max_scale,
+                config=config,
+            )
+        elif self.adapter_type == "depth_causal_film":
+            self.prior_adapter = DepthCausalFiLMAdapter(
+                prior_channels=self.prior_dim,
+                feature_channels=self._grid_channels,
+                hidden_channels=depth_hidden_channels,
+                modulation_max_scale=depth_modulation_max_scale,
+                config=config,
+            )
+        elif self.adapter_type == "depth_local_xattn":
+            self.prior_adapter = DepthLocalCrossAttentionAdapter(
+                prior_channels=self.prior_dim,
+                feature_channels=self._grid_channels,
+                hidden_channels=depth_hidden_channels,
+                attention_heads=depth_attention_heads,
+                window_size=depth_attention_window,
                 config=config,
             )
         else:
@@ -169,8 +225,10 @@ class FrozenBasePriorModel(nn.Module):
                 "Expected the DenseV2 decoder layout "
                 "pool/dropout/linear/norm/GELU/dropout/residual/output"
             )
-        if not isinstance(decoder[2], nn.Linear) or decoder[2].out_features != 512:
-            raise ValueError("DenseV2 decoder does not expose the expected 512-D bottleneck")
+        if not isinstance(decoder[2], nn.Linear) or decoder[2].out_features < 1:
+            raise ValueError(
+                "DenseV2 decoder does not expose a positive-width bottleneck"
+            )
         self._grid_channels = 256
         projection = getattr(head, "base_projection", None)
         if isinstance(projection, nn.Sequential) and isinstance(projection[0], nn.Conv2d):
@@ -241,9 +299,10 @@ class FrozenBasePriorModel(nn.Module):
         prior: Optional[torch.Tensor],
         control: str,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        key = "depth_prior" if self.adapter_type == "depth_spatial" else "vlm_prior"
+        is_depth = self.adapter_type in DEPTH_PRIOR_ADAPTERS
+        key = "depth_prior" if is_depth else "vlm_prior"
         available_key = (
-            "depth_available" if self.adapter_type == "depth_spatial" else "vlm_available"
+            "depth_available" if is_depth else "vlm_available"
         )
         if prior is None:
             prior = batch.get(key)
@@ -251,6 +310,18 @@ class FrozenBasePriorModel(nn.Module):
             raise KeyError(f"Batch is missing required prior tensor {key!r}")
         alternate = batch.get("alternate_prior")
         control_index = batch.get("prior_control_index")
+        if control == "spatial_shuffle" and control_index is None and prior.ndim == 4:
+            sample_uids = batch.get("sample_uid")
+            if sample_uids is None:
+                raise KeyError(
+                    "sample_uid is required for deterministic per-sample spatial shuffle"
+                )
+            control_index = per_sample_spatial_permutations(
+                [str(value) for value in sample_uids],
+                prior.shape[-2] * prior.shape[-1],
+                seed=self.control_seed,
+                device=prior.device,
+            )
         controlled = apply_prior_control(
             prior,
             control,
@@ -259,7 +330,7 @@ class FrozenBasePriorModel(nn.Module):
             seed=self.control_seed,
         )
         depth_valid = batch.get("depth_valid")
-        if self.adapter_type == "depth_spatial" and depth_valid is not None:
+        if is_depth and depth_valid is not None:
             alternate_valid = batch.get("alternate_depth_valid")
             if depth_valid.ndim == 3:
                 depth_valid = depth_valid[:, None]
@@ -345,21 +416,23 @@ class FrozenBasePriorModel(nn.Module):
         *,
         prior: Optional[torch.Tensor] = None,
         prior_control: Optional[str] = None,
+        decode: bool = True,
     ) -> Dict[str, Any]:
         self.assert_base_frozen()
         control = self.default_control if prior_control is None else str(prior_control).lower()
         controlled_prior, availability, depth_valid = self._resolve_prior(
             batch, prior, control
         )
-        if self.adapter_type == "depth_spatial":
+        if self.adapter_type in DEPTH_PRIOR_ADAPTERS:
             grid, base_logits = self._base_grid_and_logits(batch)
-            fused_grid, diagnostics = self.prior_adapter(
+            fused_grid, diagnostics, auxiliary_losses = self.prior_adapter(
                 grid,
                 controlled_prior,
                 valid=depth_valid,
                 availability=availability,
             )
-            raw_fused_logits = self.base_model.tactile_head.decoder(fused_grid)
+            feature_delta = fused_grid - grid
+            fused_feature = fused_grid
         else:
             cached_base = self._cached_vlm_base(batch)
             if cached_base is None:
@@ -368,15 +441,35 @@ class FrozenBasePriorModel(nn.Module):
                     bottleneck = self._decoder_bottleneck(grid)
             else:
                 bottleneck, base_logits = cached_base
-            fused_bottleneck, diagnostics = self.prior_adapter(
+            fused_bottleneck, diagnostics, auxiliary_losses = self.prior_adapter(
                 bottleneck,
                 controlled_prior,
                 availability=availability,
             )
-            raw_fused_logits = self._decoder_tail(fused_bottleneck)
+            feature_delta = fused_bottleneck - bottleneck
+            fused_feature = fused_bottleneck
+
+        if not decode:
+            self._last_prior_diagnostics = detached_diagnostics(diagnostics)
+            return {
+                "feature_delta": feature_delta,
+                "base_feature": grid if self.adapter_type in DEPTH_PRIOR_ADAPTERS else bottleneck,
+                "prior_aux_losses": auxiliary_losses,
+                "prior_control": control,
+                "prior_diagnostics": self._last_prior_diagnostics,
+            }
+
+        if self.adapter_type in DEPTH_PRIOR_ADAPTERS:
+            raw_fused_logits = self.base_model.tactile_head.decoder(fused_feature)
+        else:
+            raw_fused_logits = self._decoder_tail(fused_feature)
 
         fused_logits, bounded_logit_delta = smooth_logit_delta(
-            raw_fused_logits, base_logits, self.logit_delta_max
+            raw_fused_logits,
+            base_logits,
+            self.logit_delta_max,
+            valid_mask=batch.get("palm_mask"),
+            zero_mean=self.zero_mean_logit_residual,
         )
         raw_logit_delta = raw_fused_logits - base_logits
         base_prediction = torch.sigmoid(base_logits)
@@ -424,9 +517,65 @@ class FrozenBasePriorModel(nn.Module):
             "base_pred_logits": base_logits,
             "base_pred_tactile": base_prediction,
             "raw_fused_logits": raw_fused_logits,
+            "feature_delta": feature_delta,
+            "base_feature": grid if self.adapter_type in DEPTH_PRIOR_ADAPTERS else bottleneck,
+            "prior_aux_losses": auxiliary_losses,
             "prior_control": control,
             "prior_diagnostics": self._last_prior_diagnostics,
         }
+
+    def forward_paired(
+        self,
+        batch: Mapping[str, Any],
+        *,
+        control: str = "spatial_shuffle",
+        train: bool = False,
+        decode_control: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """Evaluate aligned and counterfactual priors with one frozen RGB forward."""
+
+        if self.adapter_type not in DEPTH_PRIOR_ADAPTERS:
+            raise ValueError("Paired counterfactual forwarding is only defined for Depth adapters")
+        real = self.forward_step(batch, train=train, prior_control="real")
+        paired_batch = dict(batch)
+        paired_batch["frozen_base_grid"] = real["base_feature"].detach()
+        paired_batch["frozen_base_logits"] = real["base_pred_logits"].detach()
+        if decode_control is None:
+            decode_control = not train
+        counterfactual = self.forward_step(
+            paired_batch,
+            train=train,
+            prior_control=control,
+            decode=bool(decode_control),
+        )
+        base_rms = real["base_feature"].detach().float().pow(2).mean(
+            dim=tuple(range(1, real["base_feature"].ndim)), keepdim=True
+        ).clamp_min(1e-24).sqrt()
+        control_rms = counterfactual["feature_delta"].float().pow(2).mean(
+            dim=tuple(range(1, counterfactual["feature_delta"].ndim)), keepdim=True
+        ).clamp_min(1e-24).sqrt()
+        budget = float(self.prior_adapter.rms_clamp.budget)
+        identity_loss = ((control_rms / (budget * base_rms).clamp_min(1e-12)) ** 2).mean()
+        correction_gap = (
+            real["feature_delta"].detach().float()
+            - counterfactual["feature_delta"].detach().float()
+        ).pow(2).mean().sqrt()
+        real["prior_diagnostics"] = dict(real["prior_diagnostics"])
+        real["prior_diagnostics"].update(
+            {
+                "real_control_feature_gap_rms": correction_gap,
+                "control_identity_raw": identity_loss.detach().float(),
+            }
+        )
+        if decode_control:
+            real["control_pred_logits"] = counterfactual["pred_logits"]
+            real["control_pred_tactile"] = counterfactual["pred_tactile"]
+        real["control_feature_delta"] = counterfactual["feature_delta"]
+        real["control_identity_loss"] = identity_loss
+        real["control_prior_aux_losses"] = counterfactual["prior_aux_losses"]
+        real["control_prior_diagnostics"] = counterfactual["prior_diagnostics"]
+        real["counterfactual_control"] = str(control)
+        return real
 
     def forward(self, batch: Mapping[str, Any], **kwargs) -> Dict[str, Any]:
         return self.forward_step(batch, **kwargs)

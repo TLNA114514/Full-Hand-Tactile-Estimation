@@ -178,6 +178,53 @@ python preprocess/touchanything/repair.py \
 
 ## EgoTactile
 
+### 全量 SAM3 bbox 与 HDF5 激活
+
+正式数据入口使用 SAM3，而不再使用旧 HaMeR/ViTPose bbox。该流程会自动按
+`bare_hand/gloved_hand` 选择 prompt，在 8 张 GPU 上可恢复地跟踪全部 clip，严格审计
+逐帧覆盖后复制现有 sequence HDF5、替换任务手 bbox、重建 query manifest，最后原子
+切换 `extracted_frames_current`：
+
+```bash
+./preprocess/egotactile/run_sam3_reconstruction.sh all
+```
+
+中断后执行同一条命令即可续跑。查看进度：
+
+```bash
+./preprocess/egotactile/run_sam3_reconstruction.sh status
+tail -f /home/ma-user/work/cfzhao/EgoTactile/sam3_bbox_reconstruction_v1/full_run.log
+```
+
+也可以按阶段执行 `build/track/audit/materialize/activate`。只有全量审计和 HDF5
+迁移完成后才会切换 active symlink；原始 HDF5 不会被原位修改。训练代码默认优先
+解析 `EGOTACTILE_DATA_ROOT`，否则使用 `extracted_frames_current`，再回退历史路径。
+
+### 官方 train/test manifests
+
+SAM3 HDF5 已经完成时，无需重跑跟踪或复制容器，直接生成论文 Appendix A.1.5
+定义的三套 sequence-level split：
+
+```bash
+./preprocess/egotactile/run_sam3_reconstruction.sh official-splits
+```
+
+输出位于：
+
+```text
+extracted_frames_sam3/manifests/official/
+├── gloved_object_held_out/{train,test}.{queries,sequences}.jsonl
+├── gloved_subject_held_out/{train,test}.{queries,sequences}.jsonl
+├── bare_object_held_out/{train,test}.{queries,sequences}.jsonl
+└── index.json
+```
+
+Object-held-out 固定排除 `Apple/CocaCola-330ml/Corn/Dumbbell/TennisBall`；
+Subject-held-out 固定排除 `p007/p011`。每行的 `split` 是训练逻辑上的
+`train|test`，`source_split` 保留底层 HDF5 的 `gloved_hand|bare_hand`，因此无需复制
+数据文件。官方协议只定义 train/test；脚本不会把 test 伪装成 val。训练和评估时需
+显式指定所选 protocol 的 manifest，避免 object/subject 协议混用。
+
 ### Repair / Gaussian 生成
 
 先为 EgoTactile 生成归一化 grid 和 Gaussian 压力：
@@ -202,7 +249,7 @@ python preprocess/egotactile/process.py \
   --prefilter_workers 64
 ```
 
-如果需要重新提 bbox：
+下面的 HaMeR/ViTPose bbox 命令仅用于历史复现；正式数据请使用上面的 SAM3 流程：
 
 ```bash
 python preprocess/egotactile/process.py \

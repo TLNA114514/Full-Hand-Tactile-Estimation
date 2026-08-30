@@ -24,6 +24,7 @@ from concurrent.futures import (
     wait,
 )
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -83,6 +84,9 @@ LEGACY_SAMPLE_FILES = {
     "touchanything": frozenset(("chest.jpg", "left.jpg", "right.jpg", "meta.json")),
     "egotactile": frozenset(("image.jpg", "meta.json")),
 }
+EGOTACTILE_NORMALIZATION_SCHEMA = "egotactile_threshold5_clip200_div200_v1"
+EGOTACTILE_MAPPING_SCHEMA = "egotactile_hybridv2_weighted_max_v1"
+EGOTACTILE_PRESSURE_REDUCER = "weighted_max"
 
 
 @dataclass(frozen=True)
@@ -231,6 +235,81 @@ def pressure_for_query(
     if pressure is not None:
         return effective_pressure(pressure), key
     return effective_pressure(meta.get("gaussian_pressure")), "gaussian_pressure"
+
+
+def _npz_scalar(archive, key: str) -> str:
+    if key not in archive:
+        raise KeyError(f"formal EgoTactile NPZ is missing {key!r}")
+    value = np.asarray(archive[key])
+    if value.shape != ():
+        raise ValueError(f"formal EgoTactile NPZ field {key!r} must be scalar")
+    return str(value.item())
+
+
+@lru_cache(maxsize=2)
+def _load_formal_egotactile_pressure_npz(
+    path_text: str,
+    size: int,
+    mtime_ns: int,
+) -> dict[str, np.ndarray]:
+    del size, mtime_ns
+    path = Path(path_text)
+    with np.load(path, allow_pickle=False) as archive:
+        expected = {
+            "normalization_schema": EGOTACTILE_NORMALIZATION_SCHEMA,
+            "mapping_schema": EGOTACTILE_MAPPING_SCHEMA,
+            "pressure_reducer": EGOTACTILE_PRESSURE_REDUCER,
+        }
+        for key, expected_value in expected.items():
+            actual = _npz_scalar(archive, key)
+            if actual != expected_value:
+                raise RuntimeError(
+                    f"{path}: stale {key}, expected={expected_value!r}, "
+                    f"actual={actual!r}"
+                )
+        result = {}
+        for hand in HAND_ALIASES:
+            key = f"{hand}_pressure_continuous_subdiv"
+            if key not in archive:
+                raise KeyError(f"{path}: missing {key}")
+            values = np.asarray(archive[key], dtype=np.float32)
+            if values.ndim != 2 or values.shape[1] != TACTILE_DIM:
+                raise ValueError(f"{path}: invalid {key} shape {values.shape}")
+            if not np.isfinite(values).all():
+                raise ValueError(f"{path}: {key} contains non-finite values")
+            values.setflags(write=False)
+            result[hand] = values
+    return result
+
+
+def formal_egotactile_pressure_for_query(
+    meta: dict[str, Any], query_alias: str, frame_idx: int
+) -> tuple[np.ndarray, str]:
+    candidates = []
+    explicit = meta.get("gaussian_npz")
+    if explicit:
+        candidates.append(Path(str(explicit)))
+    sequence_dir = meta.get("seq_dir")
+    if sequence_dir:
+        candidates.append(Path(str(sequence_dir)) / "pressure_grids_egotactile.npz")
+    npz_path = next((path for path in candidates if path.is_file()), None)
+    if npz_path is None:
+        raise FileNotFoundError(
+            "Formal EgoTactile pressure NPZ is missing; searched "
+            f"{[str(path) for path in candidates]}"
+        )
+    stat = npz_path.stat()
+    pressure_by_hand = _load_formal_egotactile_pressure_npz(
+        str(npz_path.resolve()), int(stat.st_size), int(stat.st_mtime_ns)
+    )
+    if query_alias not in pressure_by_hand:
+        raise ValueError(f"Unsupported EgoTactile query alias {query_alias!r}")
+    values = pressure_by_hand[query_alias]
+    if not 0 <= int(frame_idx) < values.shape[0]:
+        raise IndexError(
+            f"{npz_path}: frame {frame_idx} outside 0..{values.shape[0] - 1}"
+        )
+    return values[int(frame_idx)], f"{query_alias}_pressure_continuous_subdiv"
 
 
 def bbox_for_query(
@@ -458,7 +537,14 @@ def load_query(
     meta, digest = load_json_bytes(meta_path)
     if digest != descriptor.meta_sha256:
         raise RuntimeError(f"{meta_path} changed after source discovery")
-    pressure, pressure_source_key = pressure_for_query(meta, expected_dataset, query_alias)
+    if expected_dataset == "egotactile":
+        pressure, pressure_source_key = formal_egotactile_pressure_for_query(
+            meta, query_alias, descriptor.frame_idx
+        )
+    else:
+        pressure, pressure_source_key = pressure_for_query(
+            meta, expected_dataset, query_alias
+        )
     bbox, bbox_score, bbox_source = bbox_for_query(
         meta, expected_dataset, query_alias
     )
@@ -710,7 +796,13 @@ def convert_sequence(task: SequenceTask) -> dict[str, Any]:
                 require_bbox=is_trainable and overlay is None,
             )
             if overlay is not None:
-                loaded.update(overlay)
+                overlay_values = dict(overlay)
+                if task.dataset == "egotactile":
+                    # Existing HDF5 rows remain the source of bbox/keypoint
+                    # overlays, but formal NPZ pressure is authoritative.
+                    overlay_values.pop("pressure", None)
+                    overlay_values.pop("pressure_source_key", None)
+                loaded.update(overlay_values)
             pressure = loaded["pressure"]
             palm_pressure = pressure[task.palm_vertex_mask]
             uid = query_uid(task, descriptor.frame_idx, alias)

@@ -144,9 +144,17 @@ hamer_tactile_ft/memorization
 hamer_tactile_ft/run_processes/
 hamer_tactile_ft/preflight_logs/
 hamer_tactile_ft/input_prior_audits/
+hamer_tactile_ft/selector_sufficiency_artifacts/
+hamer_tactile_ft/selector_sufficiency_audits/
+hamer_tactile_ft/canonical_localization_audits/
 tactile_input_priors/outputs/
 tactile_input_priors/cache/
 tactile_input_priors/sidecars/
 tactile_input_priors/models/
 tactile_input_priors/envs/
 tactile_input_priors/runtime_debug
+tactile_input_priors/reports
+hamer_tactile_ft/stage1_surface_basis
+hamer_tactile_ft/stage0_4b_basis_density
+hamer_tactile_ft/surface_decoder_learnability
+hamer_tactile_ft/surface_mapping_attribution

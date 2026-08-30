@@ -64,18 +64,67 @@ HDF5_STORAGE_SCHEMA_VERSION = str(
     )
 )
 
+
+def _first_existing_dataset_root(environment_key, candidates):
+    configured = os.environ.get(environment_key)
+    if configured:
+        return os.path.abspath(os.path.expanduser(configured))
+    for candidate in candidates:
+        expanded = os.path.abspath(os.path.expanduser(candidate))
+        if os.path.exists(expanded):
+            return expanded
+    return os.path.abspath(os.path.expanduser(candidates[0]))
+
+
+EGOTACTILE_DATA_ROOT = _first_existing_dataset_root(
+    "EGOTACTILE_DATA_ROOT",
+    (
+        "/home/ma-user/work/cfzhao/EgoTactile/Raw_data/extracted_frames_current",
+        "/data1/jiangrui/EgoTactile/Raw_data/extracted_frames_current",
+        "/home/ma-user/work/cfzhao/EgoTactile/Raw_data/extracted_frames",
+        "/data1/jiangrui/EgoTactile/Raw_data/extracted_frames",
+    ),
+)
+
+OPENTOUCH_DATA_ROOT = _first_existing_dataset_root(
+    "OPENTOUCH_DATA_ROOT",
+    (
+        "/home/ma-user/work/cfzhao/OpenTouch Data/full_dataset",
+        "/data1/jiangrui/OpenTouch Data/full_dataset",
+    ),
+)
+
+TOUCHANYTHING_DATA_ROOT = _first_existing_dataset_root(
+    "TOUCHANYTHING_DATA_ROOT",
+    (
+        "/home/ma-user/work/cfzhao/EgoTouch/extracted_frames",
+        "/data1/jiangrui/EgoTouch/extracted_frames",
+    ),
+)
+
+ACEDATA_DATA_ROOT = _first_existing_dataset_root(
+    "ACEDATA_DATA_ROOT",
+    (
+        "/home/ma-user/work/hy/acedata-processed-hdf5",
+        "/data1/jiangrui/acedata-processed-hdf5",
+    ),
+)
+
 DATASET_ROOTS = {
-    "opentouch": "/data1/jiangrui/OpenTouch Data/full_dataset",
-    "open_touch": "/data1/jiangrui/OpenTouch Data/full_dataset",
-    "ot": "/data1/jiangrui/OpenTouch Data/full_dataset",
-    "touchanything": "/data1/jiangrui/EgoTouch/extracted_frames",
-    "touch_anything": "/data1/jiangrui/EgoTouch/extracted_frames",
-    "egotouch": "/data1/jiangrui/EgoTouch/extracted_frames",
-    "ego_touch": "/data1/jiangrui/EgoTouch/extracted_frames",
-    "ta": "/data1/jiangrui/EgoTouch/extracted_frames",
-    "egotactile": "/data1/jiangrui/EgoTactile/Raw_data/extracted_frames",
-    "ego_tactile": "/data1/jiangrui/EgoTactile/Raw_data/extracted_frames",
-    "ego": "/data1/jiangrui/EgoTactile/Raw_data/extracted_frames",
+    "opentouch": OPENTOUCH_DATA_ROOT,
+    "open_touch": OPENTOUCH_DATA_ROOT,
+    "ot": OPENTOUCH_DATA_ROOT,
+    "touchanything": TOUCHANYTHING_DATA_ROOT,
+    "touch_anything": TOUCHANYTHING_DATA_ROOT,
+    "egotouch": TOUCHANYTHING_DATA_ROOT,
+    "ego_touch": TOUCHANYTHING_DATA_ROOT,
+    "ta": TOUCHANYTHING_DATA_ROOT,
+    "egotactile": EGOTACTILE_DATA_ROOT,
+    "ego_tactile": EGOTACTILE_DATA_ROOT,
+    "ego": EGOTACTILE_DATA_ROOT,
+    "acedata": ACEDATA_DATA_ROOT,
+    "ace_data": ACEDATA_DATA_ROOT,
+    "ace": ACEDATA_DATA_ROOT,
 }
 
 
@@ -209,9 +258,10 @@ class OpenTouchTactileDataset(DatasetIndexingMixin, Dataset):
             for path in self.bbox_manifests
         }
         self._bbox_manifest_overlay_index = None
+        self._bbox_manifest_overlay_required_keys = None
 
         if data_dir is None:
-            data_dirs = ["/data1/jiangrui/OpenTouch Data/extracted_dataset"]
+            data_dirs = [OPENTOUCH_DATA_ROOT]
         elif isinstance(data_dir, (list, tuple)):
             data_dirs = [str(d) for d in data_dir if str(d).strip()]
         else:
@@ -242,6 +292,28 @@ class OpenTouchTactileDataset(DatasetIndexingMixin, Dataset):
             )
         else:
             self.data_backend = requested_backend
+        if self.data_backend == "legacy_dirs":
+            missing_data_roots = [
+                os.path.abspath(path)
+                for path in self.data_dirs
+                if not os.path.isdir(path)
+            ]
+            if missing_data_roots:
+                requested_label = (
+                    "data_backend=auto found no sequence-HDF5 query manifest and "
+                    "would have fallen back to legacy_dirs"
+                    if requested_backend == "auto"
+                    else "data_backend=legacy_dirs was requested"
+                )
+                raise FileNotFoundError(
+                    f"{requested_label}, but the legacy data root(s) do not exist: "
+                    f"{missing_data_roots}. Refusing to reuse a path-only legacy "
+                    "index cache because migrated/deleted sample directories could "
+                    "silently change the evaluated sample set. Configure the "
+                    "corresponding *_DATA_ROOT environment variable, pass --data_dir "
+                    "and --query_manifests explicitly, or select "
+                    "--data_backend sequence_hdf5."
+                )
         if self.data_backend == "sequence_hdf5" and sample_records is None and not self.query_manifest_specs:
             raise ValueError(
                 "data_backend='sequence_hdf5' requires query_manifests; "
@@ -656,7 +728,14 @@ class OpenTouchTactileDataset(DatasetIndexingMixin, Dataset):
         sample_dir = sample_record["sample_dir"]
         meta_path = os.path.join(sample_dir, "meta.json")
         if not os.path.exists(meta_path):
-            self._sample_error(sample_dir, "meta.json disappeared after index construction")
+            self._sample_error(
+                sample_dir,
+                "meta.json disappeared after index construction. This usually means "
+                "a legacy path-only index cache survived a dataset migration or HDF5 "
+                "aggregation. Do not skip this sample: use data_backend=auto or "
+                "sequence_hdf5 with the current query manifest, or rebuild the legacy "
+                "index only if the raw-directory dataset is still authoritative",
+            )
         meta = load_json_file(meta_path)
 
         dataset_name = sample_record.get("dataset", self._infer_dataset_name(meta))
@@ -770,10 +849,14 @@ class OpenTouchTactileDataset(DatasetIndexingMixin, Dataset):
                 actual_split = self._decode_hdf5_attr(
                     handle.attrs.get("split", "")
                 )
-                if actual_split and str(actual_split) != self.split:
+                expected_source_split = str(
+                    sample_record.get("source_split", self.split)
+                )
+                if actual_split and str(actual_split) != expected_source_split:
                     self._sample_error(
                         sample_ref,
-                        f"HDF5 split mismatch: requested={self.split!r}, "
+                        f"HDF5 split mismatch: logical={self.split!r}, "
+                        f"source={expected_source_split!r}, "
                         f"container={actual_split!r}",
                     )
                 self._hdf5_validated_paths.add(h5_path)

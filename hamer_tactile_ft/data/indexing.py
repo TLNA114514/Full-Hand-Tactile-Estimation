@@ -160,6 +160,9 @@ def canonical_dataset_name(value):
         "ego_touch": "TouchAnything",
         "egotactile": "EgoTactile",
         "ego_tactile": "EgoTactile",
+        "acedata": "AceData",
+        "ace_data": "AceData",
+        "ace": "AceData",
     }
     return aliases.get(raw_name.lower(), raw_name)
 
@@ -1646,6 +1649,21 @@ class DatasetIndexingMixin:
             }
         if not isinstance(source, dict) or source.get("schema") != SAM3_BBOX_SOURCE_SCHEMA:
             return False
+        dataset_name = canonical_dataset_name(record.get("dataset"))
+        if dataset_name == "EgoTactile":
+            return bool(
+                source.get("association_policy")
+                == "egotactile_task_hand_single_track"
+                and source.get("source_bbox_jsonl_sha256")
+                and source.get("source_manifest_sha256")
+            )
+        if dataset_name == "AceData":
+            return bool(
+                source.get("association_policy") == "initial_screen_order"
+                and source.get("source_bbox_jsonl_sha256")
+                and source.get("source_manifest_sha256")
+                and source.get("source_materialized_bbox_sha256")
+            )
         allowed_hashes = set(getattr(self, "bbox_manifest_sha256", {}).values())
         return not allowed_hashes or source.get("source_manifest_sha256") in allowed_hashes
 
@@ -1718,6 +1736,7 @@ class DatasetIndexingMixin:
         overlay_index = {}
         row_count = 0
         selected_count = 0
+        required_keys = self._bbox_manifest_overlay_required_keys
         expected = set(self.expected_datasets)
         for manifest_path in self.bbox_manifests:
             manifest_sha256 = self.bbox_manifest_sha256[manifest_path]
@@ -1825,7 +1844,10 @@ class DatasetIndexingMixin:
                             f"{manifest_path}:{line_number}: SAM3 bbox row has "
                             "neither a portable sample path nor sequence/frame identity"
                         )
+                    row_selected = False
                     for key in keys:
+                        if required_keys is not None and key not in required_keys:
+                            continue
                         previous = overlay_index.get(key)
                         if previous is not None and (
                             previous["bbox_xyxy"] != payload["bbox_xyxy"]
@@ -1840,7 +1862,8 @@ class DatasetIndexingMixin:
                                 f"{manifest_path}:{line_number}"
                             )
                         overlay_index[key] = payload
-                    selected_count += 1
+                        row_selected = True
+                    selected_count += int(row_selected)
         self._bbox_manifest_overlay_index = overlay_index
         print(
             f"[{self.split}] Loaded {selected_count}/{row_count} current SAM3 bbox "
@@ -1848,6 +1871,66 @@ class DatasetIndexingMixin:
             flush=True,
         )
         return overlay_index
+
+    def _collect_required_hdf5_bbox_overlay_keys(self):
+        """Collect only stale query keys before scanning large bbox manifests."""
+
+        if not self.bbox_manifests:
+            return None
+        required = set()
+        expected = set(self.expected_datasets)
+        stale_records = 0
+        for spec in self.query_manifest_specs:
+            path = spec["path"]
+            with open(path, "rb") as handle:
+                for line_number, raw_line in enumerate(handle, start=1):
+                    raw_line = raw_line.strip()
+                    if not raw_line:
+                        continue
+                    try:
+                        record = (
+                            orjson.loads(raw_line)
+                            if orjson is not None
+                            else json.loads(raw_line)
+                        )
+                        if not isinstance(record, dict):
+                            raise TypeError("query manifest row must be a JSON object")
+                        record_split = record.get("split")
+                        if record_split is not None and str(record_split) != self.split:
+                            continue
+                        dataset_value = record.get("dataset") or spec.get("dataset")
+                        if not dataset_value:
+                            raise ValueError("query manifest row is missing dataset")
+                        dataset_name = canonical_dataset_name(dataset_value)
+                        if expected and dataset_name not in expected:
+                            continue
+                        if self._manifest_bbox_source_allowed(record):
+                            continue
+                        stale_records += 1
+                        required.update(self._bbox_overlay_keys(
+                            dataset_name=dataset_name,
+                            split=record.get(
+                                "source_split", record.get("split", self.split)
+                            ),
+                            sequence_key=record.get("sequence_key"),
+                            frame_idx=record.get("frame_idx"),
+                            query_alias=record.get(
+                                "target_hand",
+                                record.get("query_alias", record.get("hand")),
+                            ),
+                            sample_path=record.get("source_sample_relpath"),
+                        ))
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"Invalid HDF5 query manifest row while preparing the "
+                            f"SAM3 overlay at {path}:{line_number}: {exc}"
+                        ) from exc
+        print(
+            f"[{self.split}] SAM3 overlay prefilter: {stale_records} stale "
+            f"query row(s), {len(required)} required key(s).",
+            flush=True,
+        )
+        return required
 
     def _apply_hdf5_bbox_manifest_overlay(self, record, dataset_name):
         if self._manifest_bbox_source_allowed(record):
@@ -1860,7 +1943,7 @@ class DatasetIndexingMixin:
         )
         keys = self._bbox_overlay_keys(
             dataset_name=dataset_name,
-            split=record.get("split", self.split),
+            split=record.get("source_split", record.get("split", self.split)),
             sequence_key=record.get("sequence_key"),
             frame_idx=record.get("frame_idx"),
             query_alias=query_alias,
@@ -2013,7 +2096,9 @@ class DatasetIndexingMixin:
             "dataset_filter": list(self.expected_datasets),
             "bbox_source_policy": self.bbox_source_policy,
             "bbox_manifest_sha256": self.bbox_manifest_sha256,
-            "bbox_hdf5_overlay_schema_version": 1,
+            # Version 4 recognizes train-only AceData SAM3 provenance in
+            # addition to EgoTactile and the reviewed OT/TA overlays.
+            "bbox_hdf5_overlay_schema_version": 4,
             "storage_schema_version": HDF5_STORAGE_SCHEMA_VERSION,
         }
         digest = hashlib.sha1(
@@ -2029,6 +2114,9 @@ class DatasetIndexingMixin:
         bbox_policy_skipped = 0
         bbox_overlay_applied = 0
         expected = set(self.expected_datasets)
+        self._bbox_manifest_overlay_required_keys = (
+            self._collect_required_hdf5_bbox_overlay_keys()
+        )
         try:
             for spec in self.query_manifest_specs:
                 path = spec["path"]
@@ -2074,6 +2162,7 @@ class DatasetIndexingMixin:
                             ) from exc
         finally:
             self._bbox_manifest_overlay_index = None
+            self._bbox_manifest_overlay_required_keys = None
             release_unused_python_heap()
         if bbox_overlay_applied or bbox_policy_skipped:
             print(
@@ -2158,7 +2247,7 @@ class DatasetIndexingMixin:
                         "num_samples": len(samples),
                         "query_manifest_sha256": self.query_manifest_sha256,
                         "bbox_manifest_sha256": self.bbox_manifest_sha256,
-                        "bbox_hdf5_overlay_schema_version": 1,
+                        "bbox_hdf5_overlay_schema_version": 4,
                     },
                 )
                 records = MMapJsonlRecords(cache_path)
@@ -2671,5 +2760,3 @@ class DatasetIndexingMixin:
         print(f"[{self.split}] Sorting {len(samples)} compact index records...", flush=True)
         samples.sort(key=lambda item: (item["sample_dir"], item["hand"]))
         return samples
-
-

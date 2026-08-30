@@ -54,6 +54,10 @@ RSYNC_EXCLUDES=(
     --exclude='sam3_bbox_reconstruction/index.html'
     --exclude='sam3_bbox_reconstruction/association_index.html'
     --exclude='tactile_input_priors/runtime_debug'
+    --exclude='tactile_input_priors/reports'
+    --exclude='hamer_tactile_ft/stage1_surface_basis'
+    --exclude='hamer_tactile_ft/stage0_4b_basis_density'
+    --exclude='hamer_tactile_ft/surface_decoder_learnability'
     --exclude='outputs'
 )
 

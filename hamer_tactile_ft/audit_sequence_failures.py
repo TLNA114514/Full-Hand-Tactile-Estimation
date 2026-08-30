@@ -1078,6 +1078,9 @@ def _audit_imports():
         write_json_atomic,
     )
     from hamer.configs import get_config  # pylint: disable=import-outside-toplevel
+    from hamer_config_assets import (  # pylint: disable=import-outside-toplevel
+        resolve_hamer_model_config_path,
+    )
 
     return {
         "script_dir": script_dir,
@@ -1092,6 +1095,7 @@ def _audit_imports():
         "wait_for_file": wait_for_file,
         "write_json_atomic": write_json_atomic,
         "get_config": get_config,
+        "resolve_hamer_model_config_path": resolve_hamer_model_config_path,
     }
 
 
@@ -1459,10 +1463,10 @@ def run_data_integrity_audit(args):
     index_cache_dir = Path(args.index_cache_dir or imports["script_dir"] / "index_cache").expanduser().resolve()
     bbox_scale = float(args.bbox_rescale_factor if args.bbox_rescale_factor is not None else 2.0)
 
-    model_cfg = imports["get_config"](
-        str(imports["workspace_dir"] / "hamer" / "_DATA" / "hamer_ckpts" / "model_config.yaml"),
-        update_cachedir=True,
+    model_cfg_path = imports["resolve_hamer_model_config_path"](
+        imports["workspace_dir"]
     )
+    model_cfg = imports["get_config"](str(model_cfg_path), update_cachedir=True)
     if model_cfg.MODEL.BACKBONE.TYPE == "vit" and "BBOX_SHAPE" not in model_cfg.MODEL:
         model_cfg.defrost()
         model_cfg.MODEL.BBOX_SHAPE = [192, 256]

@@ -219,13 +219,14 @@ def _query_records(
     frame_count: int,
     source_pressure,
     overlay: dict[tuple[int, str], dict[str, Any]],
+    preserve_overlay_pressure: bool = True,
 ) -> list[dict[str, Any]]:
     records = []
     for frame_idx in range(frame_count):
         for alias in ("left", "right"):
             existing = overlay.get((frame_idx, alias))
             pressure, pressure_key = source_pressure(alias, frame_idx)
-            if existing is not None:
+            if existing is not None and preserve_overlay_pressure:
                 pressure = np.asarray(existing["pressure"], dtype=np.float32)
                 pressure_key = existing.get("pressure_source_key") or pressure_key
             if pressure is None:
@@ -502,8 +503,11 @@ def _upgrade_egotactile(task: UpgradeTask) -> None:
         try:
             records = _query_records(
                 frame_count=frame_count,
-                source_pressure=lambda hand, row: _pressure_from_npz(npz, hand, row),
+                source_pressure=lambda hand, row: _pressure_from_npz(
+                    npz, hand, row
+                ),
                 overlay=overlay,
+                preserve_overlay_pressure=False,
             )
         finally:
             if npz is not None:

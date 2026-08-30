@@ -98,18 +98,25 @@ def build_decoder(
     tactile_dim: int,
     grid_size: Sequence[int],
     pool_output_channels: int,
+    decoder_hidden_dim: int,
     dropout_scale: float,
 ) -> nn.Sequential:
+    decoder_hidden_dim = int(decoder_hidden_dim)
+    if decoder_hidden_dim < 1:
+        raise ValueError("decoder_hidden_dim must be positive")
     pool = FullGridSpatialPooling(256, grid_size, pool_output_channels)
     return nn.Sequential(
         pool,
         nn.Dropout(p=0.5 * float(dropout_scale)),
-        nn.Linear(pool.output_dim, 512),
-        nn.LayerNorm(512),
+        nn.Linear(pool.output_dim, decoder_hidden_dim),
+        nn.LayerNorm(decoder_hidden_dim),
         nn.GELU(),
         nn.Dropout(p=0.3 * float(dropout_scale)),
-        ResidualBlock(512, dropout_probability=0.3 * float(dropout_scale)),
-        nn.Linear(512, int(tactile_dim)),
+        ResidualBlock(
+            decoder_hidden_dim,
+            dropout_probability=0.3 * float(dropout_scale),
+        ),
+        nn.Linear(decoder_hidden_dim, int(tactile_dim)),
     )
 
 
@@ -120,6 +127,7 @@ class DenseV2DinoReZeroHead(nn.Module):
         layer_indices: Sequence[int],
         grid_size: Sequence[int],
         pool_output_channels: int = 32,
+        decoder_hidden_dim: int = 512,
         residual_max_scale: float = 0.1,
         residual_rms_budget: float = 0.5,
         dropout_scale: float = 1.0,
@@ -139,6 +147,7 @@ class DenseV2DinoReZeroHead(nn.Module):
             tactile_dim,
             grid_size,
             pool_output_channels,
+            decoder_hidden_dim,
             dropout_scale,
         )
         self.projections = nn.ModuleDict()
@@ -279,6 +288,7 @@ class TactileRuntime(nn.Module):
         input_resolution: Sequence[int],
         layer_indices: Sequence[int],
         pool_output_channels: int,
+        decoder_hidden_dim: int,
         residual_max_scale: float,
         residual_rms_budget: float,
         dropout_scale: float,
@@ -289,6 +299,7 @@ class TactileRuntime(nn.Module):
         if tuple(sorted(set(self.layer_indices))) != self.layer_indices:
             raise ValueError("DINO feature layers must be unique and increasing")
         self.tactile_dim = int(tactile_dim)
+        self.decoder_hidden_dim = int(decoder_hidden_dim)
         self.backbone = DinoV3Backbone(dino_weights, self.input_resolution)
         if self.layer_indices[-1] != len(self.backbone.model.blocks):
             raise ValueError(
@@ -299,6 +310,7 @@ class TactileRuntime(nn.Module):
             layer_indices=self.layer_indices,
             grid_size=(self.input_resolution[0] // 16, self.input_resolution[1] // 16),
             pool_output_channels=pool_output_channels,
+            decoder_hidden_dim=self.decoder_hidden_dim,
             residual_max_scale=residual_max_scale,
             residual_rms_budget=residual_rms_budget,
             dropout_scale=dropout_scale,
@@ -335,6 +347,7 @@ def _merged_metadata(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
         "pool_valid_tokens",
         "decoder_input_dim",
         "pool_output_channels",
+        "decoder_hidden_dim",
         "decoder_dropout_scale",
         "bbox_rescale_factor",
         "bbox_source_policy",
@@ -410,6 +423,7 @@ def load_runtime_model(
         input_resolution=resolution,
         layer_indices=metadata.get("backbone_feature_layers", (8, 16, 24, 32)),
         pool_output_channels=int(metadata.get("pool_output_channels", 32)),
+        decoder_hidden_dim=int(metadata.get("decoder_hidden_dim", 512)),
         residual_max_scale=float(metadata.get("dino_residual_max_scale", 0.1)),
         residual_rms_budget=float(metadata.get("dino_residual_rms_budget", 0.5)),
         dropout_scale=float(metadata.get("decoder_dropout_scale", 1.0)),
@@ -434,6 +448,7 @@ def load_runtime_model(
             "pool_grid_size": [resolution[0] // 16, resolution[1] // 16],
             "pool_valid_tokens": (resolution[0] // 16) * (resolution[1] // 16),
             "pool_output_channels": int(metadata.get("pool_output_channels", 32)),
+            "decoder_hidden_dim": int(metadata.get("decoder_hidden_dim", 512)),
             "bbox_rescale_factor": bbox_scale,
             "checkpoint_epoch": checkpoint.get("epoch"),
             "checkpoint_global_step": checkpoint.get("global_step"),

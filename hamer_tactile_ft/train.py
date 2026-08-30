@@ -54,6 +54,7 @@ from dataset import (
     release_unused_python_heap,
 )
 from hamer_tactile import DinoTactileModel, parse_input_resolution
+from hamer_config_assets import resolve_hamer_model_config_path
 from losses import TactileLossConfig
 from tactile_metrics import (
     CompactTouchAnythingProtocolAccumulator,
@@ -61,6 +62,15 @@ from tactile_metrics import (
     TOUCHANYTHING_MIN_CONTACT_RATIO,
     summarize_compact_touchanything_protocol,
     touchanything_protocol_group_key,
+)
+from selector_calibration import (
+    SELECTOR_CORRECTION_MIN_PRECISION,
+    SELECTOR_HISTOGRAM_BINS,
+    SELECTOR_LOGIT_MAX,
+    SELECTOR_LOGIT_MIN,
+    selector_histogram_layout,
+    selector_histogram_rows,
+    summarize_selector_histograms,
 )
 
 CORE_LOCATION_DISTRIBUTION_POWER = 2.0
@@ -265,6 +275,34 @@ class TactileTrainingModule(DinoTactileModel):
         decoder_dropout_scale=1.0,
         input_resolution=(256, 192),
         pool_output_channels=32,
+        decoder_hidden_dim=512,
+        local_anchor_count=512,
+        local_anchor_neighbors=4,
+        local_logit_delta_max=6.0,
+        local_residual_dropout=0.10,
+        freeze_local_residual_base=True,
+        support_selector_mode="contact",
+        support_selector_thresholds=(0.02, 0.05, 0.10, 0.20, 0.50),
+        support_selector_no_contact_max=0.02,
+        support_selector_contact_min=0.10,
+        support_selector_dropout=0.10,
+        support_selector_monotonicity_weight=0.10,
+        support_selector_architecture="linear",
+        support_selector_feature_source="fullgrid32",
+        support_selector_neck_channels=64,
+        support_selector_hidden_dim=512,
+        support_selector_base_conditioning="real",
+        surface_basis_path="",
+        surface_coefficient_dim=4096,
+        surface_coefficient_architecture="linear",
+        surface_coefficient_hidden_dim=1024,
+        surface_target_support_count=4,
+        surface_background_probability=1e-3,
+        freeze_surface_feature_extractor=True,
+        support_selector_correction_min_precision=(
+            SELECTOR_CORRECTION_MIN_PRECISION
+        ),
+        init_tactile_checkpoint="",
         optimizer_weight_decay=1e-4,
         lr_scheduler="cosine",
         lr_decay_milestones="0.5,0.75",
@@ -286,6 +324,38 @@ class TactileTrainingModule(DinoTactileModel):
             decoder_dropout_scale=decoder_dropout_scale,
             input_resolution=input_resolution,
             pool_output_channels=pool_output_channels,
+            decoder_hidden_dim=decoder_hidden_dim,
+            local_anchor_count=local_anchor_count,
+            local_anchor_neighbors=local_anchor_neighbors,
+            local_logit_delta_max=local_logit_delta_max,
+            local_residual_dropout=local_residual_dropout,
+            freeze_local_residual_base=freeze_local_residual_base,
+            support_selector_mode=support_selector_mode,
+            support_selector_thresholds=support_selector_thresholds,
+            support_selector_no_contact_max=support_selector_no_contact_max,
+            support_selector_contact_min=support_selector_contact_min,
+            support_selector_dropout=support_selector_dropout,
+            support_selector_monotonicity_weight=(
+                support_selector_monotonicity_weight
+            ),
+            support_selector_architecture=support_selector_architecture,
+            support_selector_feature_source=support_selector_feature_source,
+            support_selector_neck_channels=support_selector_neck_channels,
+            support_selector_hidden_dim=support_selector_hidden_dim,
+            support_selector_base_conditioning=(
+                support_selector_base_conditioning
+            ),
+            surface_basis_path=surface_basis_path,
+            surface_coefficient_dim=surface_coefficient_dim,
+            surface_coefficient_architecture=(
+                surface_coefficient_architecture
+            ),
+            surface_coefficient_hidden_dim=surface_coefficient_hidden_dim,
+            surface_target_support_count=surface_target_support_count,
+            surface_background_probability=surface_background_probability,
+            freeze_surface_feature_extractor=(
+                freeze_surface_feature_extractor
+            ),
         )
         self.learning_rate = learning_rate
         self.optimizer_weight_decay = float(optimizer_weight_decay)
@@ -295,7 +365,17 @@ class TactileTrainingModule(DinoTactileModel):
         self.lr_decay_gamma = float(lr_decay_gamma)
         self.bbox_rescale_factor = float(bbox_rescale_factor)
         self.bbox_source_policy = str(bbox_source_policy)
+        self.init_tactile_checkpoint = str(init_tactile_checkpoint or "")
+        self.init_tactile_checkpoint_sha256 = ""
         self.lr_warmup_epochs = int(lr_warmup_epochs)
+        self.support_selector_correction_min_precision = float(
+            support_selector_correction_min_precision
+        )
+        if not 0.0 < self.support_selector_correction_min_precision <= 1.0:
+            raise ValueError(
+                "support_selector_correction_min_precision must lie in (0, 1]"
+            )
+        self.support_selector_calibration = {}
         self.sync_train_logs = bool(sync_train_logs)
         self.frame_low_volume_thr = float(frame_low_volume_thr)
         self.frame_high_volume_thr = float(frame_high_volume_thr)
@@ -314,9 +394,22 @@ class TactileTrainingModule(DinoTactileModel):
 
         for param in self.tactile_head.parameters():
             param.requires_grad = True
+        freeze_extension_base = (
+            self.tactile_head_type == "dense_v2_dino_surface_basis"
+            and self.freeze_surface_feature_extractor
+        ) or (
+            self.tactile_head_type != "dense_v2_dino_surface_basis"
+            and self.freeze_local_residual_base
+        )
+        if freeze_extension_base and hasattr(
+            self.tactile_head, "freeze_base_parameters"
+        ):
+            self.tactile_head.freeze_base_parameters()
 
         self._val_eval_stats = None
         self._val_touchanything_protocol_stats = CompactTouchAnythingProtocolAccumulator()
+        self._val_selector_stats = None
+        self._val_selector_histogram = None
         self._grad_clip_trigger_count = 0
         self._grad_clip_step_count = 0
         self._grad_norm_finite_step_count = 0
@@ -338,17 +431,101 @@ class TactileTrainingModule(DinoTactileModel):
         self._loading_tactile_resume = False
 
     def _resume_contract(self):
-        return {
+        contract = {
             "tactile_head_type": str(self.tactile_head_type),
             "input_resolution": list(self.input_resolution),
             "backbone_feature_layers": list(self.backbone_feature_layers),
             "pool_layout": str(self.pool_layout),
             "pool_output_channels": int(self.pool_output_channels),
+            "decoder_hidden_dim": int(self.decoder_hidden_dim),
+            "local_anchor_count": int(self.local_anchor_count),
+            "local_anchor_neighbors": int(self.local_anchor_neighbors),
+            "local_logit_delta_max": float(self.local_logit_delta_max),
+            "local_residual_dropout": float(self.local_residual_dropout),
+            "freeze_local_residual_base": bool(self.freeze_local_residual_base),
+            "init_tactile_checkpoint_sha256": str(
+                self.init_tactile_checkpoint_sha256
+            ),
             "dataset_filter": list(getattr(self, "dataset_filter", ())),
+            "val_dataset_filter": list(
+                getattr(self, "val_dataset_filter", ())
+            ),
+            "val_query_manifest_sha256": dict(
+                getattr(self, "val_query_manifest_sha256", {})
+            ),
             "bbox_rescale_factor": float(self.bbox_rescale_factor),
             "bbox_source_policy": str(self.bbox_source_policy),
             "loss_config": asdict(self.tactile_loss_config),
         }
+        if self.tactile_head_type == "dense_v2_dino_support_selector":
+            contract.update(
+                {
+                    "support_selector_mode": str(self.support_selector_mode),
+                    "support_selector_thresholds": list(
+                        self.support_selector_thresholds
+                    ),
+                    "support_selector_no_contact_max": float(
+                        self.support_selector_no_contact_max
+                    ),
+                    "support_selector_contact_min": float(
+                        self.support_selector_contact_min
+                    ),
+                    "support_selector_dropout": float(
+                        self.support_selector_dropout
+                    ),
+                    "support_selector_monotonicity_weight": float(
+                        self.support_selector_monotonicity_weight
+                    ),
+                    "support_selector_architecture": str(
+                        self.support_selector_architecture
+                    ),
+                    "support_selector_feature_source": str(
+                        self.support_selector_feature_source
+                    ),
+                    "support_selector_neck_channels": int(
+                        self.support_selector_neck_channels
+                    ),
+                    "support_selector_hidden_dim": int(
+                        self.support_selector_hidden_dim
+                    ),
+                    "support_selector_base_conditioning": str(
+                        self.support_selector_base_conditioning
+                    ),
+                    "support_selector_correction_min_precision": float(
+                        self.support_selector_correction_min_precision
+                    ),
+                }
+            )
+        elif self.tactile_head_type == "dense_v2_dino_surface_basis":
+            contract.update(
+                {
+                    "surface_coefficient_dim": int(
+                        self.surface_coefficient_dim
+                    ),
+                    "surface_coefficient_architecture": str(
+                        self.surface_coefficient_architecture
+                    ),
+                    "surface_coefficient_hidden_dim": int(
+                        self.surface_coefficient_hidden_dim
+                    ),
+                    "surface_target_support_count": int(
+                        self.surface_target_support_count
+                    ),
+                    "surface_background_probability": float(
+                        self.surface_background_probability
+                    ),
+                    "freeze_surface_feature_extractor": bool(
+                        self.freeze_surface_feature_extractor
+                    ),
+                    "surface_basis_tensor_sha256": str(
+                        self.surface_basis_tensor_sha256
+                    ),
+                    "surface_sparse_basis_sha256": str(
+                        self.surface_sparse_basis_sha256
+                    ),
+                }
+            )
+        return contract
 
     def on_save_checkpoint(self, checkpoint):
         """Keep exact trainer state while rebuilding the frozen DINO from disk."""
@@ -363,11 +540,24 @@ class TactileTrainingModule(DinoTactileModel):
         checkpoint["backbone_sha256"] = str(self.backbone_weights_sha256 or "")
         checkpoint["tactile_head_type"] = str(self.tactile_head_type)
         checkpoint["input_resolution"] = list(self.input_resolution)
+        checkpoint["decoder_hidden_dim"] = int(self.decoder_hidden_dim)
+        checkpoint["surface_basis_tensor_sha256"] = str(
+            getattr(self, "surface_basis_tensor_sha256", "") or ""
+        )
         checkpoint["dataset_filter"] = list(getattr(self, "dataset_filter", ()))
+        checkpoint["val_dataset_filter"] = list(
+            getattr(self, "val_dataset_filter", ())
+        )
+        checkpoint["val_query_manifest_sha256"] = dict(
+            getattr(self, "val_query_manifest_sha256", {})
+        )
         checkpoint["wandb_run_id"] = str(
             getattr(self, "wandb_run_id", "") or ""
         )
         checkpoint["resume_contract"] = self._resume_contract()
+        checkpoint["support_selector_calibration"] = json.loads(
+            json.dumps(self.support_selector_calibration)
+        )
 
     def on_load_checkpoint(self, checkpoint):
         if checkpoint.get("format") != "tactile_resume_v1":
@@ -390,6 +580,9 @@ class TactileTrainingModule(DinoTactileModel):
             )
         if checkpoint_wandb_run_id:
             self.wandb_run_id = checkpoint_wandb_run_id
+        calibration = checkpoint.get("support_selector_calibration")
+        if isinstance(calibration, dict):
+            self.support_selector_calibration = calibration
         expected_sha = str(getattr(self, "backbone_weights_sha256", "") or "")
         checkpoint_sha = str(checkpoint.get("backbone_sha256", "") or "")
         if expected_sha and checkpoint_sha and expected_sha != checkpoint_sha:
@@ -414,6 +607,37 @@ class TactileTrainingModule(DinoTactileModel):
         checkpoint_contract = checkpoint.get("resume_contract")
         if checkpoint_contract is not None:
             current_contract = self._resume_contract()
+            checkpoint_contract = dict(checkpoint_contract)
+            checkpoint_contract.setdefault("decoder_hidden_dim", 512)
+            if (
+                self.tactile_head_type == "dense_v2_dino_support_selector"
+                and "support_selector_correction_min_precision"
+                not in checkpoint_contract
+            ):
+                checkpoint_contract[
+                    "support_selector_correction_min_precision"
+                ] = current_contract[
+                    "support_selector_correction_min_precision"
+                ]
+            if self.tactile_head_type == "dense_v2_dino_support_selector":
+                legacy_selector_defaults = {
+                    "support_selector_architecture": "linear",
+                    "support_selector_feature_source": "fullgrid32",
+                    "support_selector_neck_channels": 64,
+                    "support_selector_hidden_dim": 512,
+                    "support_selector_base_conditioning": "real",
+                }
+                for key, value in legacy_selector_defaults.items():
+                    if key not in checkpoint_contract:
+                        checkpoint_contract[key] = value
+            if self.tactile_head_type == "dense_v2_dino_surface_basis":
+                legacy_surface_defaults = {
+                    "surface_coefficient_architecture": "linear",
+                    "surface_coefficient_hidden_dim": 1024,
+                }
+                for key, value in legacy_surface_defaults.items():
+                    if key not in checkpoint_contract:
+                        checkpoint_contract[key] = value
             mismatches = {
                 key: {
                     "checkpoint": checkpoint_contract.get(key),
@@ -769,6 +993,421 @@ class TactileTrainingModule(DinoTactileModel):
         super().train(mode)
         self.backbone.eval()
         return self
+
+    @staticmethod
+    def _selector_binary_counts(prediction, target, mask):
+        prediction = prediction & mask
+        target = target & mask
+        return torch.stack(
+            (
+                (prediction & target).sum(),
+                (prediction & ~target & mask).sum(),
+                (~prediction & target & mask).sum(),
+                (~prediction & ~target & mask).sum(),
+            )
+        ).to(dtype=torch.float64)
+
+    def _accumulate_selector_stats(
+        self,
+        selector_logits,
+        base_prediction,
+        target,
+        has_tactile,
+        palm_mask,
+    ):
+        logits = selector_logits.detach().float()
+        if not bool(torch.isfinite(logits).all().item()):
+            raise FloatingPointError(
+                "Support selector produced non-finite validation logits"
+            )
+        probabilities = torch.sigmoid(logits)
+        gt = target.detach().float()
+        valid = (palm_mask.detach().float() > 0.5) & (
+            has_tactile.detach().float() > 0.5
+        )[:, None]
+        thresholds = tuple(float(value) for value in self.support_selector_thresholds)
+        contact_matches = [
+            index
+            for index, value in enumerate(thresholds)
+            if math.isclose(
+                value,
+                float(self.support_selector_contact_min),
+                rel_tol=0.0,
+                abs_tol=1e-8,
+            )
+        ]
+        if len(contact_matches) != 1:
+            raise RuntimeError(
+                "Support selector thresholds must contain contact_min exactly once"
+            )
+        contact_index = contact_matches[0]
+        selector_contact = probabilities[:, contact_index] >= 0.5
+        base_contact = (
+            base_prediction.detach().float()
+            >= float(self.support_selector_contact_min)
+        )
+        gt_contact = gt >= float(self.support_selector_contact_min)
+        clear = valid & (
+            (gt <= float(self.support_selector_no_contact_max)) | gt_contact
+        )
+        selector_eligible = valid
+        if self.support_selector_mode == "down_error":
+            selector_eligible = clear & base_contact
+
+        values = [
+            self._selector_binary_counts(
+                selector_contact, gt_contact, selector_eligible
+            ),
+            self._selector_binary_counts(
+                base_contact, gt_contact, selector_eligible
+            ),
+            self._selector_binary_counts(
+                selector_contact, gt_contact, clear & selector_eligible
+            ),
+            self._selector_binary_counts(
+                base_contact, gt_contact, clear & selector_eligible
+            ),
+        ]
+        false_high = clear & ~gt_contact & base_contact
+        false_low = clear & gt_contact & ~base_contact
+        false_low_recovered = (false_low & selector_contact).sum()
+        if self.support_selector_mode == "down_error":
+            false_low_recovered = false_low_recovered.new_zeros(())
+        scalar_values = torch.stack(
+            (
+                (false_high & ~selector_contact).sum(),
+                false_high.sum(),
+                false_low_recovered,
+                false_low.sum(),
+                ((selector_contact != base_contact) & selector_eligible).sum(),
+                selector_eligible.sum(),
+            )
+        ).to(dtype=torch.float64)
+        values.append(scalar_values)
+
+        gt_bin = torch.stack(
+            [gt > threshold for threshold in thresholds], dim=1
+        ).sum(dim=1)
+        if self.support_selector_mode == "down_error":
+            gt_bin = gt_contact.to(dtype=gt_bin.dtype)
+        pred_bin = (probabilities >= 0.5).sum(dim=1)
+        ordinal_abs = ((pred_bin - gt_bin).abs() * selector_eligible).sum()
+        ordinal_exact = ((pred_bin == gt_bin) & selector_eligible).sum()
+        if logits.shape[1] > 1:
+            monotonic_mask = selector_eligible[:, None].expand(
+                -1, logits.shape[1] - 1, -1
+            )
+            monotonic_violation = (
+                (logits[:, 1:] > logits[:, :-1]) & monotonic_mask
+            ).sum()
+            monotonic_count = monotonic_mask.sum()
+        else:
+            monotonic_violation = selector_eligible.sum().new_zeros(())
+            monotonic_count = selector_eligible.sum().new_zeros(())
+        values.append(
+            torch.stack(
+                (
+                    ordinal_abs,
+                    ordinal_exact,
+                    valid.sum(),
+                    monotonic_violation,
+                    monotonic_count,
+                )
+            ).to(dtype=torch.float64)
+        )
+        for threshold_index, threshold in enumerate(thresholds):
+            values.append(
+                self._selector_binary_counts(
+                    probabilities[:, threshold_index] >= 0.5,
+                    gt > threshold,
+                    selector_eligible,
+                )
+            )
+        batch_stats = torch.cat(values)
+        if self._val_selector_stats is None:
+            self._val_selector_stats = batch_stats
+        else:
+            self._val_selector_stats.add_(batch_stats)
+
+    def _selector_contact_index(self):
+        matches = [
+            index
+            for index, threshold in enumerate(self.support_selector_thresholds)
+            if math.isclose(
+                float(threshold),
+                float(self.support_selector_contact_min),
+                rel_tol=0.0,
+                abs_tol=1e-8,
+            )
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                "Support selector thresholds must contain contact_min exactly once"
+            )
+        return matches[0]
+
+    @staticmethod
+    def _selector_histogram_bin_indices(logits):
+        scale = SELECTOR_HISTOGRAM_BINS / (
+            SELECTOR_LOGIT_MAX - SELECTOR_LOGIT_MIN
+        )
+        return torch.floor(
+            (logits.clamp(SELECTOR_LOGIT_MIN, SELECTOR_LOGIT_MAX)
+             - SELECTOR_LOGIT_MIN)
+            * scale
+        ).to(dtype=torch.long).clamp_(0, SELECTOR_HISTOGRAM_BINS - 1)
+
+    def _accumulate_selector_calibration_histogram(
+        self,
+        selector_logits,
+        base_prediction,
+        target,
+        has_tactile,
+        palm_mask,
+    ):
+        logits = selector_logits.detach().float()
+        gt = target.detach().float()
+        valid = (palm_mask.detach().float() > 0.5) & (
+            has_tactile.detach().float() > 0.5
+        )[:, None]
+        thresholds = tuple(float(value) for value in self.support_selector_thresholds)
+        if logits.shape[1] != len(thresholds):
+            raise RuntimeError(
+                "Support selector output count does not match configured thresholds"
+            )
+        layout = selector_histogram_layout(len(thresholds))
+        histogram = torch.zeros(
+            selector_histogram_rows(len(thresholds)),
+            SELECTOR_HISTOGRAM_BINS,
+            dtype=torch.float64,
+            device=logits.device,
+        )
+
+        def add(row, indices, mask):
+            selected = indices[mask]
+            if selected.numel() > 0:
+                histogram[int(row)].add_(
+                    torch.bincount(
+                        selected,
+                        minlength=SELECTOR_HISTOGRAM_BINS,
+                    ).to(dtype=torch.float64)
+                )
+
+        bin_indices = self._selector_histogram_bin_indices(logits)
+        gt_contact = gt >= float(self.support_selector_contact_min)
+        clear = valid & (
+            (gt <= float(self.support_selector_no_contact_max)) | gt_contact
+        )
+        base_contact = (
+            base_prediction.detach().float()
+            >= float(self.support_selector_contact_min)
+        )
+        selector_eligible = valid
+        if self.support_selector_mode == "down_error":
+            selector_eligible = clear & base_contact
+        for output_index, threshold in enumerate(thresholds):
+            labels = (
+                gt >= float(self.support_selector_contact_min)
+                if self.support_selector_mode in {"contact", "down_error"}
+                else gt > threshold
+            )
+            pair = layout["cumulative"][output_index]
+            add(
+                pair["positive"],
+                bin_indices[:, output_index],
+                selector_eligible & labels,
+            )
+            add(
+                pair["negative"],
+                bin_indices[:, output_index],
+                selector_eligible & ~labels,
+            )
+
+        contact_index = self._selector_contact_index()
+        contact_bins = bin_indices[:, contact_index]
+        add(
+            layout["clear_positive"],
+            contact_bins,
+            clear & selector_eligible & gt_contact,
+        )
+        add(
+            layout["clear_negative"],
+            contact_bins,
+            clear & selector_eligible & ~gt_contact,
+        )
+        add(
+            layout["false_high"],
+            contact_bins,
+            clear & ~gt_contact & base_contact,
+        )
+        add(
+            layout["base_true_positive"],
+            contact_bins,
+            clear & gt_contact & base_contact,
+        )
+        if self.support_selector_mode != "down_error":
+            add(
+                layout["false_low"],
+                contact_bins,
+                clear & gt_contact & ~base_contact,
+            )
+            add(
+                layout["base_true_negative"],
+                contact_bins,
+                clear & ~gt_contact & ~base_contact,
+            )
+        if self._val_selector_histogram is None:
+            self._val_selector_histogram = histogram
+        else:
+            self._val_selector_histogram.add_(histogram)
+
+    def _selector_calibration_metrics(self, histogram, base_clear_iou):
+        calibration = summarize_selector_histograms(
+            histogram.detach().cpu().tolist(),
+            self.support_selector_thresholds,
+            contact_index=self._selector_contact_index(),
+            minimum_correction_precision=(
+                self.support_selector_correction_min_precision
+            ),
+        )
+        calibration.update(
+            {
+                "source": "validation",
+                "epoch": int(self.current_epoch),
+                "global_step": int(self.global_step),
+                "selector_mode": str(self.support_selector_mode),
+                "no_contact_max": float(self.support_selector_no_contact_max),
+                "contact_min": float(self.support_selector_contact_min),
+            }
+        )
+        self.support_selector_calibration = calibration
+
+        clear = calibration["contact_clear"]
+        clear_metrics = clear["metrics"]
+        metrics = {
+            "val/selector_calibrated_clear_iou": float(clear_metrics["iou"]),
+            "val/selector_calibrated_clear_precision": float(
+                clear_metrics["precision"]
+            ),
+            "val/selector_calibrated_clear_recall": float(clear_metrics["recall"]),
+            "val/selector_calibrated_clear_f1": float(clear_metrics["f1"]),
+            "val/selector_calibrated_clear_threshold": float(
+                clear["threshold_probability"]
+            ),
+            "val/selector_clear_average_precision": float(
+                clear["average_precision"]
+            ),
+            "val/selector_calibrated_clear_iou_gain_vs_base": (
+                float(clear_metrics["iou"]) - float(base_clear_iou)
+            ),
+        }
+        if math.isfinite(float(clear["roc_auc"])):
+            metrics["val/selector_clear_roc_auc"] = float(clear["roc_auc"])
+        correction = calibration["correction"]
+        for direction in ("down", "up"):
+            values = correction[direction]
+            metrics[f"val/selector_{direction}_threshold"] = float(
+                values["threshold_probability"]
+            )
+            metrics[f"val/selector_{direction}_precision"] = float(
+                values["precision"]
+            )
+        metrics["val/selector_false_high_calibrated_coverage"] = float(
+            correction["down"]["false_high_coverage"]
+        )
+        metrics["val/selector_down_error_calibrated_coverage"] = float(
+            correction["down"]["false_high_coverage"]
+        )
+        metrics["val/selector_down_error_calibrated_precision"] = float(
+            correction["down"]["precision"]
+        )
+        metrics["val/selector_down_error_average_precision"] = float(
+            correction["down"]["average_precision"]
+        )
+        if math.isfinite(float(correction["down"]["roc_auc"])):
+            metrics["val/selector_down_error_roc_auc"] = float(
+                correction["down"]["roc_auc"]
+            )
+        metrics["val/selector_false_low_calibrated_recovery"] = float(
+            correction["up"]["false_low_recovery"]
+        )
+        for item in calibration["cumulative"]:
+            label = f"{float(item['target_threshold']):g}".replace(".", "p")
+            for name, value in item["metrics"].items():
+                metrics[f"val/selector_calibrated_{label}_{name}"] = float(value)
+            metrics[f"val/selector_calibrated_{label}_threshold"] = float(
+                item["threshold_probability"]
+            )
+            metrics[f"val/selector_{label}_average_precision"] = float(
+                item["average_precision"]
+            )
+            if math.isfinite(float(item["roc_auc"])):
+                metrics[f"val/selector_{label}_roc_auc"] = float(item["roc_auc"])
+        return metrics
+
+    @staticmethod
+    def _selector_metrics_from_stats(stats, thresholds):
+        def binary_metrics(counts):
+            tp, fp, fn, tn = counts
+            iou_denominator = tp + fp + fn
+            precision_denominator = tp + fp
+            recall_denominator = tp + fn
+            return {
+                "iou": torch.where(
+                    iou_denominator > 0,
+                    tp / iou_denominator.clamp_min(1.0),
+                    tp.new_tensor(1.0),
+                ),
+                "precision": tp / precision_denominator.clamp_min(1.0),
+                "recall": tp / recall_denominator.clamp_min(1.0),
+                "f1": (2.0 * tp) / (2.0 * tp + fp + fn).clamp_min(1.0),
+                "accuracy": (tp + tn) / (tp + fp + fn + tn).clamp_min(1.0),
+            }
+
+        selector = binary_metrics(stats[0:4])
+        baseline = binary_metrics(stats[4:8])
+        selector_clear = binary_metrics(stats[8:12])
+        baseline_clear = binary_metrics(stats[12:16])
+        metrics = {}
+        for prefix, values in (
+            ("selector", selector),
+            ("selector_base", baseline),
+            ("selector_clear", selector_clear),
+            ("selector_base_clear", baseline_clear),
+        ):
+            for name, value in values.items():
+                metrics[f"val/{prefix}_{name}"] = value
+        metrics.update(
+            {
+                "val/selector_contact_iou_gain_vs_base": (
+                    selector["iou"] - baseline["iou"]
+                ),
+                "val/selector_clear_iou_gain_vs_base": (
+                    selector_clear["iou"] - baseline_clear["iou"]
+                ),
+                "val/selector_false_high_detect_rate": stats[16]
+                / stats[17].clamp_min(1.0),
+                "val/selector_false_low_recovery_rate": stats[18]
+                / stats[19].clamp_min(1.0),
+                "val/selector_disagreement_rate": stats[20]
+                / stats[21].clamp_min(1.0),
+                "val/selector_ordinal_bin_mae": stats[22]
+                / stats[24].clamp_min(1.0),
+                "val/selector_ordinal_bin_accuracy": stats[23]
+                / stats[24].clamp_min(1.0),
+                "val/selector_monotonic_violation_rate": stats[25]
+                / stats[26].clamp_min(1.0),
+            }
+        )
+        offset = 27
+        for threshold_index, threshold in enumerate(thresholds):
+            threshold_metrics = binary_metrics(
+                stats[offset + 4 * threshold_index:offset + 4 * (threshold_index + 1)]
+            )
+            label = f"{float(threshold):g}".replace(".", "p")
+            for name, value in threshold_metrics.items():
+                metrics[f"val/selector_cumulative_{label}_{name}"] = value
+        return metrics
                 
     def training_step(self, batch, batch_idx):
         output = self.forward_step(batch, train=True)
@@ -828,6 +1467,12 @@ class TactileTrainingModule(DinoTactileModel):
             "train/loss_contact_weighted_epoch_global": output["losses"].get(
                 "loss_contact_weighted", loss.detach().new_zeros(())
             ),
+            "train/loss_selector_bce_epoch_global": output["losses"].get(
+                "loss_selector_balanced_bce", loss.detach().new_zeros(())
+            ),
+            "train/loss_selector_monotonic_epoch_global": output["losses"].get(
+                "loss_selector_monotonic", loss.detach().new_zeros(())
+            ),
         }
         for name, value in metric_values.items():
             weighted = value.detach().to(dtype=torch.float64) * float(batch_size)
@@ -854,6 +1499,111 @@ class TactileTrainingModule(DinoTactileModel):
             batch_size=batch_size,
         )
         return loss
+
+    def _local_base_comparison_metrics(
+        self,
+        fused_prediction,
+        base_prediction,
+        target,
+        has_tactile,
+        palm_mask,
+    ):
+        valid = has_tactile > 0.5
+        if not bool(valid.any().item()):
+            return {}
+        fused = fused_prediction[valid].detach().float()
+        base = base_prediction[valid].detach().float()
+        gt = target[valid].detach().float()
+        palm = palm_mask[valid].detach().float() > 0.5
+        values = palm.sum().clamp_min(1.0)
+        contact_threshold = float(self.tactile_loss_config.contact_pressure_thr)
+
+        def frame_metrics(prediction):
+            diff = (prediction - gt) * palm
+            rmse = torch.sqrt(diff.square().sum() / values)
+            pred_contact = (prediction >= contact_threshold) & palm
+            gt_contact = (gt >= contact_threshold) & palm
+            intersection = (pred_contact & gt_contact).sum(dim=1).float()
+            union = (pred_contact | gt_contact).sum(dim=1).float()
+            contact = torch.where(
+                union > 0,
+                intersection / union.clamp_min(1.0),
+                torch.ones_like(union),
+            ).mean()
+            vol_intersection = (torch.minimum(prediction, gt) * palm).sum(dim=1)
+            vol_union = (torch.maximum(prediction, gt) * palm).sum(dim=1)
+            viou = torch.where(
+                vol_union > 1e-12,
+                vol_intersection / vol_union.clamp_min(1e-12),
+                torch.ones_like(vol_union),
+            ).mean()
+            pred_core = prediction.clamp_min(0.0).square() * palm
+            gt_core = gt.clamp_min(0.0).square() * palm
+            pred_core = pred_core / pred_core.sum(dim=1, keepdim=True).clamp_min(1e-12)
+            gt_core = gt_core / gt_core.sum(dim=1, keepdim=True).clamp_min(1e-12)
+            core_union = torch.maximum(pred_core, gt_core).sum(dim=1)
+            core = torch.minimum(pred_core, gt_core).sum(dim=1) / core_union.clamp_min(1e-12)
+            eligible = ((gt * palm).sum(dim=1) >= 1.0) & (
+                (gt * palm).amax(dim=1) >= 0.05
+            )
+            core = core[eligible].mean() if bool(eligible.any().item()) else core.new_zeros(())
+            low_gt = (gt < 0.005) & palm
+            false_high = low_gt & (prediction >= 0.3)
+            false_high_excess = (
+                (prediction - gt).clamp_min(0.0) * false_high
+            ).sum() / low_gt.sum().clamp_min(1)
+            pred_volume = (prediction * palm).sum(dim=1)
+            gt_volume = (gt * palm).sum(dim=1)
+            catastrophic = (gt_volume < 10.0) & (pred_volume > 300.0)
+            return {
+                "rmse": rmse,
+                "contact": contact,
+                "viou": viou,
+                "coreloc": core,
+                "false_high_excess": false_high_excess,
+                "catastrophic": catastrophic.float().mean(),
+                "false_high_mask": false_high,
+                "catastrophic_mask": catastrophic,
+            }
+
+        fused_metrics = frame_metrics(fused)
+        base_metrics = frame_metrics(base)
+        base_false_high = base_metrics.pop("false_high_mask")
+        fused_false_high = fused_metrics.pop("false_high_mask")
+        base_catastrophic = base_metrics.pop("catastrophic_mask")
+        fused_catastrophic = fused_metrics.pop("catastrophic_mask")
+        output_delta = fused - base
+        low_gt_count = ((gt < 0.005) & palm).sum().clamp_min(1)
+        metrics = {
+            f"local_base_{name}": value for name, value in base_metrics.items()
+        }
+        for name in ("contact", "viou", "coreloc"):
+            metrics[f"local_fused_minus_base_{name}"] = (
+                fused_metrics[name] - base_metrics[name]
+            )
+        metrics.update(
+            {
+                "local_false_high_created": (
+                    fused_false_high & ~base_false_high
+                ).float().sum() / low_gt_count,
+                "local_false_high_corrected": (
+                    base_false_high & ~fused_false_high
+                ).float().sum() / low_gt_count,
+                "local_catastrophic_created": (
+                    fused_catastrophic & ~base_catastrophic
+                ).float().mean(),
+                "local_catastrophic_corrected": (
+                    base_catastrophic & ~fused_catastrophic
+                ).float().mean(),
+                "local_output_delta_up_volume": (
+                    output_delta.clamp_min(0.0) * palm
+                ).sum(dim=1).mean(),
+                "local_output_delta_down_volume": (
+                    (-output_delta).clamp_min(0.0) * palm
+                ).sum(dim=1).mean(),
+            }
+        )
+        return metrics
 
     def validation_step(self, batch, batch_idx):
         output = self.forward_step(batch, train=False)
@@ -911,6 +1661,18 @@ class TactileTrainingModule(DinoTactileModel):
                     sync_dist=True,
                     batch_size=batch_size,
                 )
+        selector_level_rms = diagnostics.get("selector_source_level_rms")
+        if selector_level_rms is not None:
+            for layer, value in zip(self.backbone_feature_layers, selector_level_rms):
+                self.log(
+                    f"val/selector_source_level_rms_{layer}",
+                    value,
+                    on_step=False,
+                    on_epoch=True,
+                    logger=True,
+                    sync_dist=True,
+                    batch_size=batch_size,
+                )
         for diagnostic_key, metric_name in (
             ("gate_raw", "rezero_gate_raw"),
             ("gate_effective", "rezero_gate_effective"),
@@ -932,6 +1694,74 @@ class TactileTrainingModule(DinoTactileModel):
                     sync_dist=True,
                     batch_size=batch_size,
                 )
+        for diagnostic_key in (
+            "local_logit_delta_rms",
+            "local_logit_delta_abs_max",
+            "local_logit_delta_saturation",
+            "local_changed_vertex_fraction",
+            "local_anchor_active_fraction",
+            "local_up_strength_mean",
+            "local_down_strength_mean",
+            "local_path_cancellation_ratio",
+            "selector_probability_mean",
+            "selector_probability_std",
+            "selector_logit_rms",
+            "selector_base_probability_mean",
+            "selector_monotonic_violation",
+            "selector_source_grid_rms",
+            "selector_source_fused_rms",
+            "selector_neck_rms",
+            "surface_coefficient_mean",
+            "surface_coefficient_rms",
+            "surface_coefficient_negative_fraction",
+            "surface_valid_logit_rms",
+        ):
+            value = diagnostics.get(diagnostic_key)
+            if value is not None:
+                self.log(
+                    f"val/{diagnostic_key}",
+                    value,
+                    on_step=False,
+                    on_epoch=True,
+                    logger=True,
+                    sync_dist=True,
+                    batch_size=batch_size,
+                )
+        base_prediction = output.get("base_pred_tactile")
+        if base_prediction is not None:
+            comparison_metrics = self._local_base_comparison_metrics(
+                pred_tactile,
+                base_prediction,
+                gt_tactile,
+                has_tactile,
+                palm_mask,
+            )
+            for name, value in comparison_metrics.items():
+                self.log(
+                    f"val/{name}",
+                    value,
+                    on_step=False,
+                    on_epoch=True,
+                    logger=True,
+                    sync_dist=True,
+                    batch_size=batch_size,
+                )
+        selector_logits = output.get("support_selector_logits")
+        if selector_logits is not None:
+            self._accumulate_selector_stats(
+                selector_logits,
+                pred_tactile,
+                gt_tactile,
+                has_tactile,
+                palm_mask,
+            )
+            self._accumulate_selector_calibration_histogram(
+                selector_logits,
+                pred_tactile,
+                gt_tactile,
+                has_tactile,
+                palm_mask,
+            )
         self._accumulate_val_eval_stats(
             pred_tactile,
             gt_tactile,
@@ -963,6 +1793,8 @@ class TactileTrainingModule(DinoTactileModel):
         self._val_eval_stats = None
         self._val_eval_stats_by_domain = {}
         self._val_touchanything_protocol_stats = CompactTouchAnythingProtocolAccumulator()
+        self._val_selector_stats = None
+        self._val_selector_histogram = None
 
     def _accumulate_val_eval_stats(
         self,
@@ -1434,6 +2266,41 @@ class TactileTrainingModule(DinoTactileModel):
             ).mean()
         eval_metrics.update(domain_metrics)
 
+        if self._val_selector_stats is not None:
+            selector_stats = self._val_selector_stats
+            if self.trainer.world_size > 1:
+                gathered = self.all_gather(selector_stats)
+                selector_stats = gathered.reshape(
+                    -1, selector_stats.numel()
+                ).sum(dim=0)
+            eval_metrics.update(
+                self._selector_metrics_from_stats(
+                    selector_stats,
+                    self.support_selector_thresholds,
+                )
+            )
+        if self._val_selector_histogram is not None:
+            selector_histogram = self._val_selector_histogram
+            if self.trainer.world_size > 1:
+                gathered = self.all_gather(selector_histogram)
+                selector_histogram = gathered.reshape(
+                    -1,
+                    selector_histogram.shape[0],
+                    selector_histogram.shape[1],
+                ).sum(dim=0)
+            base_clear_iou = eval_metrics.get(
+                "val/selector_base_clear_iou",
+                selector_histogram.new_zeros(()),
+            )
+            eval_metrics.update(
+                self._selector_calibration_metrics(
+                    selector_histogram,
+                    float(base_clear_iou.detach().cpu().item())
+                    if isinstance(base_clear_iou, torch.Tensor)
+                    else float(base_clear_iou),
+                )
+            )
+
         for name, value in eval_metrics.items():
             self.log(
                 name,
@@ -1470,6 +2337,12 @@ class TactileTrainingModule(DinoTactileModel):
             "loss_tactile": "loss/total",
             "loss_ramp": "schedule/loss_ramp",
             "loss_full_ramp_reference": "loss_full_ramp_reference",
+            "loss_selector_balanced_bce": "loss/selector_balanced_bce",
+            "loss_selector_monotonic": "loss/selector_monotonic",
+            "loss_selector_total": "loss/selector_total",
+            "diagnostics_selector_positive_fraction": (
+                "diagnostics/selector_positive_fraction"
+            ),
         }
         if prefix == "val":
             mapping.update({
@@ -1652,7 +2525,13 @@ def load_compatible_state_dict(model, checkpoint_path, load_backbone=False):
     if checkpoint.get("visual_backbone") != "dinov3_hplus":
         raise ValueError("Checkpoint must use visual_backbone=dinov3_hplus")
     checkpoint_head_type = checkpoint.get("tactile_head_type")
-    if checkpoint_head_type not in {"dense_v2", "dense_v2_dino_rezero"}:
+    if checkpoint_head_type not in {
+        "dense_v2",
+        "dense_v2_dino_rezero",
+        "dense_v2_dino_local_residual",
+        "dense_v2_dino_support_selector",
+        "dense_v2_dino_surface_basis",
+    }:
         raise ValueError("Checkpoint uses an unsupported tactile head type")
     if checkpoint_head_type != getattr(model, "tactile_head_type", None):
         raise ValueError(
@@ -1673,6 +2552,44 @@ def load_compatible_state_dict(model, checkpoint_path, load_backbone=False):
         raise ValueError(
             f"Backbone SHA256 mismatch: checkpoint={expected_hash}, actual={actual_hash}"
         )
+    if checkpoint_head_type == "dense_v2_dino_surface_basis":
+        expected_basis_sha = str(
+            checkpoint.get("surface_basis_tensor_sha256", "")
+            or checkpoint.get("model_config", {}).get(
+                "surface_basis_tensor_sha256", ""
+            )
+        )
+        actual_basis_sha = str(
+            getattr(model, "surface_basis_tensor_sha256", "") or ""
+        )
+        if (
+            expected_basis_sha
+            and actual_basis_sha
+            and expected_basis_sha != actual_basis_sha
+        ):
+            raise ValueError(
+                "Surface basis SHA256 mismatch: "
+                f"checkpoint={expected_basis_sha}, actual={actual_basis_sha}"
+            )
+        expected_sparse_sha = str(
+            checkpoint.get("surface_sparse_basis_sha256", "")
+            or checkpoint.get("model_config", {}).get(
+                "surface_sparse_basis_sha256", ""
+            )
+        )
+        actual_sparse_sha = str(
+            getattr(model, "surface_sparse_basis_sha256", "") or ""
+        )
+        if (
+            expected_sparse_sha
+            and actual_sparse_sha
+            and expected_sparse_sha != actual_sparse_sha
+        ):
+            raise ValueError(
+                "Sparse surface basis SHA256 mismatch: "
+                f"checkpoint={expected_sparse_sha}, "
+                f"actual={actual_sparse_sha}"
+            )
     prefix = "tactile_head."
     head_state = {
         key[len(prefix):]: value
@@ -1698,6 +2615,177 @@ def load_compatible_state_dict(model, checkpoint_path, load_backbone=False):
     return [], []
 
 
+def load_local_residual_base_checkpoint(model, checkpoint_path):
+    """Initialize only the immutable ReZero/FullGrid base of an extension head."""
+
+    head = getattr(model, "tactile_head", None)
+    if not hasattr(head, "base_state_keys"):
+        raise TypeError(
+            "--init_tactile_checkpoint is only supported by frozen extension heads"
+        )
+    checkpoint = _load_checkpoint(checkpoint_path)
+    if not isinstance(checkpoint, dict) or checkpoint.get("format") != "tactile_trainable_v2":
+        raise ValueError(
+            "Frozen extension initialization requires a compact "
+            "format=tactile_trainable_v2 checkpoint"
+        )
+    if checkpoint.get("tactile_head_type") != "dense_v2_dino_rezero":
+        raise ValueError(
+            "The frozen extension base must come from tactile_head_type="
+            "dense_v2_dino_rezero"
+        )
+    checkpoint_resolution = parse_input_resolution(
+        checkpoint.get("input_resolution", (256, 192))
+    )
+    if checkpoint_resolution != tuple(model.input_resolution):
+        raise ValueError(
+            f"Frozen extension base resolution mismatch: checkpoint={checkpoint_resolution}, "
+            f"model={model.input_resolution}"
+        )
+    if str(checkpoint.get("pool_layout", "")) != "fullgrid32":
+        raise ValueError("The frozen extension base checkpoint must use fullgrid32")
+    checkpoint_bbox_scale = float(checkpoint.get("bbox_rescale_factor", 2.0))
+    if not math.isclose(
+        checkpoint_bbox_scale,
+        float(model.bbox_rescale_factor),
+        rel_tol=0.0,
+        abs_tol=1e-9,
+    ):
+        raise ValueError(
+            "Frozen extension base bbox scale mismatch: "
+            f"checkpoint={checkpoint_bbox_scale}, model={model.bbox_rescale_factor}"
+        )
+    checkpoint_backbone_sha = str(checkpoint.get("backbone_sha256", "") or "")
+    model_backbone_sha = str(getattr(model, "backbone_weights_sha256", "") or "")
+    if (
+        checkpoint_backbone_sha
+        and model_backbone_sha
+        and checkpoint_backbone_sha != model_backbone_sha
+    ):
+        raise ValueError(
+            "Frozen extension base DINO weight SHA256 does not match the current model"
+        )
+    if int(checkpoint.get("pool_output_channels", 32)) != int(
+        model.pool_output_channels
+    ):
+        raise ValueError(
+            "Frozen extension base pool_output_channels does not match the model"
+        )
+    if int(checkpoint.get("decoder_hidden_dim", 512)) != int(
+        model.decoder_hidden_dim
+    ):
+        raise ValueError(
+            "Frozen extension base decoder_hidden_dim does not match the model"
+        )
+    checkpoint_layers = tuple(
+        int(value) for value in checkpoint.get("backbone_feature_layers", ())
+    )
+    if checkpoint_layers != tuple(model.backbone_feature_layers):
+        raise ValueError(
+            f"Frozen extension base DINO layers mismatch: checkpoint={checkpoint_layers}, "
+            f"model={model.backbone_feature_layers}"
+        )
+
+    prefix = "tactile_head."
+    checkpoint_head = {
+        key[len(prefix):]: value
+        for key, value in checkpoint.get("state_dict", {}).items()
+        if key.startswith(prefix)
+    }
+    mapping_fn = getattr(head, "base_checkpoint_mapping", None)
+    if callable(mapping_fn):
+        current_state = head.state_dict()
+        base_mapping = dict(mapping_fn())
+        mapped_state = {}
+        renamed = []
+        for current_key, source_key in base_mapping.items():
+            resolved_source_key = source_key
+            if source_key not in checkpoint_head and source_key.startswith(
+                "decoder.0.projection."
+            ):
+                legacy_key = "decoder.0.project." + source_key[
+                    len("decoder.0.projection."):
+                ]
+                if legacy_key in checkpoint_head:
+                    resolved_source_key = legacy_key
+                    renamed.append((legacy_key, source_key))
+            if resolved_source_key not in checkpoint_head:
+                raise RuntimeError(
+                    "Frozen surface feature extractor is missing source key "
+                    f"{source_key!r} for {current_key!r}"
+                )
+            if current_key not in current_state:
+                raise RuntimeError(
+                    f"Frozen surface mapping names unknown key {current_key!r}"
+                )
+            source_value = checkpoint_head[resolved_source_key]
+            if tuple(source_value.shape) != tuple(current_state[current_key].shape):
+                raise RuntimeError(
+                    "Frozen surface feature shape mismatch: "
+                    f"source={source_key!r} {tuple(source_value.shape)}, "
+                    f"target={current_key!r} {tuple(current_state[current_key].shape)}"
+                )
+            mapped_state[current_key] = source_value
+        incompatible = head.load_state_dict(mapped_state, strict=False)
+        unexpected = list(incompatible.unexpected_keys)
+        missing = set(incompatible.missing_keys)
+        expected_extension = set(current_state) - set(base_mapping)
+        if unexpected or missing != expected_extension:
+            raise RuntimeError(
+                "Unexpected surface-basis initialization result: "
+                f"missing={sorted(missing)[:5]}, unexpected={unexpected[:5]}"
+            )
+    else:
+        checkpoint_head, renamed = _migrate_tactile_head_state_keys(
+            checkpoint_head,
+            head.state_dict(),
+        )
+        base_keys = set(head.base_state_keys())
+        missing_base = sorted(base_keys - set(checkpoint_head))
+        unexpected_base = sorted(set(checkpoint_head) - base_keys)
+        if missing_base or unexpected_base:
+            raise RuntimeError(
+                "Frozen extension base state is not an exact structural match: "
+                f"missing={missing_base[:5]}, unexpected={unexpected_base[:5]}"
+            )
+        incompatible = head.load_state_dict(checkpoint_head, strict=False)
+        unexpected = list(incompatible.unexpected_keys)
+        missing = set(incompatible.missing_keys)
+        if hasattr(head, "extension_state_keys"):
+            expected_extension = set(head.extension_state_keys())
+        else:
+            expected_extension = {
+                key for key in head.state_dict() if key.startswith("local_residual.")
+            }
+        if unexpected or missing != expected_extension:
+            raise RuntimeError(
+                "Unexpected frozen extension initialization result: "
+                f"missing={sorted(missing)[:5]}, unexpected={unexpected[:5]}"
+            )
+    should_freeze_base = (
+        getattr(model, "tactile_head_type", "")
+        == "dense_v2_dino_surface_basis"
+        and bool(getattr(model, "freeze_surface_feature_extractor", True))
+    ) or (
+        getattr(model, "tactile_head_type", "")
+        != "dense_v2_dino_surface_basis"
+        and bool(getattr(model, "freeze_local_residual_base", True))
+    )
+    if should_freeze_base:
+        head.freeze_base_parameters()
+    model.init_tactile_checkpoint = str(Path(checkpoint_path).resolve())
+    model.init_tactile_checkpoint_sha256 = file_sha256(checkpoint_path)
+    if renamed:
+        print(
+            "Migrated frozen-base checkpoint keys: "
+            + ", ".join(f"{old} -> {new}" for old, new in renamed)
+        )
+    print(
+        "Initialized and froze extension base from: "
+        f"{model.init_tactile_checkpoint}"
+    )
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Train the frozen-DINO tactile regressor")
     parser.add_argument(
@@ -1715,7 +2803,8 @@ def parse_args():
         default=None,
         help=(
             "Dataset names/aliases to train on, comma-separated. Supported: "
-            "opentouch/ot, touchanything/egotouch/ta, egotactile/ego. "
+            "opentouch/ot, touchanything/egotouch/ta, egotactile/ego, "
+            "acedata/ace. "
             "Explicit --data_dir paths are appended after these resolved roots. "
             "If both --datasets and --data_dir are omitted, defaults to opentouch."
         ),
@@ -1771,6 +2860,16 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--val_query_manifests",
+        type=str,
+        default="",
+        help=(
+            "Optional comma-separated validation query manifests. When omitted, "
+            "validation inherits --query_manifests for backward compatibility. "
+            "Use this to omit a training domain that has no validation split."
+        ),
+    )
+    parser.add_argument(
         "--hdf5_handle_cache_size",
         type=int,
         default=4,
@@ -1812,6 +2911,15 @@ def parse_args():
         help=(
             "Hard dataset-content contract for strict/single-domain runs. The dataset constructor "
             "fails if an unexpected domain is present or an expected domain is absent."
+        ),
+    )
+    parser.add_argument(
+        "--val_expected_datasets",
+        type=str,
+        default="",
+        help=(
+            "Validation-only dataset-content contract. When omitted, validation "
+            "inherits --expected_datasets."
         ),
     )
     parser.add_argument("--index_cache_dir", type=str, default=os.path.join(ft_dir, "index_cache"), help="Shared JSONL cache for scanned dataset indices")
@@ -1897,7 +3005,13 @@ def parse_args():
     parser.add_argument("--quick_test", action="store_true", help="Run a quick test training")
     parser.add_argument(
         "--tactile_head_type",
-        choices=("dense_v2", "dense_v2_dino_rezero"),
+        choices=(
+            "dense_v2",
+            "dense_v2_dino_rezero",
+            "dense_v2_dino_local_residual",
+            "dense_v2_dino_support_selector",
+            "dense_v2_dino_surface_basis",
+        ),
         default="dense_v2_dino_rezero",
     )
     parser.add_argument(
@@ -1927,6 +3041,125 @@ def parse_args():
         help="Number of batches accumulated before each optimizer step.",
     )
     parser.add_argument("--pool_output_channels", type=int, default=32)
+    parser.add_argument(
+        "--decoder_hidden_dim",
+        type=int,
+        default=512,
+        help="Width of the dense decoder bottleneck (matrix presets use 512 or 1024).",
+    )
+    parser.add_argument("--local_anchor_count", type=int, default=512)
+    parser.add_argument("--local_anchor_neighbors", type=int, default=4)
+    parser.add_argument("--local_logit_delta_max", type=float, default=6.0)
+    parser.add_argument("--local_residual_dropout", type=float, default=0.10)
+    parser.add_argument(
+        "--support_selector_mode",
+        choices=("contact", "ordinal", "down_error"),
+        default="contact",
+        help=(
+            "contact/ordinal predict support directly; down_error predicts "
+            "whether a frozen-base contact candidate should be retained"
+        ),
+    )
+    parser.add_argument(
+        "--support_selector_thresholds",
+        type=str,
+        default="0.02,0.05,0.10,0.20,0.50",
+        help="Strictly increasing cumulative pressure thresholds for ordinal mode.",
+    )
+    parser.add_argument(
+        "--support_selector_no_contact_max", type=float, default=0.02
+    )
+    parser.add_argument(
+        "--support_selector_contact_min", type=float, default=0.10
+    )
+    parser.add_argument("--support_selector_dropout", type=float, default=0.10)
+    parser.add_argument(
+        "--support_selector_monotonicity_weight", type=float, default=0.10
+    )
+    parser.add_argument(
+        "--support_selector_architecture",
+        choices=("linear", "spatial_mlp"),
+        default="linear",
+    )
+    parser.add_argument(
+        "--support_selector_feature_source",
+        choices=("fullgrid32", "rezero_grid", "raw_dino"),
+        default="fullgrid32",
+    )
+    parser.add_argument("--support_selector_neck_channels", type=int, default=64)
+    parser.add_argument("--support_selector_hidden_dim", type=int, default=512)
+    parser.add_argument(
+        "--support_selector_base_conditioning",
+        choices=("real", "constant_control"),
+        default="real",
+        help=(
+            "For down_error selectors, use detached frozen-base confidence or "
+            "an identically parameterized zero-input control."
+        ),
+    )
+    parser.add_argument(
+        "--support_selector_correction_min_precision",
+        type=float,
+        default=SELECTOR_CORRECTION_MIN_PRECISION,
+        help=(
+            "Minimum validation precision used to select high-confidence "
+            "selector thresholds for downward/upward correction diagnostics."
+        ),
+    )
+    parser.add_argument(
+        "--freeze_local_residual_base",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Freeze the initialized ReZero/FullGrid base for a local residual head.",
+    )
+    parser.add_argument(
+        "--surface_basis_path",
+        type=str,
+        default="",
+        help="Audited canonical_surface_basis_v1 runtime artifact.",
+    )
+    parser.add_argument(
+        "--surface_coefficient_dim",
+        type=int,
+        default=4096,
+        help="Number of fixed continuous surface-basis coefficients.",
+    )
+    parser.add_argument(
+        "--surface_coefficient_architecture",
+        choices=("linear", "nonlinear"),
+        default="linear",
+        help="Coefficient decoder used after the FullGrid32 projection.",
+    )
+    parser.add_argument(
+        "--surface_coefficient_hidden_dim",
+        type=int,
+        default=1024,
+        help="Hidden width for the nonlinear surface coefficient decoder.",
+    )
+    parser.add_argument(
+        "--surface_target_support_count",
+        type=int,
+        default=4,
+        help="Audited median basis support; Stage 1 fixes this to 4.",
+    )
+    parser.add_argument(
+        "--surface_background_probability",
+        type=float,
+        default=1e-3,
+        help="Initial and invalid-vertex pressure probability.",
+    )
+    parser.add_argument(
+        "--freeze_surface_feature_extractor",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Freeze initialized ReZero fusion and FullGrid32 projection.",
+    )
+    parser.add_argument(
+        "--init_tactile_checkpoint",
+        type=str,
+        default="",
+        help="Compact ReZero/FullGrid checkpoint used to initialize a frozen extension base.",
+    )
     parser.add_argument(
         "--decoder_dropout_scale",
         type=float,
@@ -2091,7 +3324,38 @@ def model_summary(model):
         f"input_resolution: {getattr(model, 'input_resolution', None)}",
         f"decoder_input_dim: {getattr(model, 'decoder_input_dim', None)}",
         f"pool_output_channels: {getattr(model, 'pool_output_channels', None)}",
+        f"decoder_hidden_dim: {getattr(model, 'decoder_hidden_dim', None)}",
         f"decoder_dropout_scale: {getattr(model, 'decoder_dropout_scale', None)}",
+        f"local_anchor_count: {getattr(model, 'local_anchor_count', None)}",
+        f"local_anchor_neighbors: {getattr(model, 'local_anchor_neighbors', None)}",
+        f"local_logit_delta_max: {getattr(model, 'local_logit_delta_max', None)}",
+        f"local_residual_dropout: {getattr(model, 'local_residual_dropout', None)}",
+        f"freeze_local_residual_base: {getattr(model, 'freeze_local_residual_base', None)}",
+        f"support_selector_mode: {getattr(model, 'support_selector_mode', None)}",
+        f"support_selector_thresholds: {getattr(model, 'support_selector_thresholds', None)}",
+        f"support_selector_no_contact_max: {getattr(model, 'support_selector_no_contact_max', None)}",
+        f"support_selector_contact_min: {getattr(model, 'support_selector_contact_min', None)}",
+        f"support_selector_dropout: {getattr(model, 'support_selector_dropout', None)}",
+        f"support_selector_monotonicity_weight: {getattr(model, 'support_selector_monotonicity_weight', None)}",
+        f"support_selector_architecture: {getattr(model, 'support_selector_architecture', None)}",
+        f"support_selector_feature_source: {getattr(model, 'support_selector_feature_source', None)}",
+        f"support_selector_neck_channels: {getattr(model, 'support_selector_neck_channels', None)}",
+        f"support_selector_hidden_dim: {getattr(model, 'support_selector_hidden_dim', None)}",
+        f"support_selector_base_conditioning: {getattr(model, 'support_selector_base_conditioning', None)}",
+        f"support_selector_correction_min_precision: {getattr(model, 'support_selector_correction_min_precision', None)}",
+        f"surface_basis_path: {getattr(model, 'surface_basis_path', None)}",
+        f"surface_basis_artifact_sha256: {getattr(model, 'surface_basis_artifact_sha256', None)}",
+        f"surface_basis_tensor_sha256: {getattr(model, 'surface_basis_tensor_sha256', None)}",
+        f"surface_sparse_basis_sha256: {getattr(model, 'surface_sparse_basis_sha256', None)}",
+        f"surface_valid_vertex_count: {getattr(model, 'surface_valid_vertex_count', None)}",
+        f"surface_maximum_support_count: {getattr(model, 'surface_maximum_support_count', None)}",
+        f"surface_coefficient_dim: {getattr(model, 'surface_coefficient_dim', None)}",
+        f"surface_coefficient_architecture: {getattr(model, 'surface_coefficient_architecture', None)}",
+        f"surface_coefficient_hidden_dim: {getattr(model, 'surface_coefficient_hidden_dim', None)}",
+        f"surface_target_support_count: {getattr(model, 'surface_target_support_count', None)}",
+        f"surface_background_probability: {getattr(model, 'surface_background_probability', None)}",
+        f"freeze_surface_feature_extractor: {getattr(model, 'freeze_surface_feature_extractor', None)}",
+        f"init_tactile_checkpoint: {getattr(model, 'init_tactile_checkpoint', None)}",
         f"dino_residual_max_scale: {getattr(model, 'dino_residual_max_scale', None)}",
         f"dino_residual_rms_budget: {getattr(model, 'dino_residual_rms_budget', None)}",
         f"bbox_rescale_factor: {getattr(model, 'bbox_rescale_factor', None)}",
@@ -2129,6 +3393,16 @@ def write_run_provenance(args, data_dirs, tactile_loss_config, model, ckpt_dir, 
     if args.save_contact_best and "TouchAnything" in requested_datasets:
         checkpoint_monitors["contact-best"] = {
             "metric": "val/touchanything/touchanything_protocol_contact_iou",
+            "mode": "max",
+        }
+    if model.tactile_head_type == "dense_v2_dino_support_selector":
+        selector_monitor = (
+            "val/selector_down_error_calibrated_coverage"
+            if model.support_selector_mode == "down_error"
+            else "val/selector_calibrated_clear_iou"
+        )
+        checkpoint_monitors["selector-best"] = {
+            "metric": selector_monitor,
             "mode": "max",
         }
     run_config = {
@@ -2190,7 +3464,97 @@ def write_run_provenance(args, data_dirs, tactile_loss_config, model, ckpt_dir, 
         "input_resolution": list(getattr(model, "input_resolution", (256, 192))),
         "decoder_input_dim": int(getattr(model, "decoder_input_dim", 6144)),
         "pool_output_channels": int(getattr(model, "pool_output_channels", 32)),
+        "decoder_hidden_dim": int(getattr(model, "decoder_hidden_dim", 512)),
         "decoder_dropout_scale": float(getattr(model, "decoder_dropout_scale", 1.0)),
+        "local_anchor_count": int(getattr(model, "local_anchor_count", 512)),
+        "local_anchor_neighbors": int(getattr(model, "local_anchor_neighbors", 4)),
+        "local_logit_delta_max": float(getattr(model, "local_logit_delta_max", 6.0)),
+        "local_residual_dropout": float(getattr(model, "local_residual_dropout", 0.10)),
+        "freeze_local_residual_base": bool(
+            getattr(model, "freeze_local_residual_base", True)
+        ),
+        "support_selector_mode": str(
+            getattr(model, "support_selector_mode", "contact")
+        ),
+        "support_selector_thresholds": list(
+            getattr(model, "support_selector_thresholds", (0.10,))
+        ),
+        "support_selector_no_contact_max": float(
+            getattr(model, "support_selector_no_contact_max", 0.02)
+        ),
+        "support_selector_contact_min": float(
+            getattr(model, "support_selector_contact_min", 0.10)
+        ),
+        "support_selector_dropout": float(
+            getattr(model, "support_selector_dropout", 0.10)
+        ),
+        "support_selector_monotonicity_weight": float(
+            getattr(model, "support_selector_monotonicity_weight", 0.10)
+        ),
+        "support_selector_architecture": str(
+            getattr(model, "support_selector_architecture", "linear")
+        ),
+        "support_selector_feature_source": str(
+            getattr(model, "support_selector_feature_source", "fullgrid32")
+        ),
+        "support_selector_neck_channels": int(
+            getattr(model, "support_selector_neck_channels", 64)
+        ),
+        "support_selector_hidden_dim": int(
+            getattr(model, "support_selector_hidden_dim", 512)
+        ),
+        "support_selector_base_conditioning": str(
+            getattr(model, "support_selector_base_conditioning", "real")
+        ),
+        "support_selector_correction_min_precision": float(
+            getattr(
+                model,
+                "support_selector_correction_min_precision",
+                SELECTOR_CORRECTION_MIN_PRECISION,
+            )
+        ),
+        "surface_basis_path": str(
+            getattr(model, "surface_basis_path", "") or ""
+        ),
+        "surface_basis_artifact_sha256": str(
+            getattr(model, "surface_basis_artifact_sha256", "") or ""
+        ),
+        "surface_basis_tensor_sha256": str(
+            getattr(model, "surface_basis_tensor_sha256", "") or ""
+        ),
+        "surface_sparse_basis_sha256": str(
+            getattr(model, "surface_sparse_basis_sha256", "") or ""
+        ),
+        "surface_valid_vertex_count": int(
+            getattr(model, "surface_valid_vertex_count", 0)
+        ),
+        "surface_maximum_support_count": int(
+            getattr(model, "surface_maximum_support_count", 0)
+        ),
+        "surface_coefficient_dim": int(
+            getattr(model, "surface_coefficient_dim", 4096)
+        ),
+        "surface_coefficient_architecture": str(
+            getattr(model, "surface_coefficient_architecture", "linear")
+        ),
+        "surface_coefficient_hidden_dim": int(
+            getattr(model, "surface_coefficient_hidden_dim", 1024)
+        ),
+        "surface_target_support_count": int(
+            getattr(model, "surface_target_support_count", 4)
+        ),
+        "surface_background_probability": float(
+            getattr(model, "surface_background_probability", 1e-3)
+        ),
+        "freeze_surface_feature_extractor": bool(
+            getattr(model, "freeze_surface_feature_extractor", True)
+        ),
+        "init_tactile_checkpoint": str(
+            getattr(model, "init_tactile_checkpoint", "") or ""
+        ),
+        "init_tactile_checkpoint_sha256": str(
+            getattr(model, "init_tactile_checkpoint_sha256", "") or ""
+        ),
         "backbone_feature_layers": list(getattr(model, "backbone_feature_layers", ())),
         "dino_residual_max_scale": float(getattr(model, "dino_residual_max_scale", 0.10)),
         "dino_residual_rms_budget": float(getattr(model, "dino_residual_rms_budget", 0.50)),
@@ -2198,9 +3562,15 @@ def write_run_provenance(args, data_dirs, tactile_loss_config, model, ckpt_dir, 
         "index_schema_version": int(getattr(model, "index_schema_version", INDEX_CACHE_VERSION)),
         "index_cache_key": str(getattr(model, "index_cache_key", "")),
         "indexed_sample_count": int(getattr(model, "indexed_sample_count", 0)),
+        "val_indexed_sample_count": int(
+            getattr(model, "val_indexed_sample_count", 0)
+        ),
         "index_manifest_sha256": str(getattr(model, "index_manifest_sha256", "")),
         "data_backend": str(getattr(model, "data_backend", "legacy_dirs")),
         "query_manifest_sha256": dict(getattr(model, "query_manifest_sha256", {})),
+        "val_query_manifest_sha256": dict(
+            getattr(model, "val_query_manifest_sha256", {})
+        ),
         "hdf5_schema_version": str(getattr(model, "hdf5_schema_version", "")),
         "hdf5_handle_cache_size": int(getattr(model, "hdf5_handle_cache_size", 4)),
         "hdf5_manifest_cache_dir": str(
@@ -2212,6 +3582,7 @@ def write_run_provenance(args, data_dirs, tactile_loss_config, model, ckpt_dir, 
         "bbox_manifest_sha256": dict(getattr(model, "bbox_manifest_sha256", {})),
         "lazy_index_records": bool(getattr(model, "lazy_index_records", False)),
         "dataset_filter": list(getattr(model, "dataset_filter", ())),
+        "val_dataset_filter": list(getattr(model, "val_dataset_filter", ())),
         "train_augmentation": bool(getattr(model, "train_augmentation", True)),
         "bbox_rescale_factor": float(getattr(model, "bbox_rescale_factor", 2.0)),
         "bbox_source_policy": str(getattr(model, "bbox_source_policy", "any")),
@@ -2346,14 +3717,113 @@ def _compact_checkpoint_payload(module, epoch, global_step, reason, monitor=None
         "pool_valid_tokens": int(getattr(module, "pool_valid_tokens", 192)),
         "decoder_input_dim": int(getattr(module, "decoder_input_dim", 6144)),
         "pool_output_channels": int(getattr(module, "pool_output_channels", 32)),
+        "decoder_hidden_dim": int(getattr(module, "decoder_hidden_dim", 512)),
         "decoder_dropout_scale": float(getattr(module, "decoder_dropout_scale", 1.0)),
+        "local_anchor_count": int(getattr(module, "local_anchor_count", 512)),
+        "local_anchor_neighbors": int(getattr(module, "local_anchor_neighbors", 4)),
+        "local_logit_delta_max": float(getattr(module, "local_logit_delta_max", 6.0)),
+        "local_residual_dropout": float(getattr(module, "local_residual_dropout", 0.10)),
+        "freeze_local_residual_base": bool(
+            getattr(module, "freeze_local_residual_base", True)
+        ),
+        "support_selector_mode": str(
+            getattr(module, "support_selector_mode", "contact")
+        ),
+        "support_selector_thresholds": list(
+            getattr(module, "support_selector_thresholds", (0.10,))
+        ),
+        "support_selector_no_contact_max": float(
+            getattr(module, "support_selector_no_contact_max", 0.02)
+        ),
+        "support_selector_contact_min": float(
+            getattr(module, "support_selector_contact_min", 0.10)
+        ),
+        "support_selector_dropout": float(
+            getattr(module, "support_selector_dropout", 0.10)
+        ),
+        "support_selector_monotonicity_weight": float(
+            getattr(module, "support_selector_monotonicity_weight", 0.10)
+        ),
+        "support_selector_architecture": str(
+            getattr(module, "support_selector_architecture", "linear")
+        ),
+        "support_selector_feature_source": str(
+            getattr(module, "support_selector_feature_source", "fullgrid32")
+        ),
+        "support_selector_neck_channels": int(
+            getattr(module, "support_selector_neck_channels", 64)
+        ),
+        "support_selector_hidden_dim": int(
+            getattr(module, "support_selector_hidden_dim", 512)
+        ),
+        "support_selector_base_conditioning": str(
+            getattr(module, "support_selector_base_conditioning", "real")
+        ),
+        "support_selector_correction_min_precision": float(
+            getattr(
+                module,
+                "support_selector_correction_min_precision",
+                SELECTOR_CORRECTION_MIN_PRECISION,
+            )
+        ),
+        "support_selector_calibration": json.loads(
+            json.dumps(getattr(module, "support_selector_calibration", {}))
+        ),
+        "surface_basis_path": str(
+            getattr(module, "surface_basis_path", "") or ""
+        ),
+        "surface_basis_artifact_sha256": str(
+            getattr(module, "surface_basis_artifact_sha256", "") or ""
+        ),
+        "surface_basis_tensor_sha256": str(
+            getattr(module, "surface_basis_tensor_sha256", "") or ""
+        ),
+        "surface_sparse_basis_sha256": str(
+            getattr(module, "surface_sparse_basis_sha256", "") or ""
+        ),
+        "surface_valid_vertex_count": int(
+            getattr(module, "surface_valid_vertex_count", 0)
+        ),
+        "surface_maximum_support_count": int(
+            getattr(module, "surface_maximum_support_count", 0)
+        ),
+        "surface_coefficient_dim": int(
+            getattr(module, "surface_coefficient_dim", 4096)
+        ),
+        "surface_coefficient_architecture": str(
+            getattr(module, "surface_coefficient_architecture", "linear")
+        ),
+        "surface_coefficient_hidden_dim": int(
+            getattr(module, "surface_coefficient_hidden_dim", 1024)
+        ),
+        "surface_target_support_count": int(
+            getattr(module, "surface_target_support_count", 4)
+        ),
+        "surface_background_probability": float(
+            getattr(module, "surface_background_probability", 1e-3)
+        ),
+        "freeze_surface_feature_extractor": bool(
+            getattr(module, "freeze_surface_feature_extractor", True)
+        ),
+        "init_tactile_checkpoint": str(
+            getattr(module, "init_tactile_checkpoint", "") or ""
+        ),
+        "init_tactile_checkpoint_sha256": str(
+            getattr(module, "init_tactile_checkpoint_sha256", "") or ""
+        ),
         "accumulate_grad_batches": int(getattr(module, "accumulate_grad_batches_config", 1)),
         "index_schema_version": int(getattr(module, "index_schema_version", INDEX_CACHE_VERSION)),
         "index_cache_key": str(getattr(module, "index_cache_key", "")),
         "indexed_sample_count": int(getattr(module, "indexed_sample_count", 0)),
+        "val_indexed_sample_count": int(
+            getattr(module, "val_indexed_sample_count", 0)
+        ),
         "index_manifest_sha256": str(getattr(module, "index_manifest_sha256", "")),
         "data_backend": str(getattr(module, "data_backend", "legacy_dirs")),
         "query_manifest_sha256": dict(getattr(module, "query_manifest_sha256", {})),
+        "val_query_manifest_sha256": dict(
+            getattr(module, "val_query_manifest_sha256", {})
+        ),
         "hdf5_schema_version": str(getattr(module, "hdf5_schema_version", "")),
         "hdf5_handle_cache_size": int(getattr(module, "hdf5_handle_cache_size", 4)),
         "hdf5_manifest_cache_dir": str(
@@ -2365,6 +3835,7 @@ def _compact_checkpoint_payload(module, epoch, global_step, reason, monitor=None
         "bbox_manifest_sha256": dict(getattr(module, "bbox_manifest_sha256", {})),
         "lazy_index_records": bool(getattr(module, "lazy_index_records", False)),
         "dataset_filter": list(getattr(module, "dataset_filter", ())),
+        "val_dataset_filter": list(getattr(module, "val_dataset_filter", ())),
         "train_augmentation": bool(getattr(module, "train_augmentation", True)),
         "bbox_rescale_factor": float(getattr(module, "bbox_rescale_factor", 2.0)),
         "bbox_source_policy": str(getattr(module, "bbox_source_policy", "any")),
@@ -2409,16 +3880,119 @@ def _compact_checkpoint_payload(module, epoch, global_step, reason, monitor=None
             "pool_valid_tokens": int(getattr(module, "pool_valid_tokens", 192)),
             "decoder_input_dim": int(getattr(module, "decoder_input_dim", 6144)),
             "pool_output_channels": int(getattr(module, "pool_output_channels", 32)),
+            "decoder_hidden_dim": int(getattr(module, "decoder_hidden_dim", 512)),
             "decoder_dropout_scale": float(getattr(module, "decoder_dropout_scale", 1.0)),
+            "local_anchor_count": int(getattr(module, "local_anchor_count", 512)),
+            "local_anchor_neighbors": int(getattr(module, "local_anchor_neighbors", 4)),
+            "local_logit_delta_max": float(
+                getattr(module, "local_logit_delta_max", 6.0)
+            ),
+            "local_residual_dropout": float(
+                getattr(module, "local_residual_dropout", 0.10)
+            ),
+            "freeze_local_residual_base": bool(
+                getattr(module, "freeze_local_residual_base", True)
+            ),
+            "support_selector_mode": str(
+                getattr(module, "support_selector_mode", "contact")
+            ),
+            "support_selector_thresholds": list(
+                getattr(module, "support_selector_thresholds", (0.10,))
+            ),
+            "support_selector_no_contact_max": float(
+                getattr(module, "support_selector_no_contact_max", 0.02)
+            ),
+            "support_selector_contact_min": float(
+                getattr(module, "support_selector_contact_min", 0.10)
+            ),
+            "support_selector_dropout": float(
+                getattr(module, "support_selector_dropout", 0.10)
+            ),
+            "support_selector_monotonicity_weight": float(
+                getattr(module, "support_selector_monotonicity_weight", 0.10)
+            ),
+            "support_selector_architecture": str(
+                getattr(module, "support_selector_architecture", "linear")
+            ),
+            "support_selector_feature_source": str(
+                getattr(module, "support_selector_feature_source", "fullgrid32")
+            ),
+            "support_selector_neck_channels": int(
+                getattr(module, "support_selector_neck_channels", 64)
+            ),
+            "support_selector_hidden_dim": int(
+                getattr(module, "support_selector_hidden_dim", 512)
+            ),
+            "support_selector_base_conditioning": str(
+                getattr(module, "support_selector_base_conditioning", "real")
+            ),
+            "support_selector_correction_min_precision": float(
+                getattr(
+                    module,
+                    "support_selector_correction_min_precision",
+                    SELECTOR_CORRECTION_MIN_PRECISION,
+                )
+            ),
+            "support_selector_calibration": json.loads(
+                json.dumps(getattr(module, "support_selector_calibration", {}))
+            ),
+            "surface_basis_path": str(
+                getattr(module, "surface_basis_path", "") or ""
+            ),
+            "surface_basis_artifact_sha256": str(
+                getattr(module, "surface_basis_artifact_sha256", "") or ""
+            ),
+            "surface_basis_tensor_sha256": str(
+                getattr(module, "surface_basis_tensor_sha256", "") or ""
+            ),
+            "surface_sparse_basis_sha256": str(
+                getattr(module, "surface_sparse_basis_sha256", "") or ""
+            ),
+            "surface_valid_vertex_count": int(
+                getattr(module, "surface_valid_vertex_count", 0)
+            ),
+            "surface_maximum_support_count": int(
+                getattr(module, "surface_maximum_support_count", 0)
+            ),
+            "surface_coefficient_dim": int(
+                getattr(module, "surface_coefficient_dim", 4096)
+            ),
+            "surface_coefficient_architecture": str(
+                getattr(module, "surface_coefficient_architecture", "linear")
+            ),
+            "surface_coefficient_hidden_dim": int(
+                getattr(module, "surface_coefficient_hidden_dim", 1024)
+            ),
+            "surface_target_support_count": int(
+                getattr(module, "surface_target_support_count", 4)
+            ),
+            "surface_background_probability": float(
+                getattr(module, "surface_background_probability", 1e-3)
+            ),
+            "freeze_surface_feature_extractor": bool(
+                getattr(module, "freeze_surface_feature_extractor", True)
+            ),
+            "init_tactile_checkpoint": str(
+                getattr(module, "init_tactile_checkpoint", "") or ""
+            ),
+            "init_tactile_checkpoint_sha256": str(
+                getattr(module, "init_tactile_checkpoint_sha256", "") or ""
+            ),
             "accumulate_grad_batches": int(
                 getattr(module, "accumulate_grad_batches_config", 1)
             ),
             "index_schema_version": int(getattr(module, "index_schema_version", INDEX_CACHE_VERSION)),
             "index_cache_key": str(getattr(module, "index_cache_key", "")),
             "indexed_sample_count": int(getattr(module, "indexed_sample_count", 0)),
+            "val_indexed_sample_count": int(
+                getattr(module, "val_indexed_sample_count", 0)
+            ),
             "index_manifest_sha256": str(getattr(module, "index_manifest_sha256", "")),
             "data_backend": str(getattr(module, "data_backend", "legacy_dirs")),
             "query_manifest_sha256": dict(getattr(module, "query_manifest_sha256", {})),
+            "val_query_manifest_sha256": dict(
+                getattr(module, "val_query_manifest_sha256", {})
+            ),
             "hdf5_schema_version": str(getattr(module, "hdf5_schema_version", "")),
             "hdf5_handle_cache_size": int(getattr(module, "hdf5_handle_cache_size", 4)),
             "hdf5_manifest_cache_dir": str(
@@ -2430,6 +4004,9 @@ def _compact_checkpoint_payload(module, epoch, global_step, reason, monitor=None
             "bbox_manifest_sha256": dict(getattr(module, "bbox_manifest_sha256", {})),
             "lazy_index_records": bool(getattr(module, "lazy_index_records", False)),
             "dataset_filter": list(getattr(module, "dataset_filter", ())),
+            "val_dataset_filter": list(
+                getattr(module, "val_dataset_filter", ())
+            ),
             "train_augmentation": bool(getattr(module, "train_augmentation", True)),
             "bbox_rescale_factor": float(getattr(module, "bbox_rescale_factor", 2.0)),
             "bbox_source_policy": str(getattr(module, "bbox_source_policy", "any")),
@@ -2865,6 +4442,130 @@ def main():
         raise ValueError("--wandb_sync_interval must be at least 1")
     if int(args.pool_output_channels) < 1:
         raise ValueError("--pool_output_channels must be positive")
+    if int(args.decoder_hidden_dim) < 1:
+        raise ValueError("--decoder_hidden_dim must be positive")
+    if int(args.local_anchor_count) < 1:
+        raise ValueError("--local_anchor_count must be positive")
+    if not 1 <= int(args.local_anchor_neighbors) <= int(args.local_anchor_count):
+        raise ValueError(
+            "--local_anchor_neighbors must lie in [1, --local_anchor_count]"
+        )
+    if float(args.local_logit_delta_max) <= 0.0:
+        raise ValueError("--local_logit_delta_max must be positive")
+    if not 0.0 <= float(args.local_residual_dropout) <= 1.0:
+        raise ValueError("--local_residual_dropout must lie in [0, 1]")
+    if not 0.0 <= float(args.support_selector_dropout) <= 1.0:
+        raise ValueError("--support_selector_dropout must lie in [0, 1]")
+    if float(args.support_selector_monotonicity_weight) < 0.0:
+        raise ValueError(
+            "--support_selector_monotonicity_weight must be nonnegative"
+        )
+    if int(args.support_selector_neck_channels) < 1:
+        raise ValueError("--support_selector_neck_channels must be positive")
+    if int(args.support_selector_hidden_dim) < 1:
+        raise ValueError("--support_selector_hidden_dim must be positive")
+    if args.support_selector_architecture == "linear":
+        if args.support_selector_feature_source != "fullgrid32":
+            raise ValueError(
+                "--support_selector_architecture linear requires "
+                "--support_selector_feature_source fullgrid32"
+            )
+    elif args.support_selector_feature_source not in {"rezero_grid", "raw_dino"}:
+        raise ValueError(
+            "--support_selector_architecture spatial_mlp requires "
+            "--support_selector_feature_source rezero_grid or raw_dino"
+        )
+    if args.support_selector_mode == "down_error" and (
+        args.support_selector_architecture != "spatial_mlp"
+        or args.support_selector_feature_source != "rezero_grid"
+    ):
+        raise ValueError(
+            "--support_selector_mode down_error requires spatial_mlp with "
+            "support_selector_feature_source=rezero_grid"
+        )
+    if (
+        args.support_selector_mode != "down_error"
+        and args.support_selector_base_conditioning != "real"
+    ):
+        raise ValueError(
+            "--support_selector_base_conditioning=constant_control is only "
+            "valid with --support_selector_mode=down_error"
+        )
+    if not 0.0 < float(args.support_selector_correction_min_precision) <= 1.0:
+        raise ValueError(
+            "--support_selector_correction_min_precision must lie in (0, 1]"
+        )
+    args.support_selector_thresholds = tuple(
+        float(value) for value in _split_csv(args.support_selector_thresholds)
+    )
+    if not args.support_selector_thresholds:
+        raise ValueError("--support_selector_thresholds cannot be empty")
+    if args.support_selector_mode == "ordinal" and not any(
+        math.isclose(
+            value,
+            float(args.support_selector_contact_min),
+            rel_tol=0.0,
+            abs_tol=1e-8,
+        )
+        for value in args.support_selector_thresholds
+    ):
+        raise ValueError(
+            "Ordinal --support_selector_thresholds must contain "
+            "--support_selector_contact_min"
+        )
+    if args.init_tactile_checkpoint:
+        args.init_tactile_checkpoint = str(
+            Path(args.init_tactile_checkpoint).expanduser().resolve(strict=False)
+        )
+    if args.surface_basis_path:
+        args.surface_basis_path = str(
+            Path(args.surface_basis_path).expanduser().resolve(strict=False)
+        )
+    if args.tactile_head_type in {
+        "dense_v2_dino_local_residual",
+        "dense_v2_dino_support_selector",
+        "dense_v2_dino_surface_basis",
+    }:
+        if args.pool_layout != "fullgrid32":
+            raise ValueError("Extension heads require --pool_layout fullgrid32")
+        requires_initialized_base = (
+            args.tactile_head_type != "dense_v2_dino_surface_basis"
+            or bool(args.freeze_surface_feature_extractor)
+        )
+        if (
+            requires_initialized_base
+            and not args.init_tactile_checkpoint
+            and not args.resume_from_checkpoint
+        ):
+            raise ValueError(
+                "The frozen extension head requires --init_tactile_checkpoint "
+                "unless an exact --resume_from_checkpoint is supplied"
+            )
+    if args.tactile_head_type == "dense_v2_dino_surface_basis":
+        if int(args.surface_coefficient_dim) not in {4096, 5120}:
+            raise ValueError(
+                "Stage 1 --surface_coefficient_dim must be 4096 or 5120"
+            )
+        if int(args.surface_target_support_count) != 4:
+            raise ValueError(
+                "Stage 1 --surface_target_support_count must remain 4"
+            )
+        if int(args.surface_coefficient_hidden_dim) <= 0:
+            raise ValueError(
+                "--surface_coefficient_hidden_dim must be positive"
+            )
+        if not 0.0 < float(args.surface_background_probability) < 0.5:
+            raise ValueError(
+                "--surface_background_probability must lie in (0, 0.5)"
+            )
+        if not args.surface_basis_path:
+            raise ValueError(
+                "The surface-basis head requires --surface_basis_path"
+            )
+        if not Path(args.surface_basis_path).is_file():
+            raise FileNotFoundError(
+                f"Surface basis artifact not found: {args.surface_basis_path}"
+            )
     if args.index_manifest:
         args.index_manifest = str(Path(args.index_manifest).expanduser().resolve(strict=False))
     if args.query_manifests:
@@ -2872,6 +4573,13 @@ def main():
             str(Path(path).expanduser().resolve(strict=False))
             for path in _split_csv(args.query_manifests)
         )
+    if args.val_query_manifests:
+        args.val_query_manifests = ",".join(
+            str(Path(path).expanduser().resolve(strict=False))
+            for path in _split_csv(args.val_query_manifests)
+        )
+    else:
+        args.val_query_manifests = args.query_manifests
     if args.hdf5_manifest_cache_dir:
         args.hdf5_manifest_cache_dir = str(
             Path(args.hdf5_manifest_cache_dir).expanduser().resolve(strict=False)
@@ -2879,6 +4587,11 @@ def main():
     if int(args.hdf5_handle_cache_size) < 1:
         raise ValueError("--hdf5_handle_cache_size must be at least 1")
     args.expected_datasets = list(canonical_dataset_filter(args.expected_datasets))
+    args.val_expected_datasets = list(
+        canonical_dataset_filter(args.val_expected_datasets)
+    )
+    if not args.val_expected_datasets:
+        args.val_expected_datasets = list(args.expected_datasets)
     if not args.dino_weights:
         raise ValueError("--dino_weights is required")
     args.dino_weights = str(Path(args.dino_weights).expanduser().resolve(strict=False))
@@ -2904,9 +4617,8 @@ def main():
     
     from hamer.configs import get_config
     
-    # We can use the original model_config.yaml from hamer
-    model_cfg_path = os.path.join(workspace_dir, 'hamer/_DATA/hamer_ckpts/model_config.yaml')
-    model_cfg = get_config(model_cfg_path, update_cachedir=True)
+    model_cfg_path = resolve_hamer_model_config_path(workspace_dir)
+    model_cfg = get_config(str(model_cfg_path), update_cachedir=True)
     
     model_cfg.defrost()
     model_cfg.MODEL.IMAGE_SIZE = int(args.input_resolution[0])
@@ -2963,7 +4675,7 @@ def main():
             index_backend=args.index_backend,
             index_process_worker_cap=args.index_process_worker_cap,
             index_manifest=args.index_manifest,
-            expected_datasets=args.expected_datasets,
+            expected_datasets=args.val_expected_datasets,
             index_cache_dir=args.index_cache_dir,
             rebuild_index=args.rebuild_index,
             index_cache_timeout=args.index_cache_timeout,
@@ -2975,10 +4687,13 @@ def main():
             lazy_index_records=args.lazy_index_records,
             augmentation_enabled=False,
             data_backend=args.data_backend,
-            query_manifests=args.query_manifests,
+            query_manifests=args.val_query_manifests,
             hdf5_handle_cache_size=args.hdf5_handle_cache_size,
             hdf5_manifest_cache_dir=args.hdf5_manifest_cache_dir,
         )
+    val_index_metadata = (
+        val_dataset.index_cache_metadata() if val_dataset is not None else {}
+    )
 
     print("Initializing standalone DINO tactile model...")
     tactile_loss_config = tactile_loss_config_from_args(args)
@@ -3005,6 +4720,42 @@ def main():
         decoder_dropout_scale=args.decoder_dropout_scale,
         input_resolution=args.input_resolution,
         pool_output_channels=args.pool_output_channels,
+        decoder_hidden_dim=args.decoder_hidden_dim,
+        local_anchor_count=args.local_anchor_count,
+        local_anchor_neighbors=args.local_anchor_neighbors,
+        local_logit_delta_max=args.local_logit_delta_max,
+        local_residual_dropout=args.local_residual_dropout,
+        freeze_local_residual_base=args.freeze_local_residual_base,
+        support_selector_mode=args.support_selector_mode,
+        support_selector_thresholds=args.support_selector_thresholds,
+        support_selector_no_contact_max=args.support_selector_no_contact_max,
+        support_selector_contact_min=args.support_selector_contact_min,
+        support_selector_dropout=args.support_selector_dropout,
+        support_selector_monotonicity_weight=(
+            args.support_selector_monotonicity_weight
+        ),
+        support_selector_architecture=args.support_selector_architecture,
+        support_selector_feature_source=args.support_selector_feature_source,
+        support_selector_neck_channels=args.support_selector_neck_channels,
+        support_selector_hidden_dim=args.support_selector_hidden_dim,
+        support_selector_base_conditioning=(
+            args.support_selector_base_conditioning
+        ),
+        surface_basis_path=args.surface_basis_path,
+        surface_coefficient_dim=args.surface_coefficient_dim,
+        surface_coefficient_architecture=(
+            args.surface_coefficient_architecture
+        ),
+        surface_coefficient_hidden_dim=args.surface_coefficient_hidden_dim,
+        surface_target_support_count=args.surface_target_support_count,
+        surface_background_probability=args.surface_background_probability,
+        freeze_surface_feature_extractor=(
+            args.freeze_surface_feature_extractor
+        ),
+        support_selector_correction_min_precision=(
+            args.support_selector_correction_min_precision
+        ),
+        init_tactile_checkpoint=args.init_tactile_checkpoint,
         optimizer_weight_decay=args.optimizer_weight_decay,
         lr_scheduler=args.lr_scheduler,
         lr_decay_milestones=args.lr_decay_milestones,
@@ -3014,6 +4765,12 @@ def main():
     model.backbone_weights_path = args.dino_weights
     print(f"Computing backbone SHA256: {model.backbone_weights_path}")
     model.backbone_weights_sha256 = file_sha256(model.backbone_weights_path)
+    if args.init_tactile_checkpoint:
+        if not Path(args.init_tactile_checkpoint).is_file():
+            raise FileNotFoundError(
+                f"Initial tactile checkpoint not found: {args.init_tactile_checkpoint}"
+            )
+        load_local_residual_base_checkpoint(model, args.init_tactile_checkpoint)
     model.accumulate_grad_batches_config = int(args.accumulate_grad_batches)
     model.batch_size_config = int(args.batch_size)
     model.index_schema_version = int(index_metadata["index_schema_version"])
@@ -3023,6 +4780,9 @@ def main():
     model.index_manifest_sha256 = str(index_metadata.get("index_manifest_sha256", ""))
     model.data_backend = str(index_metadata.get("data_backend", args.data_backend))
     model.query_manifest_sha256 = dict(index_metadata.get("query_manifest_sha256", {}))
+    model.val_query_manifest_sha256 = dict(
+        val_index_metadata.get("query_manifest_sha256", {})
+    )
     storage_schema_version = index_metadata.get("storage_schema_version", "")
     if isinstance(storage_schema_version, (list, tuple)):
         storage_schema_version = ",".join(str(value) for value in storage_schema_version)
@@ -3035,6 +4795,12 @@ def main():
     model.bbox_manifest_sha256 = dict(index_metadata.get("bbox_manifest_sha256", {}))
     model.lazy_index_records = bool(index_metadata.get("lazy_index_records", False))
     model.dataset_filter = tuple(index_metadata.get("dataset_filter", ()))
+    model.val_dataset_filter = tuple(
+        val_index_metadata.get("dataset_filter", ())
+    )
+    model.val_indexed_sample_count = int(
+        val_index_metadata.get("indexed_sample_count", 0)
+    )
     model.train_augmentation = bool(args.train_augmentation)
     # Validate the complete feature/head shape before allocating DataLoader workers.
     dummy_input = torch.zeros(1, 3, *args.input_resolution)
@@ -3181,6 +4947,22 @@ def main():
                 dirpath=ckpt_dir,
                 filename="best_contact",
                 monitor="val/touchanything/touchanything_protocol_contact_iou",
+                mode="max",
+            )
+        if model.tactile_head_type == "dense_v2_dino_support_selector":
+            selector_monitor = (
+                "val/selector_down_error_calibrated_coverage"
+                if model.support_selector_mode == "down_error"
+                else "val/selector_calibrated_clear_iou"
+            )
+            print(
+                "Selector checkpoint monitor: "
+                f"{selector_monitor} (max)"
+            )
+            checkpoint_callbacks["selector-best"] = CompactBestCheckpoint(
+                dirpath=ckpt_dir,
+                filename="best_selector",
+                monitor=selector_monitor,
                 mode="max",
             )
     lr_monitor = LearningRateMonitor(logging_interval="step")

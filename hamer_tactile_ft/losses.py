@@ -237,11 +237,22 @@ def pressure_weight_like(target: torch.Tensor, config: TactileLossConfig, ramp: 
     return 1.0 + float(ramp) * additive
 
 
-def global_conditional_mean(local_sum: torch.Tensor, local_count: torch.Tensor) -> torch.Tensor:
-    """Return a DDP-gradient-correct mean over a distributed conditional mask."""
+def global_conditional_mean(
+    local_sum: torch.Tensor,
+    local_count: torch.Tensor,
+    *,
+    distributed_reduce: bool = True,
+) -> torch.Tensor:
+    """Return a gradient-correct conditional mean.
+
+    Training uses a global eligible count so that DDP ranks contribute to one
+    common mean. Offline audits may disable that collective and merge their
+    numerators/counts after processing; this is required when rank-local
+    validity masks cause ranks to evaluate different candidates.
+    """
     global_count = local_count.detach().to(device=local_sum.device, dtype=torch.float32).clone()
     world_size = 1
-    if dist.is_available() and dist.is_initialized():
+    if distributed_reduce and dist.is_available() and dist.is_initialized():
         dist.all_reduce(global_count, op=dist.ReduceOp.SUM)
         world_size = dist.get_world_size()
     return local_sum * float(world_size) / global_count.clamp_min(1.0)
@@ -339,6 +350,7 @@ def compute_tactile_loss(
     current_epoch: Optional[int] = None,
     sample_weight: Optional[torch.Tensor] = None,
     ramp_override: Optional[float] = None,
+    distributed_reduce: bool = True,
 ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     config = config or TactileLossConfig()
     ramp = loss_ramp(config, current_epoch) if ramp_override is None else float(ramp_override)
@@ -423,7 +435,11 @@ def compute_tactile_loss(
             torch.zeros_like(location_union),
         )
         location_sum = (1.0 - location_viou).masked_fill(~location_eligible, 0.0).sum()
-        location_loss_raw = global_conditional_mean(location_sum, location_count_local)
+        location_loss_raw = global_conditional_mean(
+            location_sum,
+            location_count_local,
+            distributed_reduce=distributed_reduce,
+        )
         location_loss_weighted = location_loss_raw * (ramp * config.location_loss_weight)
         total = total + location_loss_weighted
     else:
@@ -438,7 +454,11 @@ def compute_tactile_loss(
             mask,
             config,
         )
-        contact_loss_raw = global_conditional_mean(contact_sum, contact_count_local)
+        contact_loss_raw = global_conditional_mean(
+            contact_sum,
+            contact_count_local,
+            distributed_reduce=distributed_reduce,
+        )
         contact_loss_weighted = contact_loss_raw * (ramp * config.contact_loss_weight)
         total = total + contact_loss_weighted
     else:

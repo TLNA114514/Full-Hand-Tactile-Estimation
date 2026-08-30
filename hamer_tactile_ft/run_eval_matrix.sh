@@ -14,7 +14,7 @@ WORKSPACE_DIR="$(dirname "$SCRIPT_DIR")"
 #     loss-best contact-best
 
 if (( $# == 0 )); then
-    echo "Usage: $0 EXP_NAME [loss-best|contact-best|last ...]" >&2
+    echo "Usage: $0 EXP_NAME [loss-best|contact-best|selector-best|last ...]" >&2
     exit 2
 fi
 EXP_NAME="$1"
@@ -53,10 +53,11 @@ BBOX_MANIFESTS="${BBOX_MANIFESTS:-}"
 SAVE_DIAGNOSTICS="${SAVE_DIAGNOSTICS:-1}"
 RUN_SEQUENCE_AUDIT="${RUN_SEQUENCE_AUDIT:-0}"
 REBUILD_INDEX="${REBUILD_INDEX:-0}"
+SELECTOR_CALIBRATION_FIT="${SELECTOR_CALIBRATION_FIT:-0}"
 PROCESS_GRACE_SECONDS="${PROCESS_GRACE_SECONDS:-30}"
 PROCESS_KILL_WAIT_SECONDS="${PROCESS_KILL_WAIT_SECONDS:-5}"
 
-for flag_name in SAVE_DIAGNOSTICS RUN_SEQUENCE_AUDIT REBUILD_INDEX; do
+for flag_name in SAVE_DIAGNOSTICS RUN_SEQUENCE_AUDIT REBUILD_INDEX SELECTOR_CALIBRATION_FIT; do
     flag_value="${!flag_name}"
     if [[ "$flag_value" != "0" && "$flag_value" != "1" ]]; then
         echo "$flag_name must be 0 or 1 (got '$flag_value')." >&2
@@ -76,6 +77,7 @@ safe_name() {
 
 SAFE_EXP_NAME="$(safe_name "$EXP_NAME")"
 OUTPUT_ROOT="${OUTPUT_ROOT:-$SCRIPT_DIR/eval_reports_${SAFE_EXP_NAME}}"
+SELECTOR_CALIBRATION_ROOT="${SELECTOR_CALIBRATION_ROOT:-$OUTPUT_ROOT}"
 LOG_DIR="$OUTPUT_ROOT/logs"
 mkdir -p "$LOG_DIR"
 
@@ -111,13 +113,15 @@ echo "Save diagnostics: $SAVE_DIAGNOSTICS"
 echo "Run sequence audit: $RUN_SEQUENCE_AUDIT"
 echo "Rebuild index: $REBUILD_INDEX"
 echo "Output root: $OUTPUT_ROOT"
+echo "Selector calibration mode: $([[ "$SELECTOR_CALIBRATION_FIT" == "1" ]] && echo fit-validation || echo apply-if-available)"
+echo "Selector calibration root: $SELECTOR_CALIBRATION_ROOT"
 echo
 
 for ckpt in "${CKPT_SELECTORS[@]}"; do
     case "$ckpt" in
-        loss-best|contact-best|last) ;;
+        loss-best|contact-best|selector-best|last) ;;
         *)
-            echo "Invalid checkpoint selector '$ckpt'. Use loss-best, contact-best, or last." >&2
+            echo "Invalid checkpoint selector '$ckpt'. Use loss-best, contact-best, selector-best, or last." >&2
             exit 2
             ;;
     esac
@@ -146,6 +150,17 @@ for ckpt in "${CKPT_SELECTORS[@]}"; do
             --report_dir "$task_dir"
             --eval_output_root "$OUTPUT_ROOT"
         )
+        calibration_path="$SELECTOR_CALIBRATION_ROOT/$ckpt/support_selector_calibration.json"
+        if [[ "$SELECTOR_CALIBRATION_FIT" == "1" ]]; then
+            if [[ "$split" != "val" && "$split" != "validation" ]]; then
+                echo "SELECTOR_CALIBRATION_FIT=1 only accepts val/validation tasks (got '$task')." >&2
+                exit 2
+            fi
+            mkdir -p "$(dirname "$calibration_path")"
+            command+=(--selector_calibration_output "$calibration_path")
+        elif [[ -f "$calibration_path" ]]; then
+            command+=(--selector_calibration_input "$calibration_path")
+        fi
         if [[ "$REBUILD_INDEX" == "1" ]]; then
             command+=(--rebuild_index)
         else

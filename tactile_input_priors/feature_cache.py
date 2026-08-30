@@ -38,9 +38,14 @@ ALLOWED_FEATURE_FIELDS = (
     "z_rgb",
     "h_rgb",
     "base_logits",
+    "palm_base_logits",
+    "contact_neck",
+    "contact_anchor_logits",
+    "contact_logits",
     "depth_grid",
     "vlm_embedding",
     "tactile_signal",
+    "palm_tactile_signal",
     "palm_mask",
     "has_tactile",
 )
@@ -348,11 +353,14 @@ class CacheBuildLock:
                     continue
                 if time.monotonic() >= deadline:
                     owner = self.path / "owner.json"
-                    detail = owner.read_text(encoding="utf-8") if owner.is_file() else "unknown"
+                    try:
+                        detail = owner.read_text(encoding="utf-8")
+                    except OSError:
+                        detail = "unknown (lock changed while reporting timeout)"
                     raise FeatureCacheError(
                         f"Timed out waiting for feature-cache build lock {self.path}; "
                         f"owner={detail.strip()}"
-                    )
+                    ) from None
                 time.sleep(self.poll_seconds)
                 continue
             owner = {
@@ -710,7 +718,12 @@ class FeatureCacheBuilder:
             connection.execute(
                 "CREATE TABLE samples ("
                 "sample_id TEXT PRIMARY KEY, ordinal INTEGER NOT NULL UNIQUE, "
-                "shard INTEGER NOT NULL, row_in_shard INTEGER NOT NULL"
+                "shard INTEGER NOT NULL, row_in_shard INTEGER NOT NULL, "
+                "sample_ref TEXT NOT NULL, dataset TEXT NOT NULL, "
+                "sequence_key TEXT NOT NULL, query_alias TEXT NOT NULL, "
+                "frame_idx INTEGER NOT NULL, source_frame_idx INTEGER, "
+                "timestamp REAL, is_right INTEGER NOT NULL, bbox_xyxy TEXT NOT NULL, "
+                "bbox_association_id TEXT NOT NULL"
                 ") WITHOUT ROWID"
             )
             batch = []
@@ -720,21 +733,44 @@ class FeatureCacheBuilder:
                     self.cache_dir / "shards" / _shard_name(shard_index) / "samples.jsonl"
                 )
                 for _, row in iter_jsonl(samples_path):
+                    metadata = row.get("metadata")
+                    metadata = metadata if isinstance(metadata, Mapping) else {}
                     batch.append(
                         (
                             _sample_id(row.get("sample_id"), location=str(samples_path)),
                             int(row["source_index"]),
                             shard_index,
                             int(row["source_index"]) - int(entry["source_start"]),
+                            str(metadata.get("sample_ref", "")),
+                            str(metadata.get("dataset", "")),
+                            str(metadata.get("sequence_key", "")),
+                            str(metadata.get("query_alias", "query")),
+                            int(metadata.get("frame_idx", 0)),
+                            (
+                                None
+                                if metadata.get("source_frame_idx") is None
+                                else int(metadata["source_frame_idx"])
+                            ),
+                            (
+                                None
+                                if metadata.get("timestamp") is None
+                                else float(metadata["timestamp"])
+                            ),
+                            int(metadata.get("is_right", 0)),
+                            canonical_json(metadata.get("bbox_xyxy", ())),
+                            str(metadata.get("bbox_association_id", "")),
                         )
                     )
                     if len(batch) >= 8192:
                         connection.executemany(
-                            "INSERT INTO samples VALUES (?, ?, ?, ?)", batch
+                            "INSERT INTO samples VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            batch,
                         )
                         batch.clear()
             if batch:
-                connection.executemany("INSERT INTO samples VALUES (?, ?, ?, ?)", batch)
+                connection.executemany(
+                    "INSERT INTO samples VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", batch
+                )
             count = connection.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
             if count != self.source.sample_count:
                 raise FeatureCacheError(
@@ -953,8 +989,12 @@ class FeatureCacheDataset:
         self.sample_index_path = sample_index
         self.max_open_shards = max(1, int(max_open_shards))
         self.copy_arrays = bool(copy_arrays)
-        self._open_shards: OrderedDict[int, tuple[dict[str, np.ndarray], list[dict[str, Any]]]] = OrderedDict()
+        self._open_shards: OrderedDict[
+            int, tuple[dict[str, np.ndarray], list[dict[str, Any]] | None]
+        ] = OrderedDict()
         self._index_connection: sqlite3.Connection | None = None
+        self._index_has_metadata_cache: bool | None = None
+        self._index_has_temporal_metadata_cache: bool | None = None
         for entry in self.shards:
             shard_index = int(entry["shard_index"])
             done_path = (
@@ -989,6 +1029,82 @@ class FeatureCacheDataset:
             self._index_connection = sqlite3.connect(uri, uri=True, check_same_thread=False)
         return self._index_connection
 
+    def _index_has_metadata(self) -> bool:
+        if self._index_has_metadata_cache is None:
+            columns = {
+                str(row[1])
+                for row in self._connection().execute("PRAGMA table_info(samples)")
+            }
+            self._index_has_metadata_cache = {
+                "sample_ref",
+                "dataset",
+                "sequence_key",
+                "query_alias",
+                "frame_idx",
+            }.issubset(columns)
+        return self._index_has_metadata_cache
+
+    def _metadata_at(self, ordinal: int) -> dict[str, Any]:
+        if self._index_has_temporal_metadata_cache is None:
+            columns = {
+                str(row[1])
+                for row in self._connection().execute("PRAGMA table_info(samples)")
+            }
+            self._index_has_temporal_metadata_cache = "source_frame_idx" in columns
+        extended = self._index_has_temporal_metadata_cache
+        select = (
+            "sample_id, sample_ref, dataset, sequence_key, query_alias, frame_idx, "
+            "source_frame_idx, timestamp, is_right, bbox_xyxy, bbox_association_id"
+            if extended
+            else "sample_id, sample_ref, dataset, sequence_key, query_alias, frame_idx"
+        )
+        row = self._connection().execute(
+            f"SELECT {select} FROM samples WHERE ordinal = ?", (int(ordinal),)
+        ).fetchone()
+        if row is None:
+            raise IndexError(ordinal)
+        metadata = {
+            "sample_ref": str(row[1]),
+            "dataset": str(row[2]),
+            "sequence_key": str(row[3]),
+            "query_alias": str(row[4]),
+            "frame_idx": int(row[5]),
+        }
+        if extended:
+            metadata.update(
+                {
+                    "source_frame_idx": None if row[6] is None else int(row[6]),
+                    "timestamp": None if row[7] is None else float(row[7]),
+                    "is_right": int(row[8]),
+                    "bbox_xyxy": json.loads(str(row[9])),
+                    "bbox_association_id": str(row[10]),
+                }
+            )
+        return {
+            "sample_id": str(row[0]),
+            "metadata": metadata,
+        }
+
+    def field_values(
+        self, index: int, fields: Sequence[str] | None = None
+    ) -> dict[str, np.ndarray]:
+        """Read arrays without paying for a per-sample SQLite metadata query."""
+
+        ordinal = int(index)
+        if ordinal < 0:
+            ordinal += self.sample_count
+        if ordinal < 0 or ordinal >= self.sample_count:
+            raise IndexError(index)
+        shard_index = bisect.bisect_right(self.shard_stops, ordinal)
+        entry = self.shards[shard_index]
+        row_in_shard = ordinal - int(entry["source_start"])
+        arrays, _ = self._load_shard(shard_index)
+        requested = self.fields if fields is None else tuple(fields)
+        unknown = sorted(set(requested) - set(arrays))
+        if unknown:
+            raise KeyError(f"Cache fields are unavailable: {unknown}")
+        return {name: arrays[name][row_in_shard] for name in requested}
+
     def location(self, sample_id: str) -> tuple[int, int, int]:
         sample_id = _sample_id(sample_id, location="sample_id lookup")
         row = self._connection().execute(
@@ -999,7 +1115,9 @@ class FeatureCacheDataset:
             raise KeyError(sample_id)
         return int(row[0]), int(row[1]), int(row[2])
 
-    def _load_shard(self, shard_index: int) -> tuple[dict[str, np.ndarray], list[dict[str, Any]]]:
+    def _load_shard(
+        self, shard_index: int
+    ) -> tuple[dict[str, np.ndarray], list[dict[str, Any]] | None]:
         cached = self._open_shards.pop(shard_index, None)
         if cached is not None:
             self._open_shards[shard_index] = cached
@@ -1009,13 +1127,15 @@ class FeatureCacheDataset:
             name: np.load(shard_dir / f"{name}.npy", mmap_mode="r", allow_pickle=False)
             for name in self.fields
         }
-        sample_rows = []
-        for _, row in iter_jsonl(shard_dir / "samples.jsonl"):
-            row = dict(row)
-            row["sample_id"] = _sample_id(
-                row.get("sample_id"), location=str(shard_dir / "samples.jsonl")
-            )
-            sample_rows.append(row)
+        sample_rows = None
+        if not self._index_has_metadata():
+            sample_rows = []
+            for _, row in iter_jsonl(shard_dir / "samples.jsonl"):
+                row = dict(row)
+                row["sample_id"] = _sample_id(
+                    row.get("sample_id"), location=str(shard_dir / "samples.jsonl")
+                )
+                sample_rows.append(row)
         cached = (arrays, sample_rows)
         self._open_shards[shard_index] = cached
         while len(self._open_shards) > self.max_open_shards:
@@ -1024,11 +1144,14 @@ class FeatureCacheDataset:
 
     def _item_at(self, ordinal: int, shard_index: int, row_in_shard: int) -> dict[str, Any]:
         arrays, sample_rows = self._load_shard(shard_index)
-        if row_in_shard < 0 or row_in_shard >= len(sample_rows):
+        if row_in_shard < 0 or row_in_shard >= int(self.shards[shard_index]["sample_count"]):
             raise IndexError(
-                f"Invalid row {row_in_shard} for shard {shard_index} ({len(sample_rows)} rows)"
+                f"Invalid row {row_in_shard} for shard {shard_index}"
             )
-        sample_row = sample_rows[row_in_shard]
+        if sample_rows is None:
+            sample_row = self._metadata_at(ordinal)
+        else:
+            sample_row = sample_rows[row_in_shard]
         result: dict[str, Any] = {
             "sample_id": sample_row["sample_id"],
             "ordinal": ordinal,
@@ -1077,6 +1200,8 @@ class FeatureCacheDataset:
         state = dict(self.__dict__)
         state["_open_shards"] = OrderedDict()
         state["_index_connection"] = None
+        state["_index_has_metadata_cache"] = None
+        state["_index_has_temporal_metadata_cache"] = None
         return state
 
     def __del__(self) -> None:

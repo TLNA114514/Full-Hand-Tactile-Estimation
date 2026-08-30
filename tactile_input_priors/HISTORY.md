@@ -1,5 +1,54 @@
 # Input-Prior Research History
 
+## 2026-08-26 Native Anchor And Mapping Oracle Audit
+
+The completed mapping-attribution V1 audit retained RBF4 as the strongest
+full-palm expansion. Across validation, seen, and unseen splits it produced
+generic down-action AP around 0.46-0.49, while strict false-high AP remained
+around 0.15-0.20. Euclidean nearest was close on strict ranking but worse on
+generic down ranking; geodesic nearest and the old zero-filled `anchor_only`
+control were weaker. No nonzero validation pressure policy became useful.
+
+V1 also showed that real history generally outranked frozen-RGB-bin-matched
+cross-sequence, contralateral, and reset controls. This supports a weak real
+temporal signal, but does not prove that its 512-anchor predictions survive the
+anchor-to-vertex expansion.
+
+The V2 audit addresses that ambiguity without retraining. It measures AP on
+the 512 native anchor locations, projects GT anchor labels through each mapping
+as an expansion diagnostic, and repeats real-versus-cross comparisons only on
+the exact RGB-bin matched subset. The output root is
+`mapping_attribution_v2`; V1 artifacts remain untouched.
+
+V2 showed that RBF4 is not the principal failure. With GT anchor labels, RBF4
+retains roughly `0.83-0.90` AP on the full palm. The learned selector reaches
+native down AP around `0.53-0.55`, but strict false-high AP only `0.16-0.21`;
+formal false-high is unstable. Exact RGB-bin matching leaves a consistent
+real-history strict AP advantage of about `0.019-0.035`, while formal
+false-high does not transfer.
+
+Mapping V3 adds the missing sequence-level uncertainty check. It stores compact
+per-sequence histograms rather than raw vertex scores, reports paired
+sequence-macro AP and equal-budget precision/recall intervals, and reuses the
+pressure-policy sufficient statistics for aligned-versus-cross sequence
+utility intervals. V3 writes a new `mapping_attribution_v3` root and leaves V1
+and V2 unchanged.
+
+## 2026-08-25 Temporal Selector Mapping Attribution
+
+The NoQ L1/L2 selector retained useful diagnostic down-action evidence, but
+its first bounded down-only pressure policy was negative: every validation
+utility selected exact RGB output. More aggressive policies reduced RMSE by
+broadly suppressing pressure and damaged contact localization.
+
+The next implemented audit freezes that selector and separates two possible
+causes. It compares RBF4, Euclidean-nearest, mesh-geodesic-nearest, and
+anchor-only mappings while measuring generic down-action, strict false-high,
+and formal false-high ranking independently. Its cross-sequence history is
+matched by the frozen RGB prediction, removing the previous GT-pressure-bin
+dependency. No model is trained and no pressure architecture is changed in
+this attribution step.
+
 ## Status
 
 The VLM V1-V6 probes and the first formal depth adapters are complete research
@@ -131,3 +180,38 @@ tactile_input_priors/make_probe_summary_ppt.py
 
 The generated VLM/depth result directories and
 `VLM_Depth_Probe_Summary_CN.pptx` remain available as immutable evidence.
+
+## Temporal Selector V2
+
+Frozen seen/unseen confirmation found a small transferable benefit from real
+L1/L2 history, while wrong histories could improve RMSE through broad pressure
+suppression and damage contact localization. The next temporal stage therefore
+does not alter pressure. It trains an independent anchor-level `down/hold/up`
+classifier and compares actual per-lag time/bbox quality against an otherwise
+identical no-quality control. Missing histories remain exact RGB evidence, and
+evaluation retains cross-sequence, contralateral, and reset controls.
+
+The quality/no-quality comparison subsequently showed that elapsed-time and
+bbox-quality channels did not improve real-history AP and slightly reduced
+macro F1. The no-quality selector is therefore retained. Its useful signal is
+concentrated in the `down` action, so the next audit maps anchor down scores
+back to palm vertices and selects a bounded sink policy on validation only.
+Test replay keeps upward correction disabled, falls back exactly to RGB when
+history is missing, and reports identical real/cross/contralateral/reset
+policies with sequence-clustered paired utility intervals.
+
+## Historical DINO Selector Evidence
+
+Mapping attribution V3 confirmed that the retained temporal selector contains
+weak action evidence but does not support a safe pressure policy. The next
+stage therefore remains pressure-inert. It caches the frozen FullGrid `z_rgb`,
+reconstructs query-crop affines from audited SAM3 boxes, aligns historical
+feature grids into current crop coordinates, and lets canonical anchor queries
+read current/history motion through one residual cross-attention layer.
+
+The residual gate starts at zero. Evaluation compares the trained alignment
+mode with the opposite alignment, fixed spatial shuffle, RGB-matched
+cross-sequence, contralateral, and reset controls. Strict false-high/clear
+ranking is reported both globally and with sequence-clustered paired
+intervals. Pressure remains exactly the frozen RGB output until this evidence
+passes its causal controls.

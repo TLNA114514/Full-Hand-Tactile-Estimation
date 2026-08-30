@@ -32,14 +32,19 @@ for _path in (REPO_ROOT, REPO_ROOT / "hamer_tactile_ft", REPO_ROOT / "hamer"):
 from hamer.configs import get_config  # noqa: E402
 from hamer_tactile_ft.dataset import OpenTouchTactileDataset  # noqa: E402
 from hamer_tactile_ft.hamer_tactile import DinoTactileModel  # noqa: E402
+from hamer_tactile_ft.hamer_config_assets import (  # noqa: E402
+    resolve_hamer_model_config_path,
+)
 from hamer_tactile_ft.losses import TactileLossConfig  # noqa: E402
 from hamer_tactile_ft.data.indexing import persistent_sha256_file  # noqa: E402
 
 from tactile_input_priors.feature_cache import FeatureCacheDataset  # noqa: E402
 from tactile_input_priors.prior_model import FrozenBasePriorModel  # noqa: E402
+from tactile_input_priors.selector_prior_model import PriorSelectorModel  # noqa: E402
 
 
 PRIOR_CHECKPOINT_FORMAT = "tactile_prior_adapter_v1"
+SELECTOR_PRIOR_CHECKPOINT_FORMAT = "tactile_prior_selector_v1"
 DATASET_ALIASES = {
     "opentouch": "OpenTouch",
     "ot": "OpenTouch",
@@ -131,10 +136,24 @@ def _checkpoint_model_config(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
         "pool_layout",
         "input_resolution",
         "pool_output_channels",
+        "decoder_hidden_dim",
         "decoder_dropout_scale",
         "bbox_rescale_factor",
         "bbox_source_policy",
         "dataset_filter",
+        "local_anchor_count",
+        "local_anchor_neighbors",
+        "support_selector_mode",
+        "support_selector_thresholds",
+        "support_selector_no_contact_max",
+        "support_selector_contact_min",
+        "support_selector_dropout",
+        "support_selector_monotonicity_weight",
+        "support_selector_architecture",
+        "support_selector_feature_source",
+        "support_selector_neck_channels",
+        "support_selector_hidden_dim",
+        "support_selector_base_conditioning",
     ):
         if key not in result and key in checkpoint:
             result[key] = checkpoint[key]
@@ -181,6 +200,39 @@ def build_frozen_base(
         decoder_dropout_scale=float(config.get("decoder_dropout_scale", 1.0)),
         input_resolution=parse_resolution(config.get("input_resolution", (256, 192))),
         pool_output_channels=int(config.get("pool_output_channels", 32)),
+        decoder_hidden_dim=int(config.get("decoder_hidden_dim", 512)),
+        local_anchor_count=int(config.get("local_anchor_count", 512)),
+        local_anchor_neighbors=int(config.get("local_anchor_neighbors", 4)),
+        support_selector_mode=str(config.get("support_selector_mode", "contact")),
+        support_selector_thresholds=tuple(
+            float(item)
+            for item in config.get("support_selector_thresholds", (0.10,))
+        ),
+        support_selector_no_contact_max=float(
+            config.get("support_selector_no_contact_max", 0.02)
+        ),
+        support_selector_contact_min=float(
+            config.get("support_selector_contact_min", 0.10)
+        ),
+        support_selector_dropout=float(config.get("support_selector_dropout", 0.10)),
+        support_selector_monotonicity_weight=float(
+            config.get("support_selector_monotonicity_weight", 0.10)
+        ),
+        support_selector_architecture=str(
+            config.get("support_selector_architecture", "linear")
+        ),
+        support_selector_feature_source=str(
+            config.get("support_selector_feature_source", "fullgrid32")
+        ),
+        support_selector_neck_channels=int(
+            config.get("support_selector_neck_channels", 64)
+        ),
+        support_selector_hidden_dim=int(
+            config.get("support_selector_hidden_dim", 512)
+        ),
+        support_selector_base_conditioning=str(
+            config.get("support_selector_base_conditioning", "real")
+        ),
     )
     expected_dino_sha = str(checkpoint.get("backbone_sha256", "") or "")
     actual_dino_sha = file_sha256(dino_weights)
@@ -231,9 +283,16 @@ def build_prior_model(
     control_seed: int = 521,
     depth_hidden_channels: int = 128,
     depth_modulation_max_scale: float = 0.10,
+    depth_attention_heads: int = 4,
+    depth_attention_window: int = 5,
+    zero_mean_logit_residual: bool = False,
     vlm_rank: int = 32,
     prior_control: str = "real",
+    counterfactual_control: str = "",
+    control_identity_weight: float = 0.0,
+    feature_budget_penalty_weight: float = 0.0,
 ) -> tuple[FrozenBasePriorModel, dict[str, Any], TactileLossConfig]:
+    del counterfactual_control, control_identity_weight, feature_budget_penalty_weight
     base, checkpoint, loss_config = build_frozen_base(base_checkpoint, dino_weights)
     model = FrozenBasePriorModel(
         base,
@@ -245,6 +304,9 @@ def build_prior_model(
         control_seed=control_seed,
         depth_hidden_channels=depth_hidden_channels,
         depth_modulation_max_scale=depth_modulation_max_scale,
+        depth_attention_heads=depth_attention_heads,
+        depth_attention_window=depth_attention_window,
+        zero_mean_logit_residual=zero_mean_logit_residual,
         vlm_rank=vlm_rank,
         default_control=prior_control,
     )
@@ -315,6 +377,112 @@ def load_prior_checkpoint(
     model.prior_adapter.load_state_dict(payload["adapter_state_dict"], strict=True)
     model.eval()
     return model, payload, loss_config
+
+
+def build_prior_selector_model(
+    *,
+    selector_checkpoint: os.PathLike[str] | str,
+    dino_weights: os.PathLike[str] | str,
+    adapter_type: str,
+    prior_dim: int,
+    prior_control: str = "real",
+    control_seed: int = 521,
+    feature_rms_budget: float = 0.05,
+    prior_dropout: float = 0.0,
+    depth_hidden_channels: int = 128,
+    depth_modulation_max_scale: float = 0.10,
+    anchor_residual_max_logit: float = 2.0,
+    anchor_query_dim: int = 128,
+    anchor_query_heads: int = 4,
+    anchor_query_layers: int = 2,
+    vlm_rank: int = 32,
+    vlm_residual_max_logit: float = 1.0,
+    **unused: Any,
+) -> tuple[PriorSelectorModel, dict[str, Any]]:
+    del unused
+    base, checkpoint, _ = build_frozen_base(selector_checkpoint, dino_weights)
+    model = PriorSelectorModel(
+        base,
+        adapter_type=adapter_type,
+        prior_dim=prior_dim,
+        prior_control=prior_control,
+        control_seed=control_seed,
+        feature_rms_budget=feature_rms_budget,
+        prior_dropout=prior_dropout,
+        depth_hidden_channels=depth_hidden_channels,
+        depth_modulation_max_scale=depth_modulation_max_scale,
+        anchor_residual_max_logit=anchor_residual_max_logit,
+        anchor_query_dim=anchor_query_dim,
+        anchor_query_heads=anchor_query_heads,
+        anchor_query_layers=anchor_query_layers,
+        vlm_rank=vlm_rank,
+        vlm_residual_max_logit=vlm_residual_max_logit,
+    )
+    return model, checkpoint
+
+
+def selector_prior_checkpoint_payload(
+    model: PriorSelectorModel,
+    *,
+    adapter_config: Mapping[str, Any],
+    selector_checkpoint: os.PathLike[str] | str,
+    dino_weights: os.PathLike[str] | str,
+    data_config: Mapping[str, Any],
+    epoch: int,
+    global_step: int,
+    monitor: str,
+    score: Optional[float],
+) -> dict[str, Any]:
+    selector_checkpoint = Path(selector_checkpoint).expanduser().resolve(strict=True)
+    dino_weights = Path(dino_weights).expanduser().resolve(strict=True)
+    return {
+        "format": SELECTOR_PRIOR_CHECKPOINT_FORMAT,
+        "adapter_state_dict": {
+            name: value.detach().cpu()
+            for name, value in model.prior_adapter.state_dict().items()
+        },
+        "adapter_config": dict(adapter_config),
+        "selector_checkpoint": str(selector_checkpoint),
+        "selector_checkpoint_sha256": file_sha256(selector_checkpoint),
+        "dino_weights": str(dino_weights),
+        "dino_weights_sha256": file_sha256(dino_weights),
+        "data_config": dict(data_config),
+        "epoch": int(epoch),
+        "global_step": int(global_step),
+        "monitor": str(monitor),
+        "score": None if score is None else float(score),
+        "pressure_output_contract": "frozen_selector_checkpoint_exact",
+    }
+
+
+def load_prior_selector_checkpoint(
+    checkpoint_path: os.PathLike[str] | str,
+    *,
+    dino_weights_override: Optional[os.PathLike[str] | str] = None,
+    selector_checkpoint_override: Optional[os.PathLike[str] | str] = None,
+) -> tuple[PriorSelectorModel, dict[str, Any]]:
+    checkpoint_path = Path(checkpoint_path).expanduser().resolve(strict=True)
+    payload = load_torch_checkpoint(checkpoint_path)
+    if payload.get("format") != SELECTOR_PRIOR_CHECKPOINT_FORMAT:
+        raise ValueError(f"Unsupported selector-prior checkpoint: {checkpoint_path}")
+    selector_checkpoint = Path(
+        selector_checkpoint_override or payload.get("selector_checkpoint", "")
+    ).expanduser().resolve(strict=True)
+    dino_weights = Path(
+        dino_weights_override or payload.get("dino_weights", "")
+    ).expanduser().resolve(strict=True)
+    if payload.get("selector_checkpoint_sha256") != file_sha256(selector_checkpoint):
+        raise ValueError("Frozen selector checkpoint SHA256 mismatch")
+    if payload.get("dino_weights_sha256") != file_sha256(dino_weights):
+        raise ValueError("DINO weight SHA256 mismatch")
+    model, _ = build_prior_selector_model(
+        selector_checkpoint=selector_checkpoint,
+        dino_weights=dino_weights,
+        **dict(payload.get("adapter_config", {})),
+    )
+    model.prior_adapter.load_state_dict(payload["adapter_state_dict"], strict=True)
+    model.eval()
+    return model, payload
 
 
 def _first_existing(candidates: Iterable[Path]) -> Optional[Path]:
@@ -395,7 +563,7 @@ def default_bbox_manifest(dataset: str) -> Path:
 
 def hamer_config(input_resolution: Sequence[int]):
     height, width = parse_resolution(input_resolution)
-    config_path = REPO_ROOT / "hamer" / "_DATA" / "hamer_ckpts" / "model_config.yaml"
+    config_path = resolve_hamer_model_config_path(REPO_ROOT)
     config = get_config(str(config_path), update_cachedir=True)
     config.defrost()
     config.MODEL.IMAGE_SIZE = height
@@ -482,6 +650,9 @@ class CachedFeatureDataset(Dataset):
         "z_rgb": "frozen_base_grid",
         "h_rgb": "frozen_base_bottleneck",
         "base_logits": "frozen_base_logits",
+        "contact_neck": "frozen_contact_neck",
+        "contact_anchor_logits": "frozen_contact_anchor_logits",
+        "contact_logits": "frozen_contact_logits",
         "depth_grid": "depth_prior",
         "vlm_embedding": "vlm_prior",
         "tactile_signal": "tactile_signal",
@@ -501,7 +672,7 @@ class CachedFeatureDataset(Dataset):
         for raw_path in cache_dirs:
             path = Path(raw_path).expanduser().resolve(strict=True)
             if (path / "CACHE_DONE.json").is_file():
-                cache_groups.append((FeatureCacheDataset(path, max_open_shards=2, copy_arrays=True),))
+                cache_groups.append((FeatureCacheDataset(path, max_open_shards=2, copy_arrays=False),))
                 continue
             partitions = sorted(
                 child for child in path.glob("part-*-of-*")
@@ -520,7 +691,7 @@ class CachedFeatureDataset(Dataset):
                 )
             cache_groups.append(
                 tuple(
-                    FeatureCacheDataset(path, max_open_shards=2, copy_arrays=True)
+                    FeatureCacheDataset(path, max_open_shards=2, copy_arrays=False)
                     for path in partitions
                 )
             )
@@ -531,6 +702,24 @@ class CachedFeatureDataset(Dataset):
         if missing:
             raise ValueError(f"Feature cache is missing required fields: {missing}")
         self.require_fields = tuple(require_fields)
+        base_hashes = {
+            str(cache.config.get("provenance", {}).get("base_checkpoint_sha256", ""))
+            for cache in self.caches
+            if any(
+                field in cache.fields
+                for field in (
+                    "z_rgb",
+                    "h_rgb",
+                    "base_logits",
+                    "contact_neck",
+                    "contact_anchor_logits",
+                )
+            )
+        }
+        base_hashes.discard("")
+        if len(base_hashes) > 1:
+            raise ValueError(f"Feature caches mix multiple frozen bases: {sorted(base_hashes)}")
+        self.base_checkpoint_sha256 = next(iter(base_hashes), "")
 
     def __len__(self) -> int:
         return len(self.dataset)
@@ -623,15 +812,41 @@ class FeatureOnlyTactileDataset(Dataset):
                     )
             self.groups.append(
                 tuple(
-                    FeatureCacheDataset(cache_path, max_open_shards=2, copy_arrays=True)
+                    FeatureCacheDataset(cache_path, max_open_shards=2, copy_arrays=False)
                     for cache_path in paths
                 )
             )
         self.groups = tuple(self.groups)
         available = {field for group in self.groups for cache in group for field in cache.fields}
-        feature_field = "h_rgb" if adapter_type == "vlm_lowrank" else "z_rgb"
-        prior_field = "vlm_embedding" if adapter_type == "vlm_lowrank" else "depth_grid"
-        required = set((*self.REQUIRED_TRAIN_FIELDS, feature_field, prior_field))
+        is_vlm = adapter_type in {"vlm_lowrank", "vlm_global_calibrator"}
+        is_selector = adapter_type in {
+            "depth_mapping_rectifier",
+            "depth_anchor_residual",
+            "depth_anchor_query",
+            "vlm_global_calibrator",
+        }
+        if is_selector:
+            selector_pressure_field = next(
+                (
+                    field
+                    for field in ("h_rgb", "base_logits")
+                    if field in available
+                ),
+                None,
+            )
+            if selector_pressure_field is None:
+                raise ValueError(
+                    "Feature-only selector cache needs h_rgb or base_logits"
+                )
+            base_fields = (
+                selector_pressure_field,
+                "contact_neck",
+                "contact_anchor_logits",
+            )
+        else:
+            base_fields = ("h_rgb",) if adapter_type == "vlm_lowrank" else ("z_rgb",)
+        prior_field = "vlm_embedding" if is_vlm else "depth_grid"
+        required = set((*self.REQUIRED_TRAIN_FIELDS, *base_fields, prior_field))
         missing = sorted(required - available)
         if missing:
             raise ValueError(f"Feature-only cache is missing fields: {missing}")
@@ -640,13 +855,23 @@ class FeatureOnlyTactileDataset(Dataset):
         base_candidates = [
             group for group in self.groups
             if any(
-                "z_rgb" in cache.fields or "h_rgb" in cache.fields
+                set(base_fields).issubset(set(cache.fields))
                 for cache in group
             )
         ]
         if len(base_candidates) != 1:
             raise ValueError("Feature-only mode requires exactly one base cache group")
         self.base_group = base_candidates[0]
+        base_hashes = {
+            str(cache.config.get("provenance", {}).get("base_checkpoint_sha256", ""))
+            for cache in self.base_group
+        }
+        base_hashes.discard("")
+        if len(base_hashes) != 1:
+            raise ValueError(
+                "Feature-only base cache must have one base_checkpoint_sha256"
+            )
+        self.base_checkpoint_sha256 = next(iter(base_hashes))
         self.sample_count = sum(len(cache) for cache in self.base_group)
         palm_values = self.base_group[0].config.get("provenance", {}).get("palm_mask")
         if not isinstance(palm_values, list) or not palm_values:
@@ -701,7 +926,9 @@ class FeatureOnlyTactileDataset(Dataset):
             result["depth_available"] = torch.tensor(True)
         if "vlm_prior" in result:
             result["vlm_available"] = torch.tensor(True)
-        result.setdefault("palm_mask", self.palm_mask.clone())
+        # default_collate copies this immutable template into the batch; cloning
+        # it once per sample here only doubles CPU memory traffic.
+        result.setdefault("palm_mask", self.palm_mask)
         return result
 
 
@@ -715,6 +942,31 @@ def adapter_config_from_args(args: Any) -> dict[str, Any]:
         "control_seed": int(args.seed),
         "depth_hidden_channels": int(args.depth_hidden_channels),
         "depth_modulation_max_scale": float(args.depth_modulation_max_scale),
+        "depth_attention_heads": int(args.depth_attention_heads),
+        "depth_attention_window": int(args.depth_attention_window),
+        "zero_mean_logit_residual": bool(args.zero_mean_logit_residual),
         "vlm_rank": int(args.vlm_rank),
         "prior_control": str(args.prior_control),
+        "counterfactual_control": str(args.counterfactual_control),
+        "control_identity_weight": float(args.control_identity_weight),
+        "feature_budget_penalty_weight": float(args.feature_budget_penalty_weight),
+    }
+
+
+def selector_prior_config_from_args(args: Any) -> dict[str, Any]:
+    return {
+        "adapter_type": str(args.adapter_type),
+        "prior_dim": int(args.prior_dim),
+        "prior_control": str(args.prior_control),
+        "control_seed": int(args.seed),
+        "feature_rms_budget": float(args.feature_rms_budget),
+        "prior_dropout": float(args.prior_dropout),
+        "depth_hidden_channels": int(args.depth_hidden_channels),
+        "depth_modulation_max_scale": float(args.depth_modulation_max_scale),
+        "anchor_residual_max_logit": float(args.anchor_residual_max_logit),
+        "anchor_query_dim": int(args.anchor_query_dim),
+        "anchor_query_heads": int(args.anchor_query_heads),
+        "anchor_query_layers": int(args.anchor_query_layers),
+        "vlm_rank": int(args.vlm_rank),
+        "vlm_residual_max_logit": float(args.vlm_residual_max_logit),
     }

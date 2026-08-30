@@ -88,11 +88,21 @@ class PriorAdapterTrainingModule(pl.LightningModule):
         self.max_epochs_config = int(max_epochs)
         self.wandb_run_id = str(wandb_run_id)
         self.runtime_debug = bool(runtime_debug)
+        self.counterfactual_control = str(
+            self.adapter_config.get("counterfactual_control", "") or ""
+        )
+        self.control_identity_weight = float(
+            self.adapter_config.get("control_identity_weight", 0.0)
+        )
+        self.feature_budget_penalty_weight = float(
+            self.adapter_config.get("feature_budget_penalty_weight", 0.0)
+        )
         self._loading_prior_resume = False
         self.tactile_loss_scale = 10.0
         self.best_loss = math.inf
         self.fused_metrics = PriorMetricAccumulator()
         self.base_metrics = PriorMetricAccumulator()
+        self.control_metrics = PriorMetricAccumulator()
         self._val_loss_sum = torch.tensor(0.0, dtype=torch.float64)
         self._val_loss_count = torch.tensor(0.0, dtype=torch.float64)
         self._train_loss_sum = torch.tensor(0.0, dtype=torch.float64)
@@ -143,7 +153,7 @@ class PriorAdapterTrainingModule(pl.LightningModule):
         checkpoint["state_dict"] = {
             name: value
             for name, value in state_dict.items()
-            if name.startswith("model.adapter.")
+            if name.startswith("model.prior_adapter.")
         }
         checkpoint["format"] = "tactile_prior_resume_v1"
         checkpoint["wandb_run_id"] = self.wandb_run_id
@@ -184,7 +194,7 @@ class PriorAdapterTrainingModule(pl.LightningModule):
         missing = [
             name
             for name in incompatible.missing_keys
-            if name.startswith("model.adapter.")
+            if name.startswith("model.prior_adapter.")
         ]
         self._loading_prior_resume = False
         if unexpected or missing:
@@ -219,8 +229,27 @@ class PriorAdapterTrainingModule(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         del batch_idx
-        output = self.model(batch, train=True)
-        loss, components = self._loss(batch, output)
+        if self.counterfactual_control:
+            output = self.model.forward_paired(
+                batch, train=True, control=self.counterfactual_control
+            )
+        else:
+            output = self.model(batch, train=True)
+        tactile_loss, components = self._loss(batch, output)
+        identity_loss = output["pred_tactile"].new_zeros(())
+        if self.counterfactual_control:
+            identity_loss = output["control_identity_loss"]
+        budget_loss = output["pred_tactile"].new_zeros(())
+        for value in output.get("prior_aux_losses", {}).values():
+            budget_loss = budget_loss + value
+        if self.counterfactual_control:
+            control_budget = output["pred_tactile"].new_zeros(())
+            for value in output.get("control_prior_aux_losses", {}).values():
+                control_budget = control_budget + value
+            budget_loss = 0.5 * (budget_loss + control_budget)
+        weighted_identity = self.control_identity_weight * identity_loss
+        weighted_budget = self.feature_budget_penalty_weight * budget_loss
+        loss = tactile_loss + weighted_identity + weighted_budget
         if not torch.isfinite(loss):
             raise FloatingPointError(
                 f"Non-finite prior-adapter loss at epoch={self.current_epoch}, "
@@ -230,6 +259,41 @@ class PriorAdapterTrainingModule(pl.LightningModule):
         self._train_loss_sum.add_(loss.detach().double() * batch_size)
         self._train_loss_count.add_(batch_size)
         self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=batch_size)
+        self.log(
+            "train/tactile_loss",
+            tactile_loss,
+            on_step=False,
+            on_epoch=True,
+            batch_size=batch_size,
+        )
+        self.log(
+            "train/control_identity_raw",
+            identity_loss,
+            on_step=False,
+            on_epoch=True,
+            batch_size=batch_size,
+        )
+        self.log(
+            "train/control_identity_weighted",
+            weighted_identity,
+            on_step=False,
+            on_epoch=True,
+            batch_size=batch_size,
+        )
+        self.log(
+            "train/feature_budget_raw",
+            budget_loss,
+            on_step=False,
+            on_epoch=True,
+            batch_size=batch_size,
+        )
+        self.log(
+            "train/feature_budget_weighted",
+            weighted_budget,
+            on_step=False,
+            on_epoch=True,
+            batch_size=batch_size,
+        )
         for name in (
             "loss_base_tactile",
             "loss_background",
@@ -248,6 +312,14 @@ class PriorAdapterTrainingModule(pl.LightningModule):
         for name, value in output.get("prior_diagnostics", {}).items():
             self.log(
                 f"train/prior_{name}",
+                value,
+                on_step=False,
+                on_epoch=True,
+                batch_size=batch_size,
+            )
+        for name, value in output.get("control_prior_diagnostics", {}).items():
+            self.log(
+                f"train/control_prior_{name}",
                 value,
                 on_step=False,
                 on_epoch=True,
@@ -278,12 +350,18 @@ class PriorAdapterTrainingModule(pl.LightningModule):
     def on_validation_epoch_start(self):
         self.fused_metrics.reset()
         self.base_metrics.reset()
+        self.control_metrics.reset()
         self._val_loss_sum = torch.zeros((), device=self.device, dtype=torch.float64)
         self._val_loss_count = torch.zeros((), device=self.device, dtype=torch.float64)
 
     def validation_step(self, batch, batch_idx):
         del batch_idx
-        output = self.model(batch, train=False)
+        if self.counterfactual_control:
+            output = self.model.forward_paired(
+                batch, train=False, control=self.counterfactual_control
+            )
+        else:
+            output = self.model(batch, train=False)
         loss, _ = self._loss(batch, output)
         batch_size = int(batch["tactile_signal"].shape[0])
         self._val_loss_sum.add_(loss.detach().double() * batch_size)
@@ -300,6 +378,31 @@ class PriorAdapterTrainingModule(pl.LightningModule):
             batch["palm_mask"],
             batch["has_tactile"],
         )
+        if self.counterfactual_control:
+            self.control_metrics.update(
+                output["control_pred_tactile"],
+                batch["tactile_signal"],
+                batch["palm_mask"],
+                batch["has_tactile"],
+            )
+        for name, value in output.get("prior_diagnostics", {}).items():
+            self.log(
+                f"val/prior_{name}",
+                value,
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=batch_size,
+            )
+        for name, value in output.get("control_prior_diagnostics", {}).items():
+            self.log(
+                f"val/control_prior_{name}",
+                value,
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=batch_size,
+            )
         return loss
 
     def _sync_loss(self) -> float:
@@ -332,14 +435,19 @@ class PriorAdapterTrainingModule(pl.LightningModule):
     def on_validation_epoch_end(self):
         self.fused_metrics.synchronize(self.device)
         self.base_metrics.synchronize(self.device)
+        if self.counterfactual_control:
+            self.control_metrics.synchronize(self.device)
         val_loss = self._sync_loss()
         fused = self.fused_metrics.summary()
         base = self.base_metrics.summary()
+        control = self.control_metrics.summary() if self.counterfactual_control else {}
         self.log("val/loss", val_loss, prog_bar=True, sync_dist=False)
         for name, value in fused.items():
             self.log(f"val/fused_{name}", value, sync_dist=False)
         for name, value in base.items():
             self.log(f"val/base_{name}", value, sync_dist=False)
+        for name, value in control.items():
+            self.log(f"val/control_{name}", value, sync_dist=False)
         if self.trainer.sanity_checking or not self.trainer.is_global_zero:
             return
         row = {
@@ -349,6 +457,7 @@ class PriorAdapterTrainingModule(pl.LightningModule):
             "val_loss": val_loss,
             **{f"fused_{key}": value for key, value in fused.items()},
             **{f"base_{key}": value for key, value in base.items()},
+            **{f"control_{key}": value for key, value in control.items()},
         }
         self._write_metrics(row)
         checkpoint_dir = self.output_dir / "checkpoints"
@@ -862,7 +971,11 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--bbox-source-policy", default="sam3_only")
     parser.add_argument("--bbox-rescale-factor", type=float, default=1.2)
     parser.add_argument("--input-resolution", default="256x192")
-    parser.add_argument("--depth-sidecar-root", default="")
+    parser.add_argument(
+        "--depth-sidecar-root",
+        default=os.environ.get("DEPTH_SIDECAR_ROOT", ""),
+        help="MoGe sidecar root; defaults to DEPTH_SIDECAR_ROOT when set.",
+    )
     parser.add_argument("--base-feature-cache", default="")
     parser.add_argument("--prior-feature-cache", default="")
     parser.add_argument("--train-base-feature-cache", default="")
@@ -886,7 +999,16 @@ def add_data_arguments(parser: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--adapter-type", choices=("depth_spatial", "vlm_lowrank"), required=True)
+    parser.add_argument(
+        "--adapter-type",
+        choices=(
+            "depth_spatial",
+            "depth_causal_film",
+            "depth_local_xattn",
+            "vlm_lowrank",
+        ),
+        required=True,
+    )
     parser.add_argument("--prior-dim", type=int, required=True)
     parser.add_argument("--prior-control", default="real")
     parser.add_argument("--base-checkpoint", required=True)
@@ -904,6 +1026,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prior-dropout", type=float, default=0.10)
     parser.add_argument("--depth-hidden-channels", type=int, default=128)
     parser.add_argument("--depth-modulation-max-scale", type=float, default=0.10)
+    parser.add_argument("--depth-attention-heads", type=int, default=4)
+    parser.add_argument("--depth-attention-window", type=int, default=5)
+    parser.add_argument(
+        "--zero-mean-logit-residual",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--counterfactual-control",
+        choices=("", "spatial_shuffle", "sample_shuffle", "global_mean", "zero"),
+        default="",
+    )
+    parser.add_argument("--control-identity-weight", type=float, default=0.0)
+    parser.add_argument("--feature-budget-penalty-weight", type=float, default=0.0)
     parser.add_argument("--vlm-rank", type=int, default=32)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=8)
@@ -964,6 +1100,7 @@ def _dataset_from_args(args, split: str, train: bool):
     base_caches = parse_csv(base_cache_value)
     prior_caches = parse_csv(prior_cache_value)
     cached_base = bool(base_caches)
+    is_vlm = args.adapter_type in {"vlm_lowrank", "vlm_global_calibrator"}
     if args.cache_only:
         if not cached_base:
             raise ValueError("--cache-only requires a base feature cache")
@@ -994,14 +1131,12 @@ def _dataset_from_args(args, split: str, train: bool):
         hdf5_batch_read_mode=args.hdf5_batch_read_mode,
     )
     caches = (*base_caches, *prior_caches)
-    required = ("vlm_embedding",) if args.adapter_type == "vlm_lowrank" else ()
-    if args.adapter_type == "depth_spatial" and not args.depth_sidecar_root:
+    required = ("vlm_embedding",) if is_vlm else ()
+    if args.adapter_type.startswith("depth_") and not args.depth_sidecar_root:
         required = ("depth_grid",)
     if cached_base:
         base_required = (
-            ("h_rgb",)
-            if args.adapter_type == "vlm_lowrank"
-            else ("z_rgb",)
+            ("h_rgb",) if args.adapter_type == "vlm_lowrank" else ("z_rgb",)
         )
         required = tuple(dict.fromkeys((*required, *base_required)))
     if caches:
@@ -1023,6 +1158,14 @@ def main() -> None:
         raise ValueError("DataLoader worker counts cannot be negative")
     if args.runtime_debug_interval <= 0 or args.runtime_debug_flush_steps < 1:
         raise ValueError("Runtime debug interval and flush steps must be positive")
+    if args.control_identity_weight < 0 or args.feature_budget_penalty_weight < 0:
+        raise ValueError("Counterfactual auxiliary weights cannot be negative")
+    if args.counterfactual_control and not args.adapter_type.startswith("depth_"):
+        raise ValueError("Paired counterfactual training is only supported by Depth adapters")
+    if args.depth_attention_heads < 1:
+        raise ValueError("--depth-attention-heads must be positive")
+    if args.depth_attention_window < 1 or args.depth_attention_window % 2 == 0:
+        raise ValueError("--depth-attention-window must be a positive odd integer")
     pl.seed_everything(args.seed, workers=True)
     gpu_ids = parse_csv(args.gpus)
     if not gpu_ids:

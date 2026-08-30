@@ -43,7 +43,9 @@ from train import file_sha256
 from train import load_compatible_state_dict
 from train import resolve_data_dirs
 from hamer_tactile import parse_input_resolution
+from hamer_config_assets import resolve_hamer_model_config_path
 from dataset import OpenTouchTactileDataset, canonical_dataset_filter
+from data.indexing import write_jsonl_atomic
 from tactile_metrics import (
     CompactTouchAnythingProtocolAccumulator,
     TOUCHANYTHING_CONTACT_THRESHOLD,
@@ -55,6 +57,18 @@ from tactile_metrics import (
     touchanything_protocol_group_key,
     touchanything_protocol_frame_stats,
     volumetric_iou_stats,
+)
+from selector_calibration import (
+    SELECTOR_CORRECTION_MIN_PRECISION,
+    SELECTOR_HISTOGRAM_BINS,
+    SELECTOR_LOGIT_MAX,
+    SELECTOR_LOGIT_MIN,
+    calibrated_correction_counts,
+    calibrated_counts,
+    selector_histogram_layout,
+    selector_histogram_rows,
+    selector_threshold_curve,
+    summarize_selector_histograms,
 )
 
 
@@ -127,6 +141,7 @@ CATASTROPHIC_UNDER_PRED_MAX = 50.0
 CHECKPOINT_FILENAMES = {
     "loss-best": "best_loss.ckpt",
     "contact-best": "best_contact.ckpt",
+    "selector-best": "best_selector.ckpt",
     "last": "last.ckpt",
 }
 
@@ -141,6 +156,16 @@ def _safe_name(value):
             chars.append("_")
     name = "".join(chars).strip("_")
     return name or "default"
+
+
+def _finite_json_value(value):
+    if isinstance(value, dict):
+        return {key: _finite_json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_finite_json_value(item) for item in value]
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
+    return value
 
 
 def _report_path(args):
@@ -173,10 +198,54 @@ def _prepare_prediction_export(args):
     shard_root.mkdir(parents=True, exist_ok=True)
     for path in shard_root.glob("worker_*.npz"):
         path.unlink()
-    for name in ("prediction_config.json", "_COMPLETE"):
+    for name in (
+        "prediction_config.json",
+        "prediction_vertex_indices.npy",
+        "sample_records.jsonl",
+        "_COMPLETE",
+    ):
         path = output_root / name
         if path.exists():
             path.unlink()
+
+
+def _materialize_prediction_sample_records(args, sample_records):
+    """Freeze the post-policy dataset universe used by prediction workers.
+
+    Query manifests may contain rows outside the current reviewed SAM3
+    universe. Dataset construction performs that overlay/filter first. The
+    artifact must bind the resulting records rather than the unfiltered source
+    manifest, otherwise replay would request predictions that were never
+    evaluated.
+    """
+
+    output_root = Path(args.prediction_output_dir)
+    records = []
+    for artifact_index, source in enumerate(sample_records):
+        record = dict(source)
+        sample_uid = str(record.get("sample_uid", ""))
+        if not sample_uid:
+            raise ValueError(
+                "Prediction export requires sample_uid in every normalized "
+                f"record; missing at index {artifact_index}"
+            )
+        record["_artifact_index"] = artifact_index
+        records.append(record)
+    if not records:
+        raise RuntimeError("Prediction export has no records after dataset filtering")
+    manifest_path = output_root / "sample_records.jsonl"
+    write_jsonl_atomic(
+        manifest_path,
+        records,
+        progress_label="[prediction-export] materializing exact manifest",
+    )
+    args.sample_records_jsonl = str(manifest_path.resolve(strict=True))
+    print(
+        "[prediction-export] frozen post-policy sample universe: "
+        f"{len(records)} records -> {args.sample_records_jsonl}",
+        flush=True,
+    )
+    return records
 
 
 def _finalize_prediction_export(args, sample_records):
@@ -190,19 +259,30 @@ def _finalize_prediction_export(args, sample_records):
     observed_indices = []
     observed_uids = []
     prediction_width = None
+    vertex_indices = None
     for shard_path in shard_paths:
         with np.load(shard_path, allow_pickle=False) as shard:
             indices = np.asarray(shard["indices"], dtype=np.int64)
             predictions = np.asarray(shard["predictions"])
             sample_uids = np.asarray(shard["sample_uids"], dtype=str)
+            shard_vertex_indices = np.asarray(
+                shard["vertex_indices"], dtype=np.int32
+            )
         if predictions.ndim != 2 or len(indices) != len(predictions):
             raise RuntimeError(f"Malformed prediction shard: {shard_path}")
         if len(sample_uids) != len(indices):
             raise RuntimeError(f"UID count differs from predictions: {shard_path}")
         if prediction_width is None:
             prediction_width = int(predictions.shape[1])
+            vertex_indices = shard_vertex_indices
         elif prediction_width != int(predictions.shape[1]):
             raise RuntimeError("Prediction width differs between worker shards")
+        elif not np.array_equal(vertex_indices, shard_vertex_indices):
+            raise RuntimeError("Prediction vertex indices differ between worker shards")
+        if len(shard_vertex_indices) != int(predictions.shape[1]):
+            raise RuntimeError(
+                f"Prediction vertex index count differs from payload width: {shard_path}"
+            )
         observed_indices.append(indices)
         observed_uids.append(sample_uids)
 
@@ -228,17 +308,47 @@ def _finalize_prediction_export(args, sample_records):
             f"expected={expected_uids[mismatch]!r}"
         )
 
+    if vertex_indices is None:
+        raise RuntimeError("Prediction export did not resolve vertex indices")
+    vertex_target = output_root / "prediction_vertex_indices.npy"
+    vertex_temporary = output_root / f".prediction_vertex_indices.{os.getpid()}.tmp.npy"
+    np.save(vertex_temporary, vertex_indices)
+    os.replace(vertex_temporary, vertex_target)
     manifest_path = Path(args.sample_records_jsonl).resolve(strict=True)
     config = {
-        "schema": "tactile_exact_prediction_shards_v1",
+        "schema": "tactile_exact_prediction_shards_v2",
         "status": "complete",
         "sample_records": str(manifest_path),
         "sample_records_sha256": file_sha256(manifest_path),
         "record_count": len(sample_records),
         "prediction_width": prediction_width,
         "prediction_dtype": "float16",
+        "prediction_palm_only": bool(args.prediction_palm_only),
+        "vertex_indices": str(vertex_target),
+        "vertex_index_count": int(len(vertex_indices)),
+        "vertex_indices_sha256": hashlib.sha256(
+            np.ascontiguousarray(vertex_indices).tobytes()
+        ).hexdigest(),
         "checkpoint": str(Path(args.checkpoint).resolve(strict=True)),
         "checkpoint_sha256": file_sha256(args.checkpoint),
+        "source_query_manifests": [
+            str(Path(path.strip()).expanduser().resolve(strict=True))
+            for path in str(args.query_manifests or "").split(",")
+            if path.strip()
+        ],
+        "source_query_manifest_sha256": {
+            str(Path(path.strip()).expanduser().resolve(strict=True)): file_sha256(
+                path.strip()
+            )
+            for path in str(args.query_manifests or "").split(",")
+            if path.strip()
+        },
+        "bbox_source_policy": str(args.bbox_source_policy),
+        "bbox_manifest_sha256": dict(
+            getattr(args, "active_bbox_manifest_sha256", None)
+            or args.model_metadata.get("bbox_manifest_sha256")
+            or {}
+        ),
         "shards": [str(path) for path in shard_paths],
     }
     config_path = output_root / "prediction_config.json"
@@ -254,6 +364,163 @@ def _finalize_prediction_export(args, sample_records):
     os.replace(temporary, complete_path)
     print(
         f"[prediction-export] complete records={len(sample_records)} root={output_root}",
+        flush=True,
+    )
+    return config
+
+
+def _prepare_selector_artifact_export(args):
+    if not args.selector_artifact_output_dir:
+        return
+    output_root = Path(args.selector_artifact_output_dir)
+    shard_root = output_root / "shards"
+    shard_root.mkdir(parents=True, exist_ok=True)
+    for path in shard_root.glob("worker_*.npz"):
+        path.unlink()
+    for name in ("artifact_config.json", "_COMPLETE"):
+        path = output_root / name
+        if path.exists():
+            path.unlink()
+
+
+def _finalize_selector_artifact_export(args, sample_records):
+    if not args.selector_artifact_output_dir:
+        return None
+    output_root = Path(args.selector_artifact_output_dir)
+    shard_paths = sorted((output_root / "shards").glob("worker_*.npz"))
+    if not shard_paths:
+        raise RuntimeError(
+            f"Selector artifact export produced no shards under {output_root}"
+        )
+
+    observed_indices = []
+    observed_uids = []
+    selector_shape = None
+    vertex_indices = None
+    thresholds = None
+    selector_mode = None
+    reference_hashes = []
+    for shard_path in shard_paths:
+        with np.load(shard_path, allow_pickle=False) as shard:
+            indices = np.asarray(shard["indices"], dtype=np.int64)
+            sample_uids = np.asarray(shard["sample_uids"], dtype=str)
+            logits = np.asarray(shard["selector_logits"])
+            shard_vertices = np.asarray(shard["vertex_indices"], dtype=np.int32)
+            shard_thresholds = np.asarray(
+                shard["selector_thresholds"], dtype=np.float64
+            )
+            shard_mode = str(np.asarray(shard["selector_mode"]).item())
+            reference_hash = str(
+                np.asarray(shard["reference_sha256"]).item()
+            )
+            has_reference = "base_predictions" in shard and "targets" in shard
+            if bool(args.selector_artifact_include_reference) != has_reference:
+                raise RuntimeError(
+                    f"Selector artifact reference payload differs from CLI: {shard_path}"
+                )
+            if has_reference:
+                base_predictions = np.asarray(shard["base_predictions"])
+                targets = np.asarray(shard["targets"])
+                if base_predictions.shape != targets.shape or base_predictions.shape != (
+                    len(indices),
+                    len(shard_vertices),
+                ):
+                    raise RuntimeError(
+                        f"Malformed selector reference arrays: {shard_path}"
+                    )
+        if logits.ndim != 3 or logits.shape[0] != len(indices):
+            raise RuntimeError(f"Malformed selector logit shard: {shard_path}")
+        if logits.shape[1] != len(shard_thresholds) or logits.shape[2] != len(
+            shard_vertices
+        ):
+            raise RuntimeError(
+                f"Selector thresholds/vertices do not match logits: {shard_path}"
+            )
+        if len(sample_uids) != len(indices):
+            raise RuntimeError(f"UID count differs from selector logits: {shard_path}")
+        current_shape = (int(logits.shape[1]), int(logits.shape[2]))
+        if selector_shape is None:
+            selector_shape = current_shape
+            vertex_indices = shard_vertices
+            thresholds = shard_thresholds
+            selector_mode = shard_mode
+        elif (
+            selector_shape != current_shape
+            or selector_mode != shard_mode
+            or not np.array_equal(vertex_indices, shard_vertices)
+            or not np.array_equal(thresholds, shard_thresholds)
+        ):
+            raise RuntimeError("Selector artifact schema differs between worker shards")
+        observed_indices.append(indices)
+        observed_uids.append(sample_uids)
+        reference_hashes.append(reference_hash)
+
+    indices = np.concatenate(observed_indices)
+    sample_uids = np.concatenate(observed_uids)
+    order = np.argsort(indices, kind="stable")
+    indices = indices[order]
+    sample_uids = sample_uids[order]
+    expected_indices = np.arange(len(sample_records), dtype=np.int64)
+    if not np.array_equal(indices, expected_indices):
+        raise RuntimeError(
+            "Selector artifact does not cover the dataset exactly once: "
+            f"expected={len(expected_indices)}, observed={len(indices)}"
+        )
+    expected_uids = np.asarray(
+        [str(record.get("sample_uid", "")) for record in sample_records], dtype=str
+    )
+    if not np.array_equal(sample_uids, expected_uids):
+        mismatch = int(np.flatnonzero(sample_uids != expected_uids)[0])
+        raise RuntimeError(
+            "Selector artifact UID order differs from the dataset at "
+            f"index {mismatch}: observed={sample_uids[mismatch]!r}, "
+            f"expected={expected_uids[mismatch]!r}"
+        )
+
+    checkpoint_path = Path(args.checkpoint).resolve(strict=True)
+    config = {
+        "schema": "tactile_selector_vertex_artifacts_v1",
+        "status": "complete",
+        "record_count": len(sample_records),
+        "split": str(args.split),
+        "datasets": str(args.datasets),
+        "selector_mode": selector_mode,
+        "selector_thresholds": [float(value) for value in thresholds],
+        "selector_output_count": int(selector_shape[0]),
+        "valid_vertex_count": int(selector_shape[1]),
+        "vertex_indices_sha256": hashlib.sha256(
+            np.ascontiguousarray(vertex_indices).tobytes()
+        ).hexdigest(),
+        "selector_dtype": "float16",
+        "reference_payload": bool(args.selector_artifact_include_reference),
+        "reference_dtype": (
+            "float16" if args.selector_artifact_include_reference else None
+        ),
+        "checkpoint": str(checkpoint_path),
+        "checkpoint_sha256": file_sha256(checkpoint_path),
+        "exp_name": str(args.exp_name),
+        "ckpt": str(args.ckpt),
+        "input_resolution": list(args.input_resolution),
+        "bbox_rescale_factor": float(args.bbox_rescale_factor),
+        "bbox_source_policy": str(args.bbox_source_policy),
+        "shards": [str(path.resolve()) for path in shard_paths],
+        "shard_reference_sha256": reference_hashes,
+    }
+    config_path = output_root / "artifact_config.json"
+    temporary = output_root / f".artifact_config.{os.getpid()}.tmp"
+    temporary.write_text(
+        json.dumps(config, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, config_path)
+    complete_path = output_root / "_COMPLETE"
+    temporary = output_root / f"._COMPLETE.{os.getpid()}.tmp"
+    temporary.write_text(config["checkpoint_sha256"] + "\n", encoding="utf-8")
+    os.replace(temporary, complete_path)
+    print(
+        "[selector-artifact] complete "
+        f"records={len(sample_records)} outputs={selector_shape[0]} "
+        f"vertices={selector_shape[1]} root={output_root}",
         flush=True,
     )
     return config
@@ -386,7 +653,7 @@ def _resolve_checkpoint_path(args):
         raise ValueError(
             "Please provide either --checkpoint /path/to/model.ckpt or "
             "--exp_name <experiment_name> with --ckpt "
-            "loss-best|contact-best|last."
+            "loss-best|contact-best|selector-best|last."
         )
 
     checkpoint_root = Path(args.checkpoint_root).expanduser()
@@ -411,8 +678,8 @@ def _resolve_checkpoint_path(args):
 
 
 def _load_model_cfg(input_resolution=(256, 192)):
-    model_cfg_path = os.path.join(base_dir, 'hamer/_DATA/hamer_ckpts/model_config.yaml')
-    model_cfg = get_config(model_cfg_path, update_cachedir=True)
+    model_cfg_path = resolve_hamer_model_config_path(base_dir)
+    model_cfg = get_config(str(model_cfg_path), update_cachedir=True)
     height, width = parse_input_resolution(input_resolution)
     model_cfg.defrost()
     model_cfg.MODEL.IMAGE_SIZE = height
@@ -423,6 +690,151 @@ def _load_model_cfg(input_resolution=(256, 192)):
         model_cfg.MODEL.BACKBONE.pop('PRETRAINED_WEIGHTS')
         model_cfg.freeze()
     return model_cfg
+
+
+def _materialize_embedded_surface_basis(
+    checkpoint, metadata, checkpoint_path
+):
+    if str(metadata.get("tactile_head_type", "")) != (
+        "dense_v2_dino_surface_basis"
+    ):
+        return
+    recorded_value = str(metadata.get("surface_basis_path", "") or "")
+    recorded_path = (
+        Path(recorded_value).expanduser() if recorded_value else None
+    )
+    if recorded_path is not None and recorded_path.is_file():
+        metadata["surface_basis_path"] = str(recorded_path.resolve())
+        return
+    state_dict = checkpoint.get("state_dict", {})
+    basis = state_dict.get("tactile_head.surface_basis_valid")
+    support_indices = state_dict.get(
+        "tactile_head.surface_support_indices"
+    )
+    support_weights = state_dict.get(
+        "tactile_head.surface_support_weights"
+    )
+    valid_indices = state_dict.get(
+        "tactile_head.surface_valid_vertex_indices"
+    )
+    sparse_payload = isinstance(support_indices, torch.Tensor) and isinstance(
+        support_weights, torch.Tensor
+    )
+    dense_payload = isinstance(basis, torch.Tensor)
+    if not isinstance(valid_indices, torch.Tensor) or not (
+        sparse_payload or dense_payload
+    ):
+        raise FileNotFoundError(
+            "Surface basis path is unavailable and the compact checkpoint "
+            "does not contain embedded basis buffers: "
+            f"{recorded_value or '<empty>'}"
+        )
+    valid_indices = valid_indices.detach().cpu().long().contiguous()
+    expected_basis_sha = str(
+        metadata.get("surface_basis_tensor_sha256", "") or ""
+    )
+    artifact_payload = {
+        "format": "canonical_surface_basis_v1",
+        "valid_vertex_indices": valid_indices,
+    }
+    if sparse_payload:
+        support_indices = (
+            support_indices.detach().cpu().long().contiguous()
+        )
+        support_weights = (
+            support_weights.detach().cpu().float().contiguous()
+        )
+        if (
+            support_indices.ndim != 2
+            or support_weights.shape != support_indices.shape
+            or support_indices.shape[0] != valid_indices.numel()
+        ):
+            raise RuntimeError(
+                "Embedded sparse surface basis has invalid shapes: "
+                f"indices={tuple(support_indices.shape)}, "
+                f"weights={tuple(support_weights.shape)}"
+            )
+        coefficient_dim = int(
+            metadata.get(
+                "surface_coefficient_dim",
+                int(support_indices.max().item()) + 1,
+            )
+        )
+        digest = hashlib.sha256()
+        for name, value in (
+            ("indices", support_indices),
+            ("weights", support_weights),
+        ):
+            digest.update(name.encode("ascii"))
+            digest.update(str(tuple(value.shape)).encode("ascii"))
+            digest.update(memoryview(value.numpy()).cast("B"))
+        sparse_sha = digest.hexdigest()
+        expected_sparse_sha = str(
+            metadata.get("surface_sparse_basis_sha256", "") or ""
+        )
+        if expected_sparse_sha and sparse_sha != expected_sparse_sha:
+            raise RuntimeError(
+                "Embedded sparse surface basis SHA256 mismatch: "
+                f"expected={expected_sparse_sha}, actual={sparse_sha}"
+            )
+        artifact_payload["support_indices"] = support_indices
+        artifact_payload["support_weights"] = support_weights
+        basis_shape = [int(valid_indices.numel()), coefficient_dim]
+        runtime_identity = sparse_sha
+    else:
+        basis = basis.detach().cpu().float().contiguous()
+        coefficient_dim = int(
+            metadata.get("surface_coefficient_dim", basis.shape[1])
+        )
+        if tuple(basis.shape) != (
+            int(valid_indices.numel()),
+            coefficient_dim,
+        ):
+            raise RuntimeError(
+                f"Embedded surface basis has invalid shape {tuple(basis.shape)}"
+            )
+        actual_basis_sha = hashlib.sha256(
+            memoryview(basis.numpy()).cast("B")
+        ).hexdigest()
+        if expected_basis_sha and actual_basis_sha != expected_basis_sha:
+            raise RuntimeError(
+                "Embedded surface basis SHA256 mismatch: "
+                f"expected={expected_basis_sha}, actual={actual_basis_sha}"
+            )
+        sparse_sha = ""
+        artifact_payload["basis_valid"] = basis
+        basis_shape = list(basis.shape)
+        runtime_identity = actual_basis_sha
+    runtime_path = Path("/tmp") / (
+        f"tactile_surface_basis_{runtime_identity[:24]}_k{coefficient_dim}.pt"
+    )
+    artifact_metadata = {
+        "schema_version": 1,
+        "basis_method": "weighted_geodesic_rbf_target_overlap_v1",
+        "coefficient_dim": coefficient_dim,
+        "target_support_count": int(
+            metadata.get("surface_target_support_count", 4)
+        ),
+        "valid_vertex_count": int(valid_indices.numel()),
+        "tactile_dim": int(metadata.get("tactile_dim", 13614)),
+        "basis_shape": basis_shape,
+        "basis_dtype": "torch.float32",
+        "basis_sha256": expected_basis_sha,
+        "sparse_basis_sha256": sparse_sha,
+        "rehydrated_from_checkpoint": str(Path(checkpoint_path).resolve()),
+    }
+    temporary_path = runtime_path.with_name(
+        f".{runtime_path.name}.partial.{os.getpid()}"
+    )
+    artifact_payload["metadata"] = artifact_metadata
+    torch.save(artifact_payload, temporary_path)
+    os.replace(temporary_path, runtime_path)
+    metadata["surface_basis_source_path"] = recorded_value
+    metadata["surface_basis_path"] = str(runtime_path)
+    print(
+        "Rehydrated embedded canonical surface basis for evaluation: "
+        f"{runtime_path}"
+    )
 
 
 def _load_model(args, model_cfg, device):
@@ -438,6 +850,100 @@ def _load_model(args, model_cfg, device):
         experiment_model_config.get("input_resolution", (256, 192))
     )
     pool_output_channels = int(experiment_model_config.get("pool_output_channels", 32))
+    decoder_hidden_dim = int(experiment_model_config.get("decoder_hidden_dim", 512))
+    local_anchor_count = int(experiment_model_config.get("local_anchor_count", 512))
+    local_anchor_neighbors = int(
+        experiment_model_config.get("local_anchor_neighbors", 4)
+    )
+    local_logit_delta_max = float(
+        experiment_model_config.get("local_logit_delta_max", 6.0)
+    )
+    local_residual_dropout = float(
+        experiment_model_config.get("local_residual_dropout", 0.10)
+    )
+    freeze_local_residual_base = bool(
+        experiment_model_config.get("freeze_local_residual_base", True)
+    )
+    surface_basis_path = str(
+        experiment_model_config.get("surface_basis_path", "") or ""
+    )
+    surface_coefficient_dim = int(
+        experiment_model_config.get("surface_coefficient_dim", 4096)
+    )
+    surface_coefficient_architecture = str(
+        experiment_model_config.get(
+            "surface_coefficient_architecture", "linear"
+        )
+    )
+    surface_coefficient_hidden_dim = int(
+        experiment_model_config.get(
+            "surface_coefficient_hidden_dim", 1024
+        )
+    )
+    surface_target_support_count = int(
+        experiment_model_config.get("surface_target_support_count", 4)
+    )
+    surface_background_probability = float(
+        experiment_model_config.get(
+            "surface_background_probability", 1e-3
+        )
+    )
+    freeze_surface_feature_extractor = bool(
+        experiment_model_config.get(
+            "freeze_surface_feature_extractor", True
+        )
+    )
+    support_selector_mode = str(
+        experiment_model_config.get("support_selector_mode", "contact")
+    )
+    support_selector_thresholds = tuple(
+        float(value)
+        for value in experiment_model_config.get(
+            "support_selector_thresholds", (0.10,)
+        )
+    )
+    support_selector_no_contact_max = float(
+        experiment_model_config.get("support_selector_no_contact_max", 0.02)
+    )
+    support_selector_contact_min = float(
+        experiment_model_config.get("support_selector_contact_min", 0.10)
+    )
+    support_selector_dropout = float(
+        experiment_model_config.get("support_selector_dropout", 0.10)
+    )
+    support_selector_monotonicity_weight = float(
+        experiment_model_config.get(
+            "support_selector_monotonicity_weight", 0.10
+        )
+    )
+    support_selector_architecture = str(
+        experiment_model_config.get("support_selector_architecture", "linear")
+    )
+    support_selector_feature_source = str(
+        experiment_model_config.get(
+            "support_selector_feature_source", "fullgrid32"
+        )
+    )
+    support_selector_neck_channels = int(
+        experiment_model_config.get("support_selector_neck_channels", 64)
+    )
+    support_selector_hidden_dim = int(
+        experiment_model_config.get("support_selector_hidden_dim", 512)
+    )
+    support_selector_base_conditioning = str(
+        experiment_model_config.get(
+            "support_selector_base_conditioning", "real"
+        )
+    )
+    support_selector_correction_min_precision = float(
+        experiment_model_config.get(
+            "support_selector_correction_min_precision",
+            SELECTOR_CORRECTION_MIN_PRECISION,
+        )
+    )
+    init_tactile_checkpoint = str(
+        experiment_model_config.get("init_tactile_checkpoint", "") or ""
+    )
     visual_backbone = experiment_model_config.get("visual_backbone", "dinov3_hplus")
     dino_weights = getattr(args, "resolved_backbone_weights", "")
     print(
@@ -457,6 +963,42 @@ def _load_model(args, model_cfg, device):
         decoder_dropout_scale=decoder_dropout_scale,
         input_resolution=input_resolution,
         pool_output_channels=pool_output_channels,
+        decoder_hidden_dim=decoder_hidden_dim,
+        local_anchor_count=local_anchor_count,
+        local_anchor_neighbors=local_anchor_neighbors,
+        local_logit_delta_max=local_logit_delta_max,
+        local_residual_dropout=local_residual_dropout,
+        freeze_local_residual_base=freeze_local_residual_base,
+        surface_basis_path=surface_basis_path,
+        surface_coefficient_dim=surface_coefficient_dim,
+        surface_coefficient_architecture=(
+            surface_coefficient_architecture
+        ),
+        surface_coefficient_hidden_dim=surface_coefficient_hidden_dim,
+        surface_target_support_count=surface_target_support_count,
+        surface_background_probability=surface_background_probability,
+        freeze_surface_feature_extractor=(
+            freeze_surface_feature_extractor
+        ),
+        support_selector_mode=support_selector_mode,
+        support_selector_thresholds=support_selector_thresholds,
+        support_selector_no_contact_max=support_selector_no_contact_max,
+        support_selector_contact_min=support_selector_contact_min,
+        support_selector_dropout=support_selector_dropout,
+        support_selector_monotonicity_weight=(
+            support_selector_monotonicity_weight
+        ),
+        support_selector_architecture=support_selector_architecture,
+        support_selector_feature_source=support_selector_feature_source,
+        support_selector_neck_channels=support_selector_neck_channels,
+        support_selector_hidden_dim=support_selector_hidden_dim,
+        support_selector_base_conditioning=(
+            support_selector_base_conditioning
+        ),
+        support_selector_correction_min_precision=(
+            support_selector_correction_min_precision
+        ),
+        init_tactile_checkpoint=init_tactile_checkpoint,
     )
     model.visual_backbone_model_name = experiment_model_config.get("visual_backbone_model_name", "")
     model.backbone_weights_path = getattr(args, "resolved_backbone_weights", "")
@@ -469,6 +1011,9 @@ def _load_model(args, model_cfg, device):
 
     print(f"📦 Loading checkpoint from: {args.checkpoint}")
     load_compatible_state_dict(model, args.checkpoint, load_backbone=False)
+    calibration = experiment_model_config.get("support_selector_calibration")
+    if isinstance(calibration, dict):
+        model.support_selector_calibration = calibration
     model = model.to(device)
     model.eval()
     return model
@@ -481,11 +1026,10 @@ def _resolve_experiment_model_metadata(args):
         with model_config_path.open("r", encoding="utf-8") as config_file:
             metadata.update(json.load(config_file))
 
-    if not model_config_path.is_file():
-        checkpoint = _load_checkpoint(args.checkpoint)
-        if isinstance(checkpoint, dict) and checkpoint.get("format") == "tactile_trainable_v2":
-            metadata.update(checkpoint.get("model_config", {}))
-            for key in (
+    checkpoint = _load_checkpoint(args.checkpoint)
+    if isinstance(checkpoint, dict) and checkpoint.get("format") == "tactile_trainable_v2":
+        metadata.update(checkpoint.get("model_config", {}))
+        for key in (
                 "visual_backbone",
                 "visual_backbone_model_name",
                 "backbone_weights",
@@ -500,7 +1044,40 @@ def _resolve_experiment_model_metadata(args):
                 "pool_valid_tokens",
                 "decoder_input_dim",
                 "pool_output_channels",
+                "decoder_hidden_dim",
                 "decoder_dropout_scale",
+                "local_anchor_count",
+                "local_anchor_neighbors",
+                "local_logit_delta_max",
+                "local_residual_dropout",
+                "freeze_local_residual_base",
+                "surface_basis_path",
+                "surface_basis_artifact_sha256",
+                "surface_basis_tensor_sha256",
+                "surface_sparse_basis_sha256",
+                "surface_valid_vertex_count",
+                "surface_maximum_support_count",
+                "surface_coefficient_dim",
+                "surface_coefficient_architecture",
+                "surface_coefficient_hidden_dim",
+                "surface_target_support_count",
+                "surface_background_probability",
+                "freeze_surface_feature_extractor",
+                "support_selector_mode",
+                "support_selector_thresholds",
+                "support_selector_no_contact_max",
+                "support_selector_contact_min",
+                "support_selector_dropout",
+                "support_selector_monotonicity_weight",
+                "support_selector_architecture",
+                "support_selector_feature_source",
+                "support_selector_neck_channels",
+                "support_selector_hidden_dim",
+                "support_selector_base_conditioning",
+                "support_selector_correction_min_precision",
+                "support_selector_calibration",
+                "init_tactile_checkpoint",
+                "init_tactile_checkpoint_sha256",
                 "index_schema_version",
                 "index_cache_key",
                 "indexed_sample_count",
@@ -516,9 +1093,12 @@ def _resolve_experiment_model_metadata(args):
                 "bbox_rescale_factor",
                 "bbox_source_policy",
                 "train_augmentation",
-            ):
-                if checkpoint.get(key) not in (None, "", []):
-                    metadata[key] = checkpoint[key]
+        ):
+            if checkpoint.get(key) not in (None, "", []):
+                metadata[key] = checkpoint[key]
+        _materialize_embedded_surface_basis(
+            checkpoint, metadata, args.checkpoint
+        )
 
     visual_backbone = str(metadata.get("visual_backbone", "dinov3_hplus"))
     if visual_backbone != "dinov3_hplus":
@@ -596,6 +1176,84 @@ def _resolve_experiment_model_metadata(args):
     args.model_metadata = metadata
     args.resolved_backbone_weights = str(weights_path)
     args.resolved_backbone_sha256 = actual_hash or expected_hash
+
+
+def _selector_contact_index(thresholds, contact_min):
+    matches = [
+        index
+        for index, value in enumerate(thresholds)
+        if np.isclose(float(value), float(contact_min), rtol=0.0, atol=1e-8)
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            "Support selector thresholds must contain contact_min exactly once"
+        )
+    return matches[0]
+
+
+def _resolve_selector_calibration(args):
+    is_selector = (
+        str(args.model_metadata.get("tactile_head_type", ""))
+        == "dense_v2_dino_support_selector"
+    )
+    if not is_selector:
+        if args.selector_calibration_input or args.selector_calibration_output:
+            raise ValueError(
+                "Selector calibration options require a support-selector checkpoint"
+            )
+        args.selector_checkpoint_sha256 = ""
+        args.selector_calibration = None
+        args.selector_calibration_source = ""
+        return
+    args.selector_checkpoint_sha256 = file_sha256(args.checkpoint)
+    calibration = None
+    calibration_source = ""
+    if args.selector_calibration_input:
+        path = Path(args.selector_calibration_input)
+        with path.open("r", encoding="utf-8") as handle:
+            artifact = json.load(handle)
+        expected_sha = str(artifact.get("checkpoint_sha256", "") or "")
+        if expected_sha and expected_sha != args.selector_checkpoint_sha256:
+            raise ValueError(
+                "Selector calibration checkpoint SHA256 mismatch: "
+                f"calibration={expected_sha}, checkpoint="
+                f"{args.selector_checkpoint_sha256}"
+            )
+        calibration = artifact.get("calibration", artifact)
+        calibration_source = str(path)
+    else:
+        embedded = args.model_metadata.get("support_selector_calibration")
+        if isinstance(embedded, dict) and embedded:
+            calibration = embedded
+            calibration_source = "compact_checkpoint"
+
+    if calibration is not None:
+        configured_thresholds = tuple(
+            float(value)
+            for value in args.model_metadata.get(
+                "support_selector_thresholds", (0.10,)
+            )
+        )
+        calibrated_thresholds = tuple(
+            float(value) for value in calibration.get("thresholds", ())
+        )
+        if calibrated_thresholds != configured_thresholds:
+            raise ValueError(
+                "Selector calibration output thresholds do not match checkpoint: "
+                f"calibration={calibrated_thresholds}, "
+                f"checkpoint={configured_thresholds}"
+            )
+        expected_mode = str(
+            args.model_metadata.get("support_selector_mode", "contact")
+        )
+        calibrated_mode = str(calibration.get("selector_mode", expected_mode))
+        if calibrated_mode != expected_mode:
+            raise ValueError(
+                "Selector calibration mode does not match checkpoint: "
+                f"calibration={calibrated_mode}, checkpoint={expected_mode}"
+            )
+    args.selector_calibration = calibration
+    args.selector_calibration_source = calibration_source
 
 
 def _empty_stats():
@@ -742,11 +1400,256 @@ def _empty_diagnostics():
     }
 
 
+def _empty_support_selector_stats(thresholds=()):
+    thresholds = tuple(float(value) for value in thresholds)
+    if not thresholds:
+        return {}
+    return {
+        "thresholds": thresholds,
+        "selector_all": np.zeros(4, dtype=np.float64),
+        "base_all": np.zeros(4, dtype=np.float64),
+        "selector_clear": np.zeros(4, dtype=np.float64),
+        "base_clear": np.zeros(4, dtype=np.float64),
+        "false_high_detected": 0.0,
+        "false_high_count": 0.0,
+        "false_low_recovered": 0.0,
+        "false_low_count": 0.0,
+        "disagreement_count": 0.0,
+        "valid_count": 0.0,
+        "ordinal_abs_error": 0.0,
+        "ordinal_exact": 0.0,
+        "ordinal_count": 0.0,
+        "monotonic_violation": 0.0,
+        "monotonic_count": 0.0,
+        "cumulative": np.zeros((len(thresholds), 4), dtype=np.float64),
+        "calibration_histogram": np.zeros(
+            (
+                selector_histogram_rows(len(thresholds)),
+                SELECTOR_HISTOGRAM_BINS,
+            ),
+            dtype=np.float64,
+        ),
+    }
+
+
+def _binary_counts_numpy(prediction, target, mask):
+    prediction = np.asarray(prediction, dtype=bool)
+    target = np.asarray(target, dtype=bool)
+    mask = np.asarray(mask, dtype=bool)
+    return np.asarray(
+        [
+            np.sum(prediction & target & mask),
+            np.sum(prediction & ~target & mask),
+            np.sum(~prediction & target & mask),
+            np.sum(~prediction & ~target & mask),
+        ],
+        dtype=np.float64,
+    )
+
+
+def _update_support_selector_stats(
+    stats,
+    selector_logits,
+    selector_probabilities,
+    base_prediction,
+    target,
+    palm_mask,
+    *,
+    no_contact_max,
+    contact_min,
+    selector_mode,
+):
+    thresholds = tuple(float(value) for value in stats["thresholds"])
+    contact_matches = [
+        index
+        for index, value in enumerate(thresholds)
+        if np.isclose(value, float(contact_min), rtol=0.0, atol=1e-8)
+    ]
+    if len(contact_matches) != 1:
+        raise RuntimeError(
+            "Support selector thresholds must contain contact_min exactly once"
+        )
+    palm = np.asarray(palm_mask, dtype=bool)[None, :]
+    palm = np.broadcast_to(palm, target.shape)
+    selector_contact = selector_probabilities[:, contact_matches[0]] >= 0.5
+    base_contact = base_prediction >= float(contact_min)
+    gt_contact = target >= float(contact_min)
+    clear = palm & ((target <= float(no_contact_max)) | gt_contact)
+    selector_eligible = palm
+    if str(selector_mode) == "down_error":
+        selector_eligible = clear & base_contact
+    stats["selector_all"] += _binary_counts_numpy(
+        selector_contact, gt_contact, selector_eligible
+    )
+    stats["base_all"] += _binary_counts_numpy(
+        base_contact, gt_contact, selector_eligible
+    )
+    stats["selector_clear"] += _binary_counts_numpy(
+        selector_contact, gt_contact, clear & selector_eligible
+    )
+    stats["base_clear"] += _binary_counts_numpy(
+        base_contact, gt_contact, clear & selector_eligible
+    )
+    false_high = clear & ~gt_contact & base_contact
+    false_low = clear & gt_contact & ~base_contact
+    stats["false_high_detected"] += float(
+        np.sum(false_high & ~selector_contact)
+    )
+    stats["false_high_count"] += float(np.sum(false_high))
+    if str(selector_mode) != "down_error":
+        stats["false_low_recovered"] += float(
+            np.sum(false_low & selector_contact)
+        )
+    stats["false_low_count"] += float(np.sum(false_low))
+    stats["disagreement_count"] += float(
+        np.sum((selector_contact != base_contact) & selector_eligible)
+    )
+    stats["valid_count"] += float(np.sum(selector_eligible))
+
+    gt_bin = np.stack([target > threshold for threshold in thresholds], axis=1).sum(axis=1)
+    if str(selector_mode) == "down_error":
+        gt_bin = gt_contact.astype(gt_bin.dtype, copy=False)
+    pred_bin = (selector_probabilities >= 0.5).sum(axis=1)
+    stats["ordinal_abs_error"] += float(
+        np.sum(np.abs(pred_bin - gt_bin) * selector_eligible)
+    )
+    stats["ordinal_exact"] += float(
+        np.sum((pred_bin == gt_bin) & selector_eligible)
+    )
+    stats["ordinal_count"] += float(np.sum(selector_eligible))
+    if len(thresholds) > 1:
+        expanded_palm = np.broadcast_to(
+            selector_eligible[:, None, :],
+            (palm.shape[0], len(thresholds) - 1, palm.shape[1]),
+        )
+        stats["monotonic_violation"] += float(
+            np.sum(
+                (selector_probabilities[:, 1:] > selector_probabilities[:, :-1])
+                & expanded_palm
+            )
+        )
+        stats["monotonic_count"] += float(np.sum(expanded_palm))
+    for index, threshold in enumerate(thresholds):
+        cumulative_target = target > threshold
+        if str(selector_mode) == "down_error":
+            cumulative_target = gt_contact
+        stats["cumulative"][index] += _binary_counts_numpy(
+            selector_probabilities[:, index] >= 0.5,
+            cumulative_target,
+            selector_eligible,
+        )
+
+    logits = np.asarray(selector_logits, dtype=np.float32)
+    if logits.shape != selector_probabilities.shape:
+        raise ValueError("Selector logits/probabilities have different shapes")
+    if not np.isfinite(logits).all():
+        raise FloatingPointError("Support selector produced non-finite eval logits")
+    scale = SELECTOR_HISTOGRAM_BINS / (
+        SELECTOR_LOGIT_MAX - SELECTOR_LOGIT_MIN
+    )
+    bin_indices = np.floor(
+        (np.clip(logits, SELECTOR_LOGIT_MIN, SELECTOR_LOGIT_MAX)
+         - SELECTOR_LOGIT_MIN)
+        * scale
+    ).astype(np.int64)
+    np.clip(bin_indices, 0, SELECTOR_HISTOGRAM_BINS - 1, out=bin_indices)
+    histogram = stats["calibration_histogram"]
+    layout = selector_histogram_layout(len(thresholds))
+
+    def add_histogram(row, indices, mask):
+        selected = indices[np.asarray(mask, dtype=bool)]
+        if selected.size:
+            histogram[int(row)] += np.bincount(
+                selected,
+                minlength=SELECTOR_HISTOGRAM_BINS,
+            )
+
+    for output_index, threshold in enumerate(thresholds):
+        labels = (
+            target >= float(contact_min)
+            if str(selector_mode) in {"contact", "down_error"}
+            else target > threshold
+        )
+        pair = layout["cumulative"][output_index]
+        add_histogram(
+            pair["positive"],
+            bin_indices[:, output_index],
+            selector_eligible & labels,
+        )
+        add_histogram(
+            pair["negative"],
+            bin_indices[:, output_index],
+            selector_eligible & ~labels,
+        )
+    contact_bins = bin_indices[:, contact_matches[0]]
+    add_histogram(
+        layout["clear_positive"],
+        contact_bins,
+        clear & selector_eligible & gt_contact,
+    )
+    add_histogram(
+        layout["clear_negative"],
+        contact_bins,
+        clear & selector_eligible & ~gt_contact,
+    )
+    add_histogram(layout["false_high"], contact_bins, false_high)
+    add_histogram(
+        layout["base_true_positive"],
+        contact_bins,
+        clear & gt_contact & base_contact,
+    )
+    if str(selector_mode) != "down_error":
+        add_histogram(layout["false_low"], contact_bins, false_low)
+        add_histogram(
+            layout["base_true_negative"],
+            contact_bins,
+            clear & ~gt_contact & ~base_contact,
+        )
+
+
+def _merge_support_selector_stats(items):
+    items = [item for item in items if item]
+    if not items:
+        return {}
+    thresholds = tuple(float(value) for value in items[0]["thresholds"])
+    merged = _empty_support_selector_stats(thresholds)
+    for item in items:
+        if tuple(float(value) for value in item["thresholds"]) != thresholds:
+            raise RuntimeError("Evaluation workers used different selector thresholds")
+        for key in (
+            "selector_all",
+            "base_all",
+            "selector_clear",
+            "base_clear",
+            "cumulative",
+            "calibration_histogram",
+        ):
+            merged[key] += np.asarray(item[key], dtype=np.float64)
+        for key in (
+            "false_high_detected",
+            "false_high_count",
+            "false_low_recovered",
+            "false_low_count",
+            "disagreement_count",
+            "valid_count",
+            "ordinal_abs_error",
+            "ordinal_exact",
+            "ordinal_count",
+            "monotonic_violation",
+            "monotonic_count",
+        ):
+            merged[key] += float(item[key])
+    return merged
+
+
 def _empty_eval_result():
     return {
         "stats": _empty_stats(),
+        "base_stats": _empty_stats(),
         "diagnostics": _empty_diagnostics(),
         "touchanything_protocol_stats": {},
+        "base_touchanything_protocol_stats": {},
+        "support_selector_stats": {},
     }
 
 
@@ -839,14 +1742,24 @@ def _trim_frame_diagnostics(diag, max_frames, seed=2026):
 
 def _merge_eval_results(items, max_frames):
     stats = _merge_stats([item["stats"] for item in items])
+    base_stats = _merge_stats([item.get("base_stats", {}) for item in items])
     diagnostics = _merge_diagnostics([item["diagnostics"] for item in items], max_frames)
     touchanything_protocol_stats = merge_compact_touchanything_protocol_stats(
         [item.get("touchanything_protocol_stats", {}) for item in items]
     )
+    base_touchanything_protocol_stats = merge_compact_touchanything_protocol_stats(
+        [item.get("base_touchanything_protocol_stats", {}) for item in items]
+    )
+    support_selector_stats = _merge_support_selector_stats(
+        [item.get("support_selector_stats", {}) for item in items]
+    )
     return {
         "stats": stats,
+        "base_stats": base_stats,
         "diagnostics": diagnostics,
         "touchanything_protocol_stats": touchanything_protocol_stats,
+        "base_touchanything_protocol_stats": base_touchanything_protocol_stats,
+        "support_selector_stats": support_selector_stats,
     }
 
 
@@ -1737,9 +2650,47 @@ def _write_frame_binned_outputs(out_dir, frame, provenance, args):
     plt.close(fig)
 
 
-def _evaluate_sample_records(args, data_dirs, sample_records, worker_rank=0, show_progress=True):
+def _managed_dataloader_batches(dataloader, *, description, position, show_progress):
+    data_iterator = iter(dataloader)
+    progress = (
+        tqdm(data_iterator, desc=description, position=position)
+        if show_progress
+        else data_iterator
+    )
+    try:
+        yield from progress
+    finally:
+        if show_progress:
+            progress.close()
+        shutdown_workers = getattr(data_iterator, "_shutdown_workers", None)
+        if callable(shutdown_workers):
+            shutdown_workers()
+
+
+def _evaluate_sample_records(
+    args,
+    data_dirs,
+    sample_records,
+    worker_rank=0,
+    show_progress=True,
+    selector_artifact_indices=None,
+):
     if len(sample_records) == 0:
         return _empty_eval_result()
+    if args.selector_artifact_output_dir:
+        if selector_artifact_indices is None:
+            raise RuntimeError(
+                "Selector artifact export requires explicit global artifact indices"
+            )
+        selector_artifact_indices = np.asarray(
+            selector_artifact_indices, dtype=np.int64
+        )
+        if selector_artifact_indices.shape != (len(sample_records),):
+            raise ValueError(
+                "Selector artifact index count differs from the worker sample shard: "
+                f"indices={len(selector_artifact_indices)}, "
+                f"samples={len(sample_records)}"
+            )
 
     device = torch.device(f'cuda:{worker_rank}' if torch.cuda.is_available() else 'cpu')
     if torch.cuda.is_available():
@@ -1773,17 +2724,45 @@ def _evaluate_sample_records(args, data_dirs, sample_records, worker_rank=0, sho
     )
 
     stats = _empty_stats()
+    base_stats = _empty_stats()
     diagnostics = _empty_diagnostics()
     touchanything_protocol_stats = CompactTouchAnythingProtocolAccumulator()
+    base_touchanything_protocol_stats = CompactTouchAnythingProtocolAccumulator()
+    support_selector_stats = {}
     palm_mask = None
     sample_cursor = 0
     exported_indices = []
     exported_predictions = []
     exported_sample_uids = []
-    iterator = tqdm(dataloader, desc=f"GPU {worker_rank} Evaluating", position=worker_rank) if show_progress else dataloader
+    exported_prediction_vertex_indices = None
+    exported_selector_indices = []
+    exported_selector_logits = []
+    exported_selector_sample_uids = []
+    exported_selector_sequence_keys = []
+    exported_selector_query_aliases = []
+    exported_selector_frame_indices = []
+    exported_base_predictions = []
+    exported_targets = []
+    selector_artifact_vertex_indices = None
+    selector_artifact_thresholds = None
+    selector_artifact_mode = None
+    selector_reference_hasher = hashlib.sha256()
+    iterator = _managed_dataloader_batches(
+        dataloader,
+        description=f"GPU {worker_rank} Evaluating",
+        position=worker_rank,
+        show_progress=show_progress,
+    )
     for batch in iterator:
         raw_batch_size = len(batch["dataset"]) if isinstance(batch.get("dataset"), (list, tuple)) else int(batch["img"].shape[0])
-        batch_records = sample_records[sample_cursor:sample_cursor + raw_batch_size]
+        batch_start = sample_cursor
+        batch_stop = sample_cursor + raw_batch_size
+        batch_records = sample_records[batch_start:batch_stop]
+        batch_selector_indices = (
+            selector_artifact_indices[batch_start:batch_stop]
+            if selector_artifact_indices is not None
+            else None
+        )
         sample_cursor += raw_batch_size
 
         batch = recursive_to(batch, device)
@@ -1798,10 +2777,110 @@ def _evaluate_sample_records(args, data_dirs, sample_records, worker_rank=0, sho
             out = model.forward_step(batch, train=False)
 
         pred_tactile = out['pred_tactile'].detach().cpu().numpy()[valid_tactile_mask]
+        base_prediction = out.get("base_pred_tactile")
+        if base_prediction is not None:
+            base_prediction = (
+                base_prediction.detach().cpu().numpy()[valid_tactile_mask]
+            )
         gt_tactile = batch['tactile_signal'].detach().cpu().numpy()[valid_tactile_mask]
+        selector_probabilities = out.get("support_selector_probabilities")
+        selector_logits_numpy = None
+        if selector_probabilities is not None:
+            selector_logits = (
+                out["support_selector_logits"]
+                .detach()
+                .float()
+                .cpu()
+                .numpy()[valid_tactile_mask]
+            )
+            selector_logits_numpy = selector_logits
+            selector_probabilities = (
+                selector_probabilities.detach().cpu().numpy()[valid_tactile_mask]
+            )
+            thresholds = tuple(
+                float(value)
+                for value in out.get(
+                    "support_selector_thresholds",
+                    getattr(model, "support_selector_thresholds", ()),
+                )
+            )
+            if not support_selector_stats:
+                support_selector_stats = _empty_support_selector_stats(thresholds)
+            _update_support_selector_stats(
+                support_selector_stats,
+                selector_logits,
+                selector_probabilities,
+                pred_tactile,
+                gt_tactile,
+                palm_mask,
+                no_contact_max=float(model.support_selector_no_contact_max),
+                contact_min=float(model.support_selector_contact_min),
+                selector_mode=str(model.support_selector_mode),
+            )
         valid_records = [
             record for record, is_valid in zip(batch_records, valid_tactile_mask) if is_valid
         ]
+        if args.selector_artifact_output_dir:
+            if selector_logits_numpy is None:
+                raise RuntimeError(
+                    "--selector_artifact_output_dir requires a support-selector checkpoint"
+                )
+            if batch_selector_indices is None:
+                raise RuntimeError("Selector artifact indices were not propagated")
+            if palm_mask is None:
+                raise RuntimeError("Selector artifact export did not resolve a palm mask")
+            current_vertices = np.flatnonzero(palm_mask).astype(np.int32)
+            current_thresholds = np.asarray(thresholds, dtype=np.float64)
+            current_mode = str(model.support_selector_mode)
+            if selector_artifact_vertex_indices is None:
+                selector_artifact_vertex_indices = current_vertices
+                selector_artifact_thresholds = current_thresholds
+                selector_artifact_mode = current_mode
+            elif (
+                selector_artifact_mode != current_mode
+                or not np.array_equal(
+                    selector_artifact_vertex_indices, current_vertices
+                )
+                or not np.array_equal(
+                    selector_artifact_thresholds, current_thresholds
+                )
+            ):
+                raise RuntimeError("Selector artifact schema changed within one worker")
+            artifact_indices = batch_selector_indices[valid_tactile_mask]
+            artifact_base = (
+                base_prediction if base_prediction is not None else pred_tactile
+            )[:, palm_mask]
+            artifact_target = gt_tactile[:, palm_mask]
+            artifact_logits = selector_logits_numpy[:, :, palm_mask]
+            artifact_base = np.ascontiguousarray(
+                artifact_base.astype(np.float16, copy=False)
+            )
+            artifact_target = np.ascontiguousarray(
+                artifact_target.astype(np.float16, copy=False)
+            )
+            artifact_logits = np.ascontiguousarray(
+                artifact_logits.astype(np.float16, copy=False)
+            )
+            selector_reference_hasher.update(artifact_base.tobytes())
+            selector_reference_hasher.update(artifact_target.tobytes())
+            exported_selector_indices.append(artifact_indices)
+            exported_selector_logits.append(artifact_logits)
+            exported_selector_sample_uids.extend(
+                str(record.get("sample_uid", "")) for record in valid_records
+            )
+            exported_selector_sequence_keys.extend(
+                str(record.get("sequence_key", "")) for record in valid_records
+            )
+            exported_selector_query_aliases.extend(
+                str(record.get("query_alias", record.get("hand", "")))
+                for record in valid_records
+            )
+            exported_selector_frame_indices.extend(
+                int(record.get("frame_idx", -1)) for record in valid_records
+            )
+            if args.selector_artifact_include_reference:
+                exported_base_predictions.append(artifact_base)
+                exported_targets.append(artifact_target)
         if args.prediction_output_dir:
             missing_indices = [
                 record.get("sample_uid", "")
@@ -1819,7 +2898,24 @@ def _evaluate_sample_records(args, data_dirs, sample_records, worker_rank=0, sho
                     dtype=np.int64,
                 )
             )
-            exported_predictions.append(pred_tactile.astype(np.float16, copy=False))
+            current_prediction_vertices = (
+                np.flatnonzero(palm_mask).astype(np.int32)
+                if args.prediction_palm_only
+                else np.arange(pred_tactile.shape[1], dtype=np.int32)
+            )
+            if exported_prediction_vertex_indices is None:
+                exported_prediction_vertex_indices = current_prediction_vertices
+            elif not np.array_equal(
+                exported_prediction_vertex_indices, current_prediction_vertices
+            ):
+                raise RuntimeError(
+                    "Prediction export vertex indices changed within one worker"
+                )
+            exported_predictions.append(
+                pred_tactile[:, current_prediction_vertices].astype(
+                    np.float16, copy=False
+                )
+            )
             exported_sample_uids.extend(
                 str(record.get("sample_uid", "")) for record in valid_records
             )
@@ -1832,6 +2928,16 @@ def _evaluate_sample_records(args, data_dirs, sample_records, worker_rank=0, sho
             active_thr=args.active_pressure_thr,
             background_thr=args.background_pressure_thr,
         )
+        if base_prediction is not None:
+            _update_stats(
+                base_stats,
+                base_prediction,
+                gt_tactile,
+                palm_mask,
+                args.contact_thr,
+                active_thr=args.active_pressure_thr,
+                background_thr=args.background_pressure_thr,
+            )
         pred_palm = pred_tactile[:, palm_mask] if palm_mask is not None else pred_tactile
         gt_palm = gt_tactile[:, palm_mask] if palm_mask is not None else gt_tactile
         touch_indices = [
@@ -1859,6 +2965,31 @@ def _evaluate_sample_records(args, data_dirs, sample_records, worker_rank=0, sho
                 [valid_records[index].get("frame_idx", 0) for index in touch_indices],
                 touch_frame_stats,
             )
+            if base_prediction is not None:
+                base_palm = (
+                    base_prediction[:, palm_mask]
+                    if palm_mask is not None
+                    else base_prediction
+                )
+                base_touch_frame_stats = touchanything_protocol_frame_stats(
+                    base_palm[touch_indices],
+                    gt_palm[touch_indices],
+                    value_axis=1,
+                    contact_threshold=args.touchanything_contact_thr,
+                )
+                base_touchanything_protocol_stats.add(
+                    [
+                        touchanything_protocol_group_key(
+                            valid_records[index].get("sequence_key", ""),
+                            valid_records[index].get(
+                                "query_alias", valid_records[index].get("hand", "")
+                            ),
+                        )
+                        for index in touch_indices
+                    ],
+                    [valid_records[index].get("frame_idx", 0) for index in touch_indices],
+                    base_touch_frame_stats,
+                )
         if args.save_diagnostics or args.save_visualizations:
             _update_diagnostics(
                 diagnostics,
@@ -1886,6 +3017,8 @@ def _evaluate_sample_records(args, data_dirs, sample_records, worker_rank=0, sho
         _trim_frame_diagnostics(diagnostics, args.diagnostic_max_frames, seed=2026 + int(worker_rank))
 
     if args.prediction_output_dir:
+        if exported_prediction_vertex_indices is None:
+            raise RuntimeError("Prediction export worker produced no tactile records")
         output_root = Path(args.prediction_output_dir)
         shard_root = output_root / "shards"
         shard_root.mkdir(parents=True, exist_ok=True)
@@ -1897,7 +3030,9 @@ def _evaluate_sample_records(args, data_dirs, sample_records, worker_rank=0, sho
         predictions = (
             np.concatenate(exported_predictions, axis=0)
             if exported_predictions
-            else np.zeros((0, 13614), dtype=np.float16)
+            else np.zeros(
+                (0, len(exported_prediction_vertex_indices)), dtype=np.float16
+            )
         )
         if len(indices) != len(predictions) or len(indices) != len(exported_sample_uids):
             raise RuntimeError("Prediction artifact arrays have inconsistent lengths")
@@ -1909,6 +3044,7 @@ def _evaluate_sample_records(args, data_dirs, sample_records, worker_rank=0, sho
             indices=indices[order],
             predictions=predictions[order],
             sample_uids=np.asarray(exported_sample_uids, dtype=str)[order],
+            vertex_indices=exported_prediction_vertex_indices,
         )
         os.replace(temporary, target)
         print(
@@ -1916,14 +3052,76 @@ def _evaluate_sample_records(args, data_dirs, sample_records, worker_rank=0, sho
             flush=True,
         )
 
+    if args.selector_artifact_output_dir:
+        if selector_artifact_vertex_indices is None:
+            raise RuntimeError("Selector artifact worker produced no tactile records")
+        output_root = Path(args.selector_artifact_output_dir)
+        shard_root = output_root / "shards"
+        shard_root.mkdir(parents=True, exist_ok=True)
+        indices = np.concatenate(exported_selector_indices)
+        logits = np.concatenate(exported_selector_logits, axis=0)
+        if len(indices) != len(logits) or len(indices) != len(
+            exported_selector_sample_uids
+        ):
+            raise RuntimeError("Selector artifact arrays have inconsistent lengths")
+        order = np.argsort(indices, kind="stable")
+        payload = {
+            "indices": indices[order],
+            "sample_uids": np.asarray(
+                exported_selector_sample_uids, dtype=str
+            )[order],
+            "sequence_keys": np.asarray(
+                exported_selector_sequence_keys, dtype=str
+            )[order],
+            "query_aliases": np.asarray(
+                exported_selector_query_aliases, dtype=str
+            )[order],
+            "frame_indices": np.asarray(
+                exported_selector_frame_indices, dtype=np.int64
+            )[order],
+            "selector_logits": logits[order],
+            "vertex_indices": selector_artifact_vertex_indices,
+            "selector_thresholds": selector_artifact_thresholds,
+            "selector_mode": np.asarray(selector_artifact_mode),
+            "reference_sha256": np.asarray(
+                selector_reference_hasher.hexdigest()
+            ),
+        }
+        if args.selector_artifact_include_reference:
+            payload["base_predictions"] = np.concatenate(
+                exported_base_predictions, axis=0
+            )[order]
+            payload["targets"] = np.concatenate(exported_targets, axis=0)[order]
+        target = shard_root / f"worker_{int(worker_rank):02d}.npz"
+        temporary = target.with_name(f".{target.stem}.{os.getpid()}.tmp.npz")
+        np.savez(temporary, **payload)
+        os.replace(temporary, target)
+        print(
+            f"[selector-artifact] worker={worker_rank} records={len(indices)} "
+            f"path={target}",
+            flush=True,
+        )
+
     return {
         "stats": stats,
+        "base_stats": base_stats,
         "diagnostics": diagnostics,
         "touchanything_protocol_stats": touchanything_protocol_stats.pack(),
+        "base_touchanything_protocol_stats": (
+            base_touchanything_protocol_stats.pack()
+        ),
+        "support_selector_stats": support_selector_stats,
     }
 
 
-def _eval_worker(rank, args, data_dirs, sample_records, queue):
+def _eval_worker(
+    rank,
+    args,
+    data_dirs,
+    sample_records,
+    selector_artifact_indices,
+    queue,
+):
     initialize_worker_parent_death_signal()
     try:
         result = _evaluate_sample_records(
@@ -1932,6 +3130,7 @@ def _eval_worker(rank, args, data_dirs, sample_records, queue):
             sample_records,
             worker_rank=rank,
             show_progress=True,
+            selector_artifact_indices=selector_artifact_indices,
         )
         queue.put((rank, result, None))
     except Exception:
@@ -2103,6 +3302,416 @@ def _format_report(
     return "\n".join(report_lines)
 
 
+def _write_local_base_vs_fused_summary(args, report_path, result):
+    base_stats = result.get("base_stats", {})
+    if int(base_stats.get("total_frames", 0)) <= 0:
+        return None, None
+    fused_summary = _stats_summary(
+        result["stats"],
+        result.get("touchanything_protocol_stats", {}),
+        touchanything_min_contact_ratio=args.touchanything_min_contact_ratio,
+    )
+    base_summary = _stats_summary(
+        base_stats,
+        result.get("base_touchanything_protocol_stats", {}),
+        touchanything_min_contact_ratio=args.touchanything_min_contact_ratio,
+    )
+    if fused_summary is None or base_summary is None:
+        return None, None
+
+    def selected(summary):
+        touch = summary.get("touchanything_protocol", {})
+        return {
+            "mae": summary["mae"],
+            "rmse": summary["rmse"],
+            "frame_pcc": summary["pcc"],
+            "contact_iou": summary["contact_iou"],
+            "volumetric_iou": summary["volumetric_iou_frame_macro"],
+            "core_distribution_viou": summary["core_distribution_viou"],
+            "pred_gt_volume_ratio": summary["pred_gt_volume_ratio"],
+            "false_high_excess_volume_fraction": summary[
+                "false_high_gt005_pred03_excess_volume_fraction"
+            ],
+            "catastrophic_over_rate": summary["catastrophic_over_rate"],
+            "ta_contact_iou": touch.get("contact_iou", float("nan")),
+            "ta_volumetric_iou": touch.get("volumetric_iou", float("nan")),
+            "ta_temporal_accuracy": touch.get("temporal_accuracy", float("nan")),
+        }
+
+    base_values = selected(base_summary)
+    fused_values = selected(fused_summary)
+    output_path = os.path.join(
+        os.path.dirname(report_path), "local_base_vs_fused_summary.csv"
+    )
+    with open(output_path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(("metric", "base", "fused", "fused_minus_base"))
+        for metric in base_values:
+            base_value = float(base_values[metric])
+            fused_value = float(fused_values[metric])
+            writer.writerow(
+                (metric, base_value, fused_value, fused_value - base_value)
+            )
+    return output_path, {
+        "base": base_values,
+        "fused": fused_values,
+        "fused_minus_base": {
+            metric: float(fused_values[metric]) - float(base_values[metric])
+            for metric in base_values
+        },
+    }
+
+
+def _write_support_selector_summary(args, report_path, result):
+    stats = result.get("support_selector_stats", {})
+    if not stats:
+        if args.selector_calibration_output:
+            raise RuntimeError(
+                "--selector_calibration_output requires a support-selector checkpoint"
+            )
+        return None, None
+
+    rows = []
+    summary = {}
+    selector_mode = str(
+        args.model_metadata.get("support_selector_mode", "contact")
+    )
+    summary["selector_mode"] = selector_mode
+    summary["selector_base_conditioning"] = str(
+        args.model_metadata.get("support_selector_base_conditioning", "real")
+    )
+
+    def add_binary(scope, counts, threshold=""):
+        tp, fp, fn, tn = (float(value) for value in counts)
+        values = {
+            "iou": tp / max(tp + fp + fn, 1.0),
+            "precision": tp / max(tp + fp, 1.0),
+            "recall": tp / max(tp + fn, 1.0),
+            "f1": 2.0 * tp / max(2.0 * tp + fp + fn, 1.0),
+            "accuracy": (tp + tn) / max(tp + fp + fn + tn, 1.0),
+        }
+        summary[scope] = values
+        denominators = {
+            "iou": tp + fp + fn,
+            "precision": tp + fp,
+            "recall": tp + fn,
+            "f1": 2.0 * tp + fp + fn,
+            "accuracy": tp + fp + fn + tn,
+        }
+        numerators = {
+            "iou": tp,
+            "precision": tp,
+            "recall": tp,
+            "f1": 2.0 * tp,
+            "accuracy": tp + tn,
+        }
+        for metric, value in values.items():
+            rows.append(
+                [
+                    scope,
+                    threshold,
+                    metric,
+                    value,
+                    numerators[metric],
+                    denominators[metric],
+                ]
+            )
+
+    add_binary("selector_all", stats["selector_all"])
+    add_binary("base_pressure_all", stats["base_all"])
+    add_binary("selector_clear", stats["selector_clear"])
+    add_binary("base_pressure_clear", stats["base_clear"])
+    for index, threshold in enumerate(stats["thresholds"]):
+        add_binary(
+            f"selector_cumulative_{float(threshold):g}",
+            stats["cumulative"][index],
+            threshold=float(threshold),
+        )
+
+    scalar_metrics = {
+        "contact_iou_gain_vs_base": (
+            summary["selector_all"]["iou"]
+            - summary["base_pressure_all"]["iou"]
+        ),
+        "clear_iou_gain_vs_base": (
+            summary["selector_clear"]["iou"]
+            - summary["base_pressure_clear"]["iou"]
+        ),
+        "false_high_detect_rate": float(stats["false_high_detected"])
+        / max(float(stats["false_high_count"]), 1.0),
+        "false_low_recovery_rate": float(stats["false_low_recovered"])
+        / max(float(stats["false_low_count"]), 1.0),
+        "disagreement_rate": float(stats["disagreement_count"])
+        / max(float(stats["valid_count"]), 1.0),
+        "ordinal_bin_mae": float(stats["ordinal_abs_error"])
+        / max(float(stats["ordinal_count"]), 1.0),
+        "ordinal_bin_accuracy": float(stats["ordinal_exact"])
+        / max(float(stats["ordinal_count"]), 1.0),
+        "monotonic_violation_rate": float(stats["monotonic_violation"])
+        / max(float(stats["monotonic_count"]), 1.0),
+    }
+    scalar_counts = {
+        "false_high_detect_rate": (
+            stats["false_high_detected"], stats["false_high_count"]
+        ),
+        "false_low_recovery_rate": (
+            stats["false_low_recovered"], stats["false_low_count"]
+        ),
+        "disagreement_rate": (
+            stats["disagreement_count"], stats["valid_count"]
+        ),
+        "ordinal_bin_mae": (
+            stats["ordinal_abs_error"], stats["ordinal_count"]
+        ),
+        "ordinal_bin_accuracy": (
+            stats["ordinal_exact"], stats["ordinal_count"]
+        ),
+        "monotonic_violation_rate": (
+            stats["monotonic_violation"], stats["monotonic_count"]
+        ),
+    }
+    for metric, value in scalar_metrics.items():
+        numerator, denominator = scalar_counts.get(metric, ("", ""))
+        rows.append(
+            ["comparison", "", metric, value, numerator, denominator]
+        )
+    summary["comparison"] = scalar_metrics
+
+    thresholds = tuple(float(value) for value in stats["thresholds"])
+    contact_min = float(
+        args.model_metadata.get("support_selector_contact_min", 0.10)
+    )
+    contact_index = _selector_contact_index(thresholds, contact_min)
+    histogram = np.asarray(stats["calibration_histogram"], dtype=np.float64)
+    minimum_precision = float(
+        args.model_metadata.get(
+            "support_selector_correction_min_precision",
+            SELECTOR_CORRECTION_MIN_PRECISION,
+        )
+    )
+    oracle = summarize_selector_histograms(
+        histogram.tolist(),
+        thresholds,
+        contact_index=contact_index,
+        minimum_correction_precision=minimum_precision,
+    )
+    split_is_validation = str(args.split).strip().lower() in {"val", "validation"}
+    oracle_scope = "validation_fit" if split_is_validation else "test_oracle"
+    for metric, value in oracle["contact_clear"]["metrics"].items():
+        rows.append(
+            [
+                f"{oracle_scope}_selector_clear",
+                oracle["contact_clear"]["threshold_probability"],
+                metric,
+                value,
+                "",
+                "",
+            ]
+        )
+    for metric in ("average_precision", "roc_auc"):
+        value = float(oracle["contact_clear"][metric])
+        if np.isfinite(value):
+            rows.append(
+                [
+                    f"{oracle_scope}_selector_clear",
+                    oracle["contact_clear"]["threshold_probability"],
+                    metric,
+                    value,
+                    "",
+                    "",
+                ]
+            )
+    for item in oracle["cumulative"]:
+        scope = f"{oracle_scope}_cumulative_{float(item['target_threshold']):g}"
+        for metric, value in item["metrics"].items():
+            rows.append(
+                [scope, item["threshold_probability"], metric, value, "", ""]
+            )
+        for metric in ("average_precision", "roc_auc"):
+            value = float(item[metric])
+            if np.isfinite(value):
+                rows.append(
+                    [scope, item["threshold_probability"], metric, value, "", ""]
+                )
+    for direction, values in oracle["correction"].items():
+        for metric, value in values.items():
+            if isinstance(value, (int, float)):
+                rows.append(
+                    [
+                        f"{oracle_scope}_{direction}_correction",
+                        values["threshold_probability"],
+                        metric,
+                        value,
+                        "",
+                        "",
+                    ]
+                )
+
+    calibrated = None
+    calibrated_correction = None
+    calibration = getattr(args, "selector_calibration", None)
+    if calibration:
+        calibrated = calibrated_counts(
+            histogram.tolist(),
+            thresholds,
+            calibration["probability_thresholds"],
+            contact_index=contact_index,
+            threshold_indices=[
+                int(item["threshold_index"])
+                for item in calibration["cumulative"]
+            ],
+        )
+        calibrated_correction = calibrated_correction_counts(
+            histogram.tolist(),
+            thresholds,
+            calibration["correction"],
+        )
+        for metric, value in calibrated["contact_clear"]["metrics"].items():
+            rows.append(
+                [
+                    "validation_calibrated_selector_clear",
+                    calibrated["contact_clear"]["threshold_probability"],
+                    metric,
+                    value,
+                    "",
+                    "",
+                ]
+            )
+        calibrated_clear_iou = float(
+            calibrated["contact_clear"]["metrics"]["iou"]
+        )
+        calibrated_gain = calibrated_clear_iou - float(
+            summary["base_pressure_clear"]["iou"]
+        )
+        rows.append(
+            [
+                "validation_calibrated_comparison",
+                calibrated["contact_clear"]["threshold_probability"],
+                "clear_iou_gain_vs_base",
+                calibrated_gain,
+                "",
+                "",
+            ]
+        )
+        for item in calibrated["cumulative"]:
+            scope = (
+                "validation_calibrated_cumulative_"
+                f"{float(item['target_threshold']):g}"
+            )
+            for metric, value in item["metrics"].items():
+                rows.append(
+                    [scope, item["threshold_probability"], metric, value, "", ""]
+                )
+        for direction, values in calibrated_correction.items():
+            for metric, value in values.items():
+                rows.append(
+                    [
+                        f"validation_calibrated_{direction}_correction",
+                        values["threshold_probability"],
+                        metric,
+                        value,
+                        "",
+                        "",
+                    ]
+                )
+        if selector_mode == "down_error":
+            down = calibrated_correction["down"]
+            for metric in (
+                "precision",
+                "false_high_coverage",
+                "selected_count",
+            ):
+                rows.append(
+                    [
+                        "validation_calibrated_down_error",
+                        down["threshold_probability"],
+                        metric,
+                        down[metric],
+                        "",
+                        "",
+                    ]
+                )
+
+    curve = selector_threshold_curve(
+        histogram.tolist(),
+        thresholds,
+        contact_index=contact_index,
+    )
+    curve_path = os.path.join(
+        os.path.dirname(report_path), "support_selector_threshold_curve.csv"
+    )
+    curve_fields = list(curve[0])
+    _write_csv(
+        curve_path,
+        curve_fields,
+        [[item[field] for field in curve_fields] for item in curve],
+    )
+
+    calibration_output = None
+    if args.selector_calibration_output:
+        if not split_is_validation:
+            raise ValueError(
+                "Selector calibration may only be fitted on --split val or validation"
+            )
+        validation_calibration = dict(oracle)
+        validation_calibration.update(
+            {
+                "source": "validation_eval",
+                "selector_mode": str(
+                    args.model_metadata.get("support_selector_mode", "contact")
+                ),
+                "no_contact_max": float(
+                    args.model_metadata.get(
+                        "support_selector_no_contact_max", 0.02
+                    )
+                ),
+                "contact_min": contact_min,
+                "dataset": str(args.datasets or args.data_dir or ""),
+                "split": str(args.split),
+            }
+        )
+        artifact = _finite_json_value({
+            "format": "support_selector_calibration_v1",
+            "checkpoint_sha256": args.selector_checkpoint_sha256,
+            "checkpoint": str(args.checkpoint),
+            "calibration": validation_calibration,
+        })
+        calibration_path = Path(args.selector_calibration_output)
+        calibration_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = calibration_path.with_name(
+            f".{calibration_path.name}.tmp-{os.getpid()}"
+        )
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(artifact, handle, indent=2, sort_keys=True, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, calibration_path)
+        calibration_output = str(calibration_path)
+
+    output_path = os.path.join(
+        os.path.dirname(report_path), "support_selector_summary.csv"
+    )
+    _write_csv(
+        output_path,
+        ["scope", "threshold", "metric", "value", "numerator", "denominator"],
+        rows,
+    )
+    summary.update(
+        {
+            "validation_calibrated": calibrated,
+            "validation_calibrated_correction": calibrated_correction,
+            "calibration_source": getattr(
+                args, "selector_calibration_source", ""
+            ),
+            "calibration_output": calibration_output,
+            "threshold_curve": curve_path,
+            f"{oracle_scope}": oracle,
+        }
+    )
+    return output_path, summary
+
+
 def main():
     parser = argparse.ArgumentParser(description='Fast evaluation for the DINO tactile regressor')
     parser.add_argument('--checkpoint', type=str, default=None, help='Explicit trained tactile checkpoint path. Overrides --exp_name/--ckpt.')
@@ -2125,6 +3734,7 @@ def main():
         choices=[
             'loss-best',
             'contact-best',
+            'selector-best',
             'last',
         ],
         help='Checkpoint selector used with --exp_name.',
@@ -2145,7 +3755,10 @@ def main():
         '--datasets',
         type=str,
         default=None,
-        help='Dataset names/aliases, comma-separated: opentouch/ot, touchanything/egotouch/ta, egotactile/ego.',
+        help=(
+            'Dataset names/aliases, comma-separated: opentouch/ot, '
+            'touchanything/egotouch/ta, egotactile/ego, acedata/ace.'
+        ),
     )
     parser.add_argument(
         '--split',
@@ -2254,8 +3867,35 @@ def main():
         type=str,
         default='',
         help=(
-            'Optional atomic NPZ shard output for exact-subset predictions. '
-            'Every sample record must contain a unique _artifact_index.'
+            'Optional atomic NPZ shard output for predictions. The post-policy '
+            'dataset universe is frozen beside the shards as an exact manifest.'
+        ),
+    )
+    parser.add_argument(
+        '--prediction_palm_only',
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            'Store only valid palm vertices in prediction shards and bind the '
+            'selected vertex indices in export provenance.'
+        ),
+    )
+    parser.add_argument(
+        '--selector_artifact_output_dir',
+        type=str,
+        default='',
+        help=(
+            'Optional atomic shard output for per-vertex selector logits used by '
+            'the offline sufficiency audit.'
+        ),
+    )
+    parser.add_argument(
+        '--selector_artifact_include_reference',
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            'Store frozen-base predictions and GT beside selector logits. Enable '
+            'this for exactly one reference artifact to avoid duplicated storage.'
         ),
     )
     parser.add_argument('--index_cache_dir', type=str, default=os.path.join(base_dir, "hamer_tactile_ft", "index_cache"))
@@ -2287,6 +3927,24 @@ def main():
         default=None,
         help='Optional report filename. Defaults to eval_{datasets}_{split}.txt.',
     )
+    parser.add_argument(
+        '--selector_calibration_input',
+        type=str,
+        default='',
+        help=(
+            'Validation calibration JSON to apply. It must be bound to the '
+            'selected checkpoint SHA256.'
+        ),
+    )
+    parser.add_argument(
+        '--selector_calibration_output',
+        type=str,
+        default='',
+        help=(
+            'Write selector calibration fitted on this split. Only val or '
+            'validation splits are accepted.'
+        ),
+    )
     parser.add_argument('--save_diagnostics', action='store_true', help='Save dataset-level distribution diagnostics and plots.')
     parser.add_argument(
         '--save_visualizations',
@@ -2311,6 +3969,9 @@ def main():
         "hdf5_manifest_cache_dir",
         "index_manifest",
         "prediction_output_dir",
+        "selector_artifact_output_dir",
+        "selector_calibration_input",
+        "selector_calibration_output",
     ):
         value = getattr(args, name, None)
         if value:
@@ -2325,6 +3986,7 @@ def main():
         parser.error("--hdf5_handle_cache_size must be at least 1")
     args.checkpoint = _resolve_checkpoint_path(args)
     _resolve_experiment_model_metadata(args)
+    _resolve_selector_calibration(args)
     args.training_val_metrics_archive = _archive_training_val_metrics(args)
     print(f"Resolved checkpoint: {args.checkpoint}")
 
@@ -2397,22 +4059,68 @@ def main():
         return
 
     if args.prediction_output_dir:
-        if not args.sample_records_jsonl:
-            parser.error("--prediction_output_dir requires --sample_records_jsonl")
         _prepare_prediction_export(args)
+        dataset.samples = _materialize_prediction_sample_records(
+            args, dataset.samples
+        )
+        args.active_bbox_manifest_sha256 = dict(dataset.bbox_manifest_sha256)
+    if args.selector_artifact_output_dir:
+        if str(args.model_metadata.get("tactile_head_type", "")) != (
+            "dense_v2_dino_support_selector"
+        ):
+            parser.error(
+                "--selector_artifact_output_dir requires a support-selector checkpoint"
+            )
+        for artifact_index, record in enumerate(dataset.samples):
+            if not str(record.get("sample_uid", "")):
+                parser.error(
+                    "Selector artifact export requires sample_uid in every record; "
+                    f"missing at index {artifact_index}"
+                )
+        _prepare_selector_artifact_export(args)
+
+    selector_artifact_indices = (
+        np.arange(len(dataset.samples), dtype=np.int64)
+        if args.selector_artifact_output_dir
+        else None
+    )
 
     print(f"🔔 开始极速评估推理 | samples={len(dataset)} | GPUs={world_size} | batch_size/GPU={args.batch_size}")
     if world_size <= 1:
-        result = _evaluate_sample_records(args, data_dirs, dataset.samples, worker_rank=0, show_progress=True)
+        result = _evaluate_sample_records(
+            args,
+            data_dirs,
+            dataset.samples,
+            worker_rank=0,
+            show_progress=True,
+            selector_artifact_indices=selector_artifact_indices,
+        )
     else:
         shards = [dataset.samples[rank::world_size] for rank in range(world_size)]
+        selector_index_shards = (
+            [
+                selector_artifact_indices[rank::world_size]
+                for rank in range(world_size)
+            ]
+            if selector_artifact_indices is not None
+            else [None] * world_size
+        )
         ctx = mp.get_context("spawn")
         result_queue = ctx.Queue()
         procs = []
-        for rank, shard in enumerate(shards):
+        for rank, (shard, selector_index_shard) in enumerate(
+            zip(shards, selector_index_shards)
+        ):
             proc = ctx.Process(
                 target=_eval_worker,
-                args=(rank, args, data_dirs, shard, result_queue),
+                args=(
+                    rank,
+                    args,
+                    data_dirs,
+                    shard,
+                    selector_index_shard,
+                    result_queue,
+                ),
             )
             proc.start()
             procs.append(proc)
@@ -2469,6 +4177,9 @@ def main():
         result = _merge_eval_results(worker_results, args.diagnostic_max_frames)
 
     prediction_export = _finalize_prediction_export(args, dataset.samples)
+    selector_artifact_export = _finalize_selector_artifact_export(
+        args, dataset.samples
+    )
 
     stats = result["stats"]
 
@@ -2488,6 +4199,18 @@ def main():
     with open(report_path, "w", encoding="utf-8") as f_rep:
         f_rep.write(report_text + "\n")
     print(f"📝 最终评测报告已保存至: {report_path}")
+
+    local_comparison_path, local_comparison = (
+        _write_local_base_vs_fused_summary(args, report_path, result)
+    )
+    if local_comparison_path:
+        print(f"🧭 Local base/fused 对照已保存至: {local_comparison_path}")
+
+    selector_summary_path, selector_summary = _write_support_selector_summary(
+        args, report_path, result
+    )
+    if selector_summary_path:
+        print(f"Selector 独立对照已保存至: {selector_summary_path}")
 
     diagnostics_dir = _write_diagnostic_outputs(args, result)
     if diagnostics_dir:
@@ -2529,9 +4252,14 @@ def main():
         "loss_config": loss_config,
         "model_config": model_config,
         "report_path": report_path,
+        "local_base_vs_fused_summary": local_comparison_path,
+        "local_base_vs_fused_metrics": local_comparison,
+        "support_selector_summary": selector_summary_path,
+        "support_selector_metrics": selector_summary,
         "diagnostics_dir": diagnostics_dir,
         "training_val_metrics_archive": args.training_val_metrics_archive,
         "prediction_export": prediction_export,
+        "selector_artifact_export": selector_artifact_export,
         "metrics": _stats_summary(
             stats,
             result.get("touchanything_protocol_stats", {}),

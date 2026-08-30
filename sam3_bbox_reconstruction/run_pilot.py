@@ -64,6 +64,15 @@ except ImportError:  # Direct execution through run_pilot.sh.
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
+        "--input-manifest",
+        type=Path,
+        default=None,
+        help=(
+            "Use an externally materialized tracking manifest instead of discovering "
+            "OpenTouch/TouchAnything records. This is used by dataset-specific adapters."
+        ),
+    )
+    parser.add_argument(
         "--datasets",
         default="opentouch,touchanything",
         help="opentouch, touchanything, or a comma-separated combination.",
@@ -131,6 +140,21 @@ def parse_args() -> argparse.Namespace:
         help="TouchAnything skips glove/bare verifier replay by default.",
     )
     parser.add_argument(
+        "--egotactile-semantic-verification-mode",
+        choices=("inherit", "off", "report", "filter"),
+        default="off",
+        help="EgoTactile uses its known bare/gloved split and skips verifier replay by default.",
+    )
+    parser.add_argument(
+        "--acedata-semantic-verification-mode",
+        choices=("inherit", "off", "report", "filter"),
+        default="off",
+        help=(
+            "AceData clips are known to contain two gloved hands, so semantic "
+            "verifier replay is disabled by default."
+        ),
+    )
+    parser.add_argument(
         "--reload-predictor-per-job",
         action="store_true",
         help="Reload SAM for every sequence instead of reusing one predictor per worker.",
@@ -163,6 +187,75 @@ def read_jsonl(path: Path) -> list[dict]:
             if line.strip():
                 rows.append(json.loads(line))
     return rows
+
+
+def resolved_prompt_preset(args: argparse.Namespace, row: dict) -> str:
+    return str(row.get("prompt_preset", args.prompt_preset)).strip().lower()
+
+
+def resolved_tracker_dataset(row: dict) -> str:
+    return str(row.get("tracker_dataset", row["dataset"])).strip().lower()
+
+
+def resolved_prompt(args: argparse.Namespace, row: dict) -> str | None:
+    value = row.get("prompt", args.prompt)
+    return None if value is None else str(value)
+
+
+def validate_external_manifest(records: list[dict], path: Path) -> None:
+    required = {
+        "job_id",
+        "dataset",
+        "split",
+        "sequence_key",
+        "resource_path",
+        "resource_type",
+        "source_path",
+        "expected_gloved_hands",
+    }
+    if not records:
+        raise ValueError(f"External tracking manifest is empty: {path}")
+    job_ids: set[str] = set()
+    sequence_keys: set[tuple[str, str, str]] = set()
+    for line_number, row in enumerate(records, start=1):
+        missing = sorted(required - set(row))
+        if missing:
+            raise ValueError(f"{path}:{line_number}: missing fields {missing}")
+        resource = Path(str(row["resource_path"])).expanduser()
+        if not resource.is_file() and not resource.is_dir():
+            raise FileNotFoundError(
+                f"{path}:{line_number}: tracking resource does not exist: {resource}"
+            )
+        job_id = str(row["job_id"])
+        if job_id in job_ids:
+            raise ValueError(f"{path}:{line_number}: duplicate job_id={job_id!r}")
+        job_ids.add(job_id)
+        identity = (
+            str(row["dataset"]),
+            str(row["split"]),
+            str(row["sequence_key"]),
+        )
+        if identity in sequence_keys:
+            raise ValueError(f"{path}:{line_number}: duplicate sequence identity={identity!r}")
+        sequence_keys.add(identity)
+
+
+def materialize_external_manifest(input_path: Path, output_dir: Path) -> tuple[Path, list[dict]]:
+    input_path = input_path.expanduser().resolve()
+    if not input_path.is_file():
+        raise FileNotFoundError(input_path)
+    records = read_jsonl(input_path)
+    validate_external_manifest(records, input_path)
+    output_path = output_dir / "pilot_manifest.jsonl"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = input_path.read_bytes()
+    if output_path.resolve() != input_path:
+        temporary = output_path.with_name(
+            f".{output_path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+        )
+        temporary.write_bytes(payload)
+        os.replace(temporary, output_path)
+    return output_path, records
 
 
 def mask_previews_enabled(args: argparse.Namespace) -> bool:
@@ -263,13 +356,17 @@ def resolved_semantic_verification_mode(args: argparse.Namespace, row: dict) -> 
     never enters the tactile model or assigns a left/right pressure target.
     """
 
-    if args.prompt_preset != "gloved":
+    if resolved_prompt_preset(args, row) != "gloved":
         return "off"
     dataset = str(row.get("dataset", ""))
     if dataset == "opentouch":
         configured = args.opentouch_semantic_verification_mode
     elif dataset == "touchanything":
         configured = args.touchanything_semantic_verification_mode
+    elif dataset == "egotactile":
+        configured = args.egotactile_semantic_verification_mode
+    elif dataset == "acedata":
+        configured = args.acedata_semantic_verification_mode
     else:
         raise ValueError(f"Unsupported pilot dataset for semantic policy: {dataset!r}")
     return args.bare_verification_mode if configured == "inherit" else configured
@@ -278,6 +375,7 @@ def resolved_semantic_verification_mode(args: argparse.Namespace, row: dict) -> 
 def resolved_verifier_prompts(
     args: argparse.Namespace,
     semantic_verification_mode: str | None = None,
+    row: dict | None = None,
 ) -> tuple[list[str], list[str]]:
     """Resolve the exact verifier lists persisted by track_video.py."""
 
@@ -286,10 +384,13 @@ def resolved_verifier_prompts(
         if semantic_verification_mode is None
         else semantic_verification_mode
     )
-    if args.prompt_preset != "gloved" or mode == "off":
+    prompt_preset = (
+        args.prompt_preset if row is None else resolved_prompt_preset(args, row)
+    )
+    if prompt_preset != "gloved" or mode == "off":
         return [], []
     glove, bare = resolve_verifier_prompt_lists(
-        load_prompt_preset(args.prompt_preset),
+        load_prompt_preset(prompt_preset),
         glove_value=args.glove_verification_prompts,
         bare_value=args.bare_verification_prompts,
         legacy_bare_prompt=args.bare_verification_prompt,
@@ -311,12 +412,15 @@ def complete(job_dir: Path, args: argparse.Namespace, row: dict) -> bool:
         glove_verifiers, bare_verifiers = resolved_verifier_prompts(
             args,
             semantic_verification_mode,
+            row,
         )
+        prompt_preset = resolved_prompt_preset(args, row)
+        prompt = resolved_prompt(args, row)
         expected = {
             "sam_version": args.sam_version,
             "checkpoint": str(args.checkpoint) if args.checkpoint else None,
-            "dataset": row["dataset"],
-            "prompt_preset": args.prompt_preset,
+            "dataset": resolved_tracker_dataset(row),
+            "prompt_preset": prompt_preset,
             "propagation_direction": args.propagation_direction,
             "max_frames": args.max_frames,
             "max_objects": resolved_max_objects(args, row),
@@ -392,7 +496,7 @@ def complete(job_dir: Path, args: argparse.Namespace, row: dict) -> bool:
         }
         scientific_match = summary.get("status") == "complete" and all(
             config.get(key) == value for key, value in expected.items()
-        ) and (args.prompt is None or config.get("prompt") == args.prompt)
+        ) and (prompt is None or config.get("prompt") == prompt)
         preview_match = (
             not mask_previews_enabled(args) or config.get("mask_previews", True)
         )
@@ -409,6 +513,8 @@ def track_video_argv(args: argparse.Namespace, row: dict, job_dir: Path) -> list
     """Build a track_video CLI payload without creating a subprocess."""
 
     semantic_verification_mode = resolved_semantic_verification_mode(args, row)
+    prompt_preset = resolved_prompt_preset(args, row)
+    prompt = resolved_prompt(args, row)
     command = [
         "--resource",
         row["resource_path"],
@@ -417,11 +523,11 @@ def track_video_argv(args: argparse.Namespace, row: dict, job_dir: Path) -> list
         "--sam-version",
         args.sam_version,
         "--dataset",
-        row["dataset"],
+        resolved_tracker_dataset(row),
         "--expected-gloved-hands",
         str(row["expected_gloved_hands"]),
         "--prompt-preset",
-        args.prompt_preset,
+        prompt_preset,
         "--propagation-direction",
         args.propagation_direction,
         "--max-frames",
@@ -537,8 +643,8 @@ def track_video_argv(args: argparse.Namespace, row: dict, job_dir: Path) -> list
         and getattr(args, "opentouch_materialization", "lazy") == "stream"
     ):
         command.extend(["--hdf5-source", str(row["source_path"])])
-    if args.prompt:
-        command.extend(["--prompt", args.prompt])
+    if prompt:
+        command.extend(["--prompt", prompt])
     if args.bare_verification_prompt:
         command.extend(["--bare-verification-prompt", args.bare_verification_prompt])
     if args.allow_missing_prompt_score:
@@ -855,7 +961,16 @@ def last_log_line(path: Path, max_bytes: int = 4096) -> str:
 
 def main() -> int:
     args = resolve_storage_policy(parse_args())
-    selected_datasets = parse_dataset_selection(args.datasets)
+    external_records = None
+    if args.input_manifest is None:
+        selected_datasets = parse_dataset_selection(args.datasets)
+    else:
+        input_path = args.input_manifest.expanduser().resolve()
+        external_records = read_jsonl(input_path)
+        validate_external_manifest(external_records, input_path)
+        selected_datasets = tuple(
+            dict.fromkeys(str(row["dataset"]) for row in external_records)
+        )
     if args.output_dir is None:
         suffix = "_".join(selected_datasets)
         args.output_dir = Path(__file__).resolve().parent / "outputs" / f"pilot_{suffix}"
@@ -880,22 +995,27 @@ def main() -> int:
         flush=True,
     )
 
-    manifest_path = build_manifest(
-        opentouch_data_root=args.opentouch_data_root,
-        opentouch_splits=args.opentouch_splits,
-        touchanything_root=args.touchanything_root,
-        touchanything_split_json=args.touchanything_split_json,
-        output_dir=args.output_dir,
-        samples_per_split=args.samples_per_split,
-        samples_per_dataset=args.samples_per_dataset,
-        all_sequences=args.all_sequences,
-        seed=args.seed,
-        max_frames=args.max_frames,
-        materialize_opentouch=args.opentouch_materialization == "eager",
-        datasets=selected_datasets,
-        splits=args.splits,
-    )
-    records = read_jsonl(manifest_path)
+    if args.input_manifest is None:
+        manifest_path = build_manifest(
+            opentouch_data_root=args.opentouch_data_root,
+            opentouch_splits=args.opentouch_splits,
+            touchanything_root=args.touchanything_root,
+            touchanything_split_json=args.touchanything_split_json,
+            output_dir=args.output_dir,
+            samples_per_split=args.samples_per_split,
+            samples_per_dataset=args.samples_per_dataset,
+            all_sequences=args.all_sequences,
+            seed=args.seed,
+            max_frames=args.max_frames,
+            materialize_opentouch=args.opentouch_materialization == "eager",
+            datasets=selected_datasets,
+            splits=args.splits,
+        )
+        records = read_jsonl(manifest_path)
+    else:
+        manifest_path, records = materialize_external_manifest(
+            args.input_manifest, args.output_dir
+        )
     if (
         args.opentouch_materialization in {"stream", "lazy"}
         and not args.keep_materialized_opentouch
@@ -906,12 +1026,21 @@ def main() -> int:
     if args.manifest_only:
         return 0
     active_semantic_modes = {
-        resolved_semantic_verification_mode(args, row) for row in records
+        (resolved_semantic_verification_mode(args, row), resolved_prompt_preset(args, row))
+        for row in records
     }
-    for semantic_verification_mode in sorted(active_semantic_modes):
-        if args.prompt_preset != "gloved" or semantic_verification_mode != "filter":
+    for semantic_verification_mode, prompt_preset in sorted(active_semantic_modes):
+        if prompt_preset != "gloved" or semantic_verification_mode != "filter":
             continue
-        glove_verifiers, _ = resolved_verifier_prompts(args, semantic_verification_mode)
+        matching_row = next(
+            row
+            for row in records
+            if resolved_semantic_verification_mode(args, row) == semantic_verification_mode
+            and resolved_prompt_preset(args, row) == prompt_preset
+        )
+        glove_verifiers, _ = resolved_verifier_prompts(
+            args, semantic_verification_mode, matching_row
+        )
         if not glove_verifiers:
             raise ValueError(
                 "A filter-mode dataset requires at least one positive glove verifier; "
