@@ -42,7 +42,10 @@ from train import _load_checkpoint
 from train import file_sha256
 from train import load_compatible_state_dict
 from train import resolve_data_dirs
-from hamer_tactile import parse_input_resolution
+from hamer_tactile import (
+    CANONICAL_MODEL_INITIALIZATION_ORDER,
+    parse_input_resolution,
+)
 from hamer_config_assets import resolve_hamer_model_config_path
 from dataset import OpenTouchTactileDataset, canonical_dataset_filter
 from data.indexing import write_jsonl_atomic
@@ -851,6 +854,14 @@ def _load_model(args, model_cfg, device):
     )
     pool_output_channels = int(experiment_model_config.get("pool_output_channels", 32))
     decoder_hidden_dim = int(experiment_model_config.get("decoder_hidden_dim", 512))
+    center_aux_hidden_dim = int(
+        experiment_model_config.get("center_aux_hidden_dim", 128)
+    )
+    model_initialization_order = str(
+        experiment_model_config.get(
+            "model_initialization_order", CANONICAL_MODEL_INITIALIZATION_ORDER
+        )
+    )
     local_anchor_count = int(experiment_model_config.get("local_anchor_count", 512))
     local_anchor_neighbors = int(
         experiment_model_config.get("local_anchor_neighbors", 4)
@@ -964,6 +975,8 @@ def _load_model(args, model_cfg, device):
         input_resolution=input_resolution,
         pool_output_channels=pool_output_channels,
         decoder_hidden_dim=decoder_hidden_dim,
+        center_aux_hidden_dim=center_aux_hidden_dim,
+        model_initialization_order=model_initialization_order,
         local_anchor_count=local_anchor_count,
         local_anchor_neighbors=local_anchor_neighbors,
         local_logit_delta_max=local_logit_delta_max,
@@ -1045,6 +1058,17 @@ def _resolve_experiment_model_metadata(args):
                 "decoder_input_dim",
                 "pool_output_channels",
                 "decoder_hidden_dim",
+                "center_aux_hidden_dim",
+                "model_initialization_order",
+                "worker_seed_mode",
+                "hdf5_sample_order",
+                "hdf5_ordered_sample_sha256",
+                "val_hdf5_ordered_sample_sha256",
+                "hdf5_sample_set_sha256",
+                "crop_pipeline",
+                "replay_profile",
+                "initial_tactile_head_sha256",
+                "optimizer_backend_mode",
                 "decoder_dropout_scale",
                 "local_anchor_count",
                 "local_anchor_neighbors",
@@ -1135,6 +1159,29 @@ def _resolve_experiment_model_metadata(args):
             )
     args.input_resolution = checkpoint_resolution
     metadata["input_resolution"] = list(checkpoint_resolution)
+    checkpoint_crop_pipeline = str(
+        metadata.get("crop_pipeline", "legacy_square_center")
+    )
+    if args.crop_pipeline is not None and args.crop_pipeline != checkpoint_crop_pipeline:
+        raise ValueError(
+            "Explicit --crop_pipeline conflicts with checkpoint metadata: "
+            f"requested={args.crop_pipeline}, checkpoint={checkpoint_crop_pipeline}"
+        )
+    args.crop_pipeline = checkpoint_crop_pipeline
+    metadata["crop_pipeline"] = checkpoint_crop_pipeline
+    checkpoint_sample_order = str(
+        metadata.get("hdf5_sample_order", "legacy_sample_dir_hand")
+    )
+    if (
+        args.hdf5_sample_order is not None
+        and args.hdf5_sample_order != checkpoint_sample_order
+    ):
+        raise ValueError(
+            "Explicit --hdf5_sample_order conflicts with checkpoint metadata: "
+            f"requested={args.hdf5_sample_order}, checkpoint={checkpoint_sample_order}"
+        )
+    args.hdf5_sample_order = checkpoint_sample_order
+    metadata["hdf5_sample_order"] = checkpoint_sample_order
     bbox_rescale_factor = (
         args.bbox_rescale_factor
         if args.bbox_rescale_factor is not None
@@ -2706,12 +2753,15 @@ def _evaluate_sample_records(
         sample_records=sample_records,
         tactile_only=True,
         input_resolution=args.input_resolution,
+        crop_pipeline=args.crop_pipeline,
         bbox_rescale_factor=args.bbox_rescale_factor,
         bbox_source_policy=args.bbox_source_policy,
         data_backend=args.data_backend,
         query_manifests=args.query_manifests,
         hdf5_handle_cache_size=args.hdf5_handle_cache_size,
         hdf5_manifest_cache_dir=args.hdf5_manifest_cache_dir,
+        # sample_records already carry the globally assigned order for this worker.
+        hdf5_sample_order="manifest",
         lazy_index_records=(args.data_backend != "legacy_dirs"),
     )
     dataloader = torch.utils.data.DataLoader(
@@ -3775,6 +3825,18 @@ def main():
         help='Optional HEIGHTxWIDTH assertion; must match checkpoint metadata.',
     )
     parser.add_argument(
+        '--crop_pipeline',
+        choices=('direct_rectangle', 'legacy_square_center'),
+        default=None,
+        help='Optional crop-pipeline assertion; checkpoint metadata is authoritative.',
+    )
+    parser.add_argument(
+        '--hdf5_sample_order',
+        choices=('manifest', 'legacy_sample_dir_hand'),
+        default=None,
+        help='Optional HDF5-order assertion; checkpoint metadata is authoritative.',
+    )
+    parser.add_argument(
         '--bbox_rescale_factor',
         type=float,
         default=None,
@@ -4043,6 +4105,7 @@ def main():
         rebuild_index=args.rebuild_index,
         index_cache_timeout=args.index_cache_timeout,
         input_resolution=args.input_resolution,
+        crop_pipeline=args.crop_pipeline,
         bbox_rescale_factor=args.bbox_rescale_factor,
         bbox_source_policy=args.bbox_source_policy,
         bbox_manifests=args.bbox_manifests,
@@ -4051,6 +4114,7 @@ def main():
         query_manifests=args.query_manifests,
         hdf5_handle_cache_size=args.hdf5_handle_cache_size,
         hdf5_manifest_cache_dir=args.hdf5_manifest_cache_dir,
+        hdf5_sample_order=args.hdf5_sample_order,
         lazy_index_records=(args.data_backend != "legacy_dirs"),
     )
 

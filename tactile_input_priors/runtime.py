@@ -31,7 +31,10 @@ for _path in (REPO_ROOT, REPO_ROOT / "hamer_tactile_ft", REPO_ROOT / "hamer"):
 
 from hamer.configs import get_config  # noqa: E402
 from hamer_tactile_ft.dataset import OpenTouchTactileDataset  # noqa: E402
-from hamer_tactile_ft.hamer_tactile import DinoTactileModel  # noqa: E402
+from hamer_tactile_ft.hamer_tactile import (  # noqa: E402
+    CANONICAL_MODEL_INITIALIZATION_ORDER,
+    DinoTactileModel,
+)
 from hamer_tactile_ft.hamer_config_assets import (  # noqa: E402
     resolve_hamer_model_config_path,
 )
@@ -138,6 +141,7 @@ def _checkpoint_model_config(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
         "pool_output_channels",
         "decoder_hidden_dim",
         "decoder_dropout_scale",
+        "model_initialization_order",
         "bbox_rescale_factor",
         "bbox_source_policy",
         "dataset_filter",
@@ -201,6 +205,12 @@ def build_frozen_base(
         input_resolution=parse_resolution(config.get("input_resolution", (256, 192))),
         pool_output_channels=int(config.get("pool_output_channels", 32)),
         decoder_hidden_dim=int(config.get("decoder_hidden_dim", 512)),
+        model_initialization_order=str(
+            config.get(
+                "model_initialization_order",
+                CANONICAL_MODEL_INITIALIZATION_ORDER,
+            )
+        ),
         local_anchor_count=int(config.get("local_anchor_count", 512)),
         local_anchor_neighbors=int(config.get("local_anchor_neighbors", 4)),
         support_selector_mode=str(config.get("support_selector_mode", "contact")),
@@ -590,6 +600,8 @@ def build_dataset(
     depth_output_hw: Sequence[int] = (16, 12),
     hdf5_handle_cache_size: int = 4,
     hdf5_manifest_cache_dir: Optional[str] = None,
+    crop_pipeline: str = "legacy_square_center",
+    hdf5_sample_order: str = "legacy_sample_dir_hand",
     io_debug_enabled: bool = False,
     hdf5_batch_read_mode: str = "streaming",
 ) -> OpenTouchTactileDataset:
@@ -625,6 +637,7 @@ def build_dataset(
         train=train,
         tactile_only=True,
         input_resolution=parse_resolution(input_resolution),
+        crop_pipeline=str(crop_pipeline),
         bbox_rescale_factor=float(bbox_rescale_factor),
         bbox_source_policy=bbox_source_policy,
         bbox_manifests=[str(path) for path in bboxes],
@@ -634,6 +647,7 @@ def build_dataset(
         query_manifests=[str(path) for path in manifests],
         hdf5_handle_cache_size=int(hdf5_handle_cache_size),
         hdf5_manifest_cache_dir=hdf5_manifest_cache_dir,
+        hdf5_sample_order=str(hdf5_sample_order),
         depth_sidecar_root=depth_sidecar_root,
         depth_control="none",
         depth_output_hw=tuple(int(item) for item in depth_output_hw),

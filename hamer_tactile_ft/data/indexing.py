@@ -2085,6 +2085,68 @@ class DatasetIndexingMixin:
             normalized["bbox_xyxy"] = [float(value) for value in bbox]
         return normalized
 
+    @staticmethod
+    def _hdf5_legacy_sample_key(record):
+        relative_path = str(record.get("source_sample_relpath") or "").strip()
+        if not relative_path:
+            raise RuntimeError(
+                "legacy_sample_dir_hand ordering requires source_sample_relpath "
+                f"for sample_uid={record.get('sample_uid', '<missing>')!r}"
+            )
+        normalized_path = relative_path.replace("\\", "/").lstrip("./")
+        return normalized_path, str(record.get("hand") or "")
+
+    def _order_hdf5_samples(self, samples):
+        if self.hdf5_sample_order == "manifest":
+            return samples
+        if len(self.data_dirs) != 1:
+            raise RuntimeError(
+                "legacy_sample_dir_hand ordering is defined for one processed "
+                f"dataset root, got {self.data_dirs!r}"
+            )
+        samples.sort(key=self._hdf5_legacy_sample_key)
+        return samples
+
+    def _record_hdf5_sample_fingerprints(self, samples):
+        ordered_digest = hashlib.sha256()
+        previous_key = None
+        for record in samples:
+            if self.hdf5_sample_order == "legacy_sample_dir_hand":
+                key = self._hdf5_legacy_sample_key(record)
+                if key == previous_key:
+                    raise RuntimeError(
+                        "Duplicate legacy HDF5 sample key: "
+                        f"source_sample_relpath={key[0]!r}, hand={key[1]!r}"
+                    )
+                previous_key = key
+                value = f"{key[0]}\0{key[1]}\n"
+            else:
+                value = f"{record.get('sample_uid', '')}\n"
+            ordered_digest.update(value.encode("utf-8"))
+        self.hdf5_ordered_sample_sha256 = ordered_digest.hexdigest()
+        # Under legacy ordering the canonical key stream is sorted, so this is
+        # also a stable sample-set fingerprint without another millions-row sort.
+        self.hdf5_sample_set_sha256 = (
+            self.hdf5_ordered_sample_sha256
+            if self.hdf5_sample_order == "legacy_sample_dir_hand"
+            else ""
+        )
+
+    def _restore_hdf5_manifest_cache_metadata(self, done_path):
+        metadata = load_json_file(done_path)
+        cached_order = str(metadata.get("hdf5_sample_order", "manifest"))
+        if cached_order != self.hdf5_sample_order:
+            raise RuntimeError(
+                "Normalized HDF5 cache sample-order mismatch: "
+                f"cache={cached_order}, requested={self.hdf5_sample_order}"
+            )
+        self.hdf5_ordered_sample_sha256 = str(
+            metadata.get("hdf5_ordered_sample_sha256", "")
+        )
+        self.hdf5_sample_set_sha256 = str(
+            metadata.get("hdf5_sample_set_sha256", "")
+        )
+
     def _hdf5_manifest_cache_path(self):
         if not self.hdf5_manifest_cache_dir:
             return None
@@ -2101,6 +2163,8 @@ class DatasetIndexingMixin:
             "bbox_hdf5_overlay_schema_version": 4,
             "storage_schema_version": HDF5_STORAGE_SCHEMA_VERSION,
         }
+        if self.hdf5_sample_order != "manifest":
+            key_data["hdf5_sample_order"] = self.hdf5_sample_order
         digest = hashlib.sha1(
             json.dumps(key_data, sort_keys=True).encode("utf-8")
         ).hexdigest()[:16]
@@ -2185,6 +2249,8 @@ class DatasetIndexingMixin:
                     f"[{self.split}] HDF5 manifest dataset contract failed: "
                     f"expected={sorted(expected)}, observed={sorted(observed)}"
                 )
+        samples = self._order_hdf5_samples(samples)
+        self._record_hdf5_sample_fingerprints(samples)
         return samples
 
     def _load_hdf5_query_manifests(self):
@@ -2203,6 +2269,7 @@ class DatasetIndexingMixin:
 
         done_path = f"{cache_path}.done"
         if os.path.isfile(cache_path) and os.path.isfile(done_path):
+            self._restore_hdf5_manifest_cache_metadata(done_path)
             if ddp_global_rank() == 0:
                 print(
                     f"[{self.split}] Reusing persistent normalized HDF5 manifest "
@@ -2219,6 +2286,7 @@ class DatasetIndexingMixin:
         if lock.try_acquire():
             try:
                 if os.path.isfile(cache_path) and os.path.isfile(done_path):
+                    self._restore_hdf5_manifest_cache_metadata(done_path)
                     if ddp_global_rank() == 0:
                         print(
                             f"[{self.split}] Reusing persistent normalized HDF5 "
@@ -2248,6 +2316,11 @@ class DatasetIndexingMixin:
                         "query_manifest_sha256": self.query_manifest_sha256,
                         "bbox_manifest_sha256": self.bbox_manifest_sha256,
                         "bbox_hdf5_overlay_schema_version": 4,
+                        "hdf5_sample_order": self.hdf5_sample_order,
+                        "hdf5_ordered_sample_sha256": (
+                            self.hdf5_ordered_sample_sha256
+                        ),
+                        "hdf5_sample_set_sha256": self.hdf5_sample_set_sha256,
                     },
                 )
                 records = MMapJsonlRecords(cache_path)
@@ -2269,6 +2342,7 @@ class DatasetIndexingMixin:
             timeout_sec=self.index_cache_timeout,
         )
         self.hdf5_schema_versions.add(HDF5_STORAGE_SCHEMA_VERSION)
+        self._restore_hdf5_manifest_cache_metadata(done_path)
         return MMapJsonlRecords(cache_path)
 
     def _has_sample_dirs(self, path):
@@ -2353,6 +2427,9 @@ class DatasetIndexingMixin:
                 "bbox_manifest_sha256": dict(getattr(self, "bbox_manifest_sha256", {})),
                 "legacy_index_cache_used": False,
                 "hdf5_manifest_cache_dir": str(self.hdf5_manifest_cache_dir or ""),
+                "hdf5_sample_order": self.hdf5_sample_order,
+                "hdf5_ordered_sample_sha256": self.hdf5_ordered_sample_sha256,
+                "hdf5_sample_set_sha256": self.hdf5_sample_set_sha256,
                 "depth_sidecar_contract": dict(self.depth_sidecar_contract),
             }
         cache_path = self._cache_path()

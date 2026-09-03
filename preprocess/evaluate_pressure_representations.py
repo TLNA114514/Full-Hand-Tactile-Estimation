@@ -26,6 +26,8 @@ from preprocess.representation_eval.io import (
 
 
 METHOD_CHOICES = [
+    "ema_preprocess_gaussian",
+    "raw_to_mano_direct",
     "egotactile_heatmap",
     "ot_centered_mano",
     "ot_discrete_heatmap",
@@ -72,6 +74,16 @@ def parse_args():
         default=None,
         help="Manifest jsonl path(s), comma-separated list, or glob. Used when --source_mode manifest.",
     )
+    parser.add_argument(
+        "--reference_sequence_metrics",
+        default=None,
+        help="Optional historical sequence_metrics.jsonl used as a sequence allowlist.",
+    )
+    parser.add_argument(
+        "--reference_method",
+        default="preprocess_gaussian",
+        help="Method rows selected from --reference_sequence_metrics.",
+    )
     parser.add_argument("--dataset_raw_root_opentouch", default="/data1/jiangrui/OpenTouch Data/data")
     parser.add_argument("--dataset_raw_root_egotactile", default="/data1/jiangrui/EgoTactile/Raw_data")
     parser.add_argument("--dataset_raw_root_touchanything", default="/data1/jiangrui/EgoTouch")
@@ -81,6 +93,15 @@ def parse_args():
     parser.add_argument("--egotactile_scan_depth", type=int, default=4)
     parser.add_argument("--touchanything_scan_split_depth", type=int, default=2)
     parser.add_argument("--egotactile_scan_split_depth", type=int, default=3)
+    parser.add_argument(
+        "--skip_gaussian_payload_validation",
+        action="store_true",
+        help=(
+            "During direct-source discovery, validate Gaussian member names and "
+            "array headers without inflating every compressed payload. Intended "
+            "for already-audited sources."
+        ),
+    )
     parser.add_argument("--output_dir", default="outputs/representation_eval")
     parser.add_argument("--repo_root", default=str(REPO_ROOT))
     parser.add_argument("--cache_dir", default=str(ARTIFACT_ROOT / "representation_eval/cache"))
@@ -91,7 +112,12 @@ def parse_args():
     parser.add_argument("--limit_sequences", type=int, default=0)
     parser.add_argument("--discrete_levels", type=int, default=5)
     parser.add_argument("--emd_mode", choices=["full", "active", "topk"], default="full")
-    parser.add_argument("--emd_solver", choices=["sinkhorn_log_gpu", "exact"], default="sinkhorn_log_gpu")
+    parser.add_argument(
+        "--emd_solver",
+        choices=["sinkhorn_log_gpu", "exact", "none"],
+        default="sinkhorn_log_gpu",
+        help="Use 'none' for direct-mapping audits that only need deterministic structural metrics.",
+    )
     parser.add_argument("--sinkhorn_iters", type=int, default=100)
     parser.add_argument("--sinkhorn_epsilon", default="auto", help="'auto' or a positive float.")
     parser.add_argument("--emd_batch_frames", type=int, default=64, help="Reserved for future batched EMD kernels.")
@@ -119,6 +145,35 @@ def _parse_epsilon(value):
 
 def _parse_gpus(value):
     return [x.strip() for x in str(value).split(",") if x.strip()]
+
+
+def _reference_sequence_ids(path, datasets, method):
+    requested = {str(dataset).lower() for dataset in datasets}
+    allowed = set()
+    with Path(path).open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"Invalid reference sequence JSON at {path}:{line_number}"
+                ) from exc
+            if str(row.get("dataset", "")).lower() not in requested:
+                continue
+            if method and str(row.get("method", "")) != str(method):
+                continue
+            sequence_id = str(row.get("sequence_id", "")).strip()
+            if sequence_id:
+                allowed.add(sequence_id)
+    if not allowed:
+        raise RuntimeError(
+            f"No sequence IDs matched datasets={sorted(requested)} and "
+            f"method={method!r} in {path}"
+        )
+    return allowed
 
 
 def _init_worker(args_dict, gpu_queue=None):
@@ -152,6 +207,10 @@ def _sensor_geom_for(dataset, hand):
 
 
 def _method_applicable(dataset, method):
+    if method == "ema_preprocess_gaussian":
+        return True
+    if method == "raw_to_mano_direct":
+        return True
     if method.startswith("ot_"):
         return dataset == "opentouch"
     if method == "egotactile_heatmap":
@@ -196,9 +255,31 @@ def _evaluate_sequence_worker(sequence):
                 topk_new=WORKER_ARGS["topk_new"],
                 sinkhorn_iters=WORKER_ARGS["sinkhorn_iters"],
                 sinkhorn_epsilon=WORKER_ARGS["sinkhorn_epsilon"],
+                include_frame_rows=WORKER_ARGS["write_frame_metrics"],
             )
             if int(summary.get("frames_evaluated") or 0) <= 0:
                 continue
+            if method in {"raw_to_mano_direct", "ot_raw_heatmap"}:
+                raw_sensor_count = max(
+                    (
+                        int(frame.raw_sensor.size)
+                        for frame in frames
+                        if frame.raw_sensor is not None
+                    ),
+                    default=0,
+                )
+                mapped_sensor_count = int(len(sensor_geom.sensor_ids))
+                summary.update(
+                    {
+                        "raw_sensor_count": raw_sensor_count,
+                        "mapped_sensor_count": mapped_sensor_count,
+                        "sensor_mapping_coverage": (
+                            mapped_sensor_count / raw_sensor_count
+                            if raw_sensor_count > 0
+                            else None
+                        ),
+                    }
+                )
             if WORKER_ARGS["write_frame_metrics"]:
                 frame_rows.extend(rows)
             sequence_rows.append(summary)
@@ -230,6 +311,9 @@ def aggregate_summary(sequence_rows):
         "emd_mean",
         "emd_p50",
         "emd_p90",
+        "raw_sensor_count",
+        "mapped_sensor_count",
+        "sensor_mapping_coverage",
     ]
     for (dataset, split, hand, method), rows in sorted(grouped.items()):
         item = {
@@ -264,6 +348,9 @@ def write_summary_md(path, summary_rows, errors):
             "method",
             "sequences",
             "frames_evaluated",
+            "mapped_sensor_count",
+            "raw_sensor_count",
+            "sensor_mapping_coverage",
             "spatial_laplacian_mean",
             "temp_1st_mean",
             "temp_2nd_mean",
@@ -326,6 +413,15 @@ def main():
             egotactile_scan_depth=args.egotactile_scan_depth,
             touchanything_scan_split_depth=args.touchanything_scan_split_depth,
             egotactile_scan_split_depth=args.egotactile_scan_split_depth,
+            require_gaussian=True,
+            validate_gaussian=(
+                not args.skip_gaussian_payload_validation
+                and any(
+                    method
+                    not in {"raw_to_mano_direct", "ema_preprocess_gaussian"}
+                    for method in args.methods
+                )
+            ),
         )
         print(f"Discovered {len(sequences)} direct pressure sequences.")
         if args.source_mode == "direct" and not sequences:
@@ -337,6 +433,33 @@ def main():
         print("Discovering extracted meta sequences...")
         sequences = discover_sequences(dataset_roots, args.datasets, args.check_workers)
         discovery_mode = "meta"
+    if args.reference_sequence_metrics:
+        reference_path = Path(args.reference_sequence_metrics).expanduser().resolve()
+        if not reference_path.is_file():
+            raise FileNotFoundError(
+                f"Reference sequence metrics not found: {reference_path}"
+            )
+        allowed_ids = _reference_sequence_ids(
+            reference_path, args.datasets, args.reference_method
+        )
+        discovered_ids = {str(sequence.get("sequence_id", "")) for sequence in sequences}
+        sequences = [
+            sequence
+            for sequence in sequences
+            if str(sequence.get("sequence_id", "")) in allowed_ids
+        ]
+        missing_ids = allowed_ids - discovered_ids
+        print(
+            "Applied historical sequence allowlist: "
+            f"selected={len(sequences)}, requested={len(allowed_ids)}, "
+            f"missing={len(missing_ids)}"
+        )
+        if missing_ids:
+            preview = ", ".join(sorted(missing_ids)[:5])
+            raise RuntimeError(
+                f"Current data is missing {len(missing_ids)} historical sequences; "
+                f"first missing: {preview}"
+            )
     if args.limit_sequences and args.limit_sequences > 0:
         sequences = sequences[: args.limit_sequences]
     print(f"Using {discovery_mode} source mode with {len(sequences)} sequences.")

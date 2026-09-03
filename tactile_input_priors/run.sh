@@ -52,6 +52,8 @@ TACTILE_HISTORY_BOOTSTRAP_CONFIDENCE="${TACTILE_HISTORY_BOOTSTRAP_CONFIDENCE:-0.
 TACTILE_HISTORY_BBOX_MANIFEST="${TACTILE_HISTORY_BBOX_MANIFEST:-$SCRIPT_DIR/../sam3_bbox_reconstruction/outputs/full_reconstruction_flow/touchanything/manifests/touchanything_sam3_v1_highconf.jsonl}"
 TEMPORAL_FEATURE_CACHE_ROOT="${TEMPORAL_FEATURE_CACHE_ROOT:-$INPUT_PRIOR_ROOT/cache/temporal_flow}"
 TEMPORAL_PAIR_ROOT="${TEMPORAL_PAIR_ROOT:-$INPUT_PRIOR_ROOT/cache/temporal_pairs}"
+TEMPORAL_DATA_MODE="${TEMPORAL_DATA_MODE:-online}"
+TEMPORAL_HDF5_INDEX_ROOT="${TEMPORAL_HDF5_INDEX_ROOT:-$INPUT_PRIOR_ROOT/state/hdf5_manifest_index}"
 TEMPORAL_EXPERIMENT_ROOT="${TEMPORAL_EXPERIMENT_ROOT:-$INPUT_PRIOR_ROOT/temporal_experiments}"
 TEMPORAL_REPORT_ROOT="${TEMPORAL_REPORT_ROOT:-$INPUT_PRIOR_ROOT/temporal_reports}"
 TEMPORAL_CACHE_FIELDS="${TEMPORAL_CACHE_FIELDS:-palm_base_logits,palm_tactile_signal,has_tactile}"
@@ -173,6 +175,28 @@ Temporal tactile data audit:
                            selectors, persistent errors, and gradient cancellation
   audit-tflow-long-horizon Audit lag 1/2/4/8/16/32 timing, conditional value,
                            trained lag masks, residual scales, and hand-swap controls
+  prepare-temporal-grid    Resolve online manifests; never materializes DINO caches
+  train-tgrid-real         Train Temporal Grid V1 with same-query real history
+  train-tgrid-cross        Parameter-matched cross-sequence history control
+  eval-tgrid-8gpu          Evaluate one Temporal Grid checkpoint and split
+  eval-tgrid-real          Evaluate real-history loss-best on val/seen/unseen
+  eval-tgrid-cross         Evaluate cross-history loss-best on val/seen/unseen
+  tgrid-tiny-check         Check zero-init/reset identity, gradients, and RMS cap
+  train-tmem-local         Train affine-guided Local Memory Fusion V2 online
+  train-tmem-local-nocf    Same V2 without wrong-history rejection loss
+  eval-tmem-local          Evaluate Local Memory V2 on val/seen/unseen
+  eval-tmem-local-nocf     Evaluate the no-rejection V2 control
+  train-ttrunk-l12         Fresh FullGrid/ReZero + L1/L2 temporal trunk
+  train-ttrunk-l124816     Fresh trunk with separate L4/L8/L16 writer
+  eval-ttrunk-l12          Evaluate fresh L1/L2 trunk on val/seen/unseen
+  eval-ttrunk-l124816      Evaluate full and cumulative lag masks
+  train-tclip-causal       Fresh eight-frame non-overlapping causal clip trunk
+  eval-tclip-8gpu          Evaluate one causal clip checkpoint and split
+  eval-tclip-causal        Evaluate clip loss-best with causal history controls
+  train-tfull6144          Fresh FullGrid6144 bidirectional trunk with twin heads
+  eval-tfull6144           Evaluate tactile loss-best and all temporal controls
+  train-tonlinehmr         Fresh OnlineHMR-style causal patch-KV twin-head trunk
+  eval-tonlinehmr          Evaluate loss-best, history controls, and KV parity
 
 Frozen feature cache:
   cache-build              Build/resume a generic mmap feature cache
@@ -270,6 +294,12 @@ Common environment:
   TACTILE_HISTORY_BBOX_MANIFEST Current reviewed TouchAnything SAM3 manifest
   TACTILE_HISTORY_BOOTSTRAP_ITERATIONS Sequence-clustered resamples (default: 2000)
   TEMPORAL_FEATURE_CACHE_ROOT Persistent palm-logit/target cache root
+  TEMPORAL_DATA_MODE       online (default) or explicit legacy cache mode
+  TEMPORAL_HDF5_INDEX_ROOT Metadata-only mmap index; never stores features
+  TEMPORAL_CLIP_BATCH_SIZE Causal-clip train clips/rank (default: 16 = 128 frames)
+  TEMPORAL_CLIP_VAL_BATCH_SIZE Causal-clip validation clips/rank (default: 16)
+  TEMPORAL_CLIP_EVAL_BATCH_SIZE Causal-clip evaluation clips/rank (default: 16)
+  TEMPORAL_CLIP_ENCODER_CHUNK_SIZE Frozen-DINO frame chunk (default: 128)
   TEMPORAL_DINO_CACHE_SHARD_SIZE DINO temporal cache shard rows (default: 8192)
   TEMPORAL_DINO_EVAL_BATCH_SIZE DINO selector eval batch/rank (default: 256)
   TEMPORAL_EXPERIMENT_ROOT  Temporal checkpoints and local/W&B logs
@@ -1629,6 +1659,12 @@ ensure_temporal_cache_split() {
         echo "[temporal-cache] reuse split=$split path=$path"
         return 0
     fi
+    if [[ "${ALLOW_FEATURE_CACHE_BUILD:-0}" != "1" ]]; then
+        echo "Temporal feature cache is absent and implicit cache generation is disabled." >&2
+        echo "Current temporal training/evaluation defaults to TEMPORAL_DATA_MODE=online." >&2
+        echo "For historical reproduction only, set ALLOW_FEATURE_CACHE_BUILD=1." >&2
+        return 2
+    fi
     echo "[temporal-cache] build split=$split path=$path"
     CACHE_LOG_DIR="$path/logs" run_tactile_cache_partitions \
         --cache-dir "$path" "${TEMPORAL_CACHE_ARGS[@]}"
@@ -1764,6 +1800,442 @@ train_tflow_selector_dino_unwarped() {
         --use-dino-history \
         --dino-alignment-mode unwarped \
         "$@"
+}
+
+prepare_temporal_grid() {
+    if [[ "$TEMPORAL_DATA_MODE" == "online" ]]; then
+        local split manifest
+        for split in train val test_seen test_unseen; do
+            manifest="$(temporal_manifest "$split")"
+            echo "[temporal-online] split=$split manifest=$manifest"
+        done
+        echo "[temporal-online] no RGB/DINO/logit feature cache was generated"
+        return 0
+    fi
+    local TEMPORAL_CACHE_FIELDS="z_rgb,palm_base_logits,palm_tactile_signal,has_tactile"
+    local TEMPORAL_CACHE_SHARD_SIZE="${TEMPORAL_GRID_CACHE_SHARD_SIZE:-8192}"
+    prepare_temporal_flow "$@"
+}
+
+train_temporal_grid() {
+    local temporal_architecture="grid_difference_v1"
+    temporal_architecture="$(cli_option_value --temporal-architecture "$@" || printf '%s\n' "$temporal_architecture")"
+    local fresh_trunk=0
+    if [[ "$temporal_architecture" == "hierarchical_memory_v3" || \
+          "$temporal_architecture" == "causal_clip_transformer_v4" || \
+          "$temporal_architecture" == "fullgrid6144_bidirectional_v5" || \
+          "$temporal_architecture" == "onlinehmr_patch_kv_v6" ]]; then
+        fresh_trunk=1
+        if [[ "$TEMPORAL_DATA_MODE" != "online" ]]; then
+            echo "$temporal_architecture is online-only and never builds a feature cache" >&2
+            return 2
+        fi
+    else
+        require_environment TACTILE_BASE_CHECKPOINT
+    fi
+    local train_manifest val_manifest
+    train_manifest="$(temporal_manifest train)"
+    val_manifest="$(temporal_manifest val)"
+    local -a data_args=(
+        --data-mode "$TEMPORAL_DATA_MODE"
+        --train-query-manifests "$train_manifest"
+        --val-query-manifests "$val_manifest"
+        --bbox-manifests "$TEMPORAL_BBOX_MANIFEST"
+        --hdf5-manifest-index-dir "$TEMPORAL_HDF5_INDEX_ROOT"
+    )
+    if [[ "$TEMPORAL_DATA_MODE" == "online" ]]; then
+        require_environment DINO_WEIGHTS
+        data_args+=(
+            --dino-weights "$DINO_WEIGHTS"
+            --batch-size "${TEMPORAL_ONLINE_BATCH_SIZE:-32}"
+            --val-batch-size "${TEMPORAL_ONLINE_VAL_BATCH_SIZE:-64}"
+            --num-workers "${TEMPORAL_ONLINE_WORKERS:-4}"
+            --val-num-workers "${TEMPORAL_ONLINE_VAL_WORKERS:-2}"
+            --online-encoder-chunk-size "${TEMPORAL_ONLINE_ENCODER_CHUNK_SIZE:-128}"
+        )
+        if [[ -n "${DEPTH_DATA_ROOT:-}" ]]; then
+            data_args+=(
+                --train-data-roots "$DEPTH_DATA_ROOT"
+                --val-data-roots "$DEPTH_DATA_ROOT"
+            )
+        fi
+    else
+        local TEMPORAL_CACHE_FIELDS="z_rgb,palm_base_logits,palm_tactile_signal,has_tactile"
+        local TEMPORAL_CACHE_SHARD_SIZE="${TEMPORAL_GRID_CACHE_SHARD_SIZE:-8192}"
+        ensure_temporal_cache_split train
+        local train_cache="$TEMPORAL_CACHE_RESOLVED_PATH"
+        ensure_temporal_cache_split val
+        local val_cache="$TEMPORAL_CACHE_RESOLVED_PATH"
+        data_args+=(--train-cache "$train_cache" --val-cache "$val_cache")
+    fi
+    local process_supervisor
+    process_supervisor="$(dirname "$SCRIPT_DIR")/hamer_tactile_ft/process_supervisor.py"
+    export OMP_NUM_THREADS="${PRIOR_CPU_THREADS_PER_PROCESS:-1}"
+    export OPENBLAS_NUM_THREADS="${PRIOR_CPU_THREADS_PER_PROCESS:-1}"
+    export MKL_NUM_THREADS="${PRIOR_CPU_THREADS_PER_PROCESS:-1}"
+    export NUMEXPR_NUM_THREADS="${PRIOR_CPU_THREADS_PER_PROCESS:-1}"
+    local -a base_args=()
+    if (( fresh_trunk == 0 )); then
+        base_args+=(--base-checkpoint "$TACTILE_BASE_CHECKPOINT")
+    fi
+    "$TACTILE_PYTHON" "$process_supervisor" \
+        --registry-dir "${PRIOR_PROCESS_REGISTRY:-$INPUT_PRIOR_ROOT/state/run_processes}" \
+        --grace-seconds "${PRIOR_PROCESS_GRACE_SECONDS:-60}" \
+        --kill-wait-seconds "${PRIOR_PROCESS_KILL_WAIT_SECONDS:-5}" \
+        -- "$TACTILE_PYTHON" "$SCRIPT_DIR/train_temporal_grid.py" \
+        "${data_args[@]}" \
+        "${base_args[@]}" \
+        --pair-index-root "$TEMPORAL_PAIR_ROOT" \
+        --output-root "$TEMPORAL_EXPERIMENT_ROOT" \
+        "$@"
+}
+
+train_tgrid_real() {
+    train_temporal_grid \
+        --exp-name ta_tgrid_real_online_r256 \
+        --history-source real \
+        "$@"
+}
+
+train_tgrid_cross() {
+    train_temporal_grid \
+        --exp-name ta_tgrid_cross_online_r256 \
+        --history-source cross_sequence \
+        "$@"
+}
+
+train_tmem_local() {
+    train_temporal_grid \
+        --exp-name ta_tmem_local_online_r256 \
+        --history-source real \
+        --temporal-architecture local_memory_v2 \
+        --history-lags 1,2 \
+        --counterfactual-identity-weight 1.0 \
+        "$@"
+}
+
+train_tmem_local_nocf() {
+    train_temporal_grid \
+        --exp-name ta_tmem_local_nocf_online_r256 \
+        --history-source real \
+        --temporal-architecture local_memory_v2 \
+        --history-lags 1,2 \
+        --counterfactual-identity-weight 0.0 \
+        "$@"
+}
+
+train_ttrunk_l12() {
+    TEMPORAL_DATA_MODE=online train_temporal_grid \
+        --exp-name ta_ttrunk_l12_r256 \
+        --history-source real \
+        --temporal-architecture hierarchical_memory_v3 \
+        --history-lags 1,2 \
+        --counterfactual-identity-weight 1.0 \
+        --base-preservation-weight 0.5 \
+        --batch-size "${TEMPORAL_TRUNK_BATCH_SIZE:-32}" \
+        --val-batch-size "${TEMPORAL_TRUNK_VAL_BATCH_SIZE:-32}" \
+        --accumulate-grad-batches "${TEMPORAL_TRUNK_ACCUMULATION:-4}" \
+        --epochs 60 \
+        --warmup-epochs 3 \
+        --prefetch-factor 2 \
+        --no-persistent-workers \
+        "$@"
+}
+
+train_ttrunk_l124816() {
+    TEMPORAL_DATA_MODE=online train_temporal_grid \
+        --exp-name ta_ttrunk_l124816_r256 \
+        --history-source real \
+        --temporal-architecture hierarchical_memory_v3 \
+        --history-lags 1,2,4,8,16 \
+        --counterfactual-identity-weight 1.0 \
+        --base-preservation-weight 0.5 \
+        --batch-size "${TEMPORAL_TRUNK_BATCH_SIZE:-32}" \
+        --val-batch-size "${TEMPORAL_TRUNK_VAL_BATCH_SIZE:-32}" \
+        --accumulate-grad-batches "${TEMPORAL_TRUNK_ACCUMULATION:-4}" \
+        --epochs 60 \
+        --warmup-epochs 3 \
+        --prefetch-factor 2 \
+        --no-persistent-workers \
+        "$@"
+}
+
+train_tclip_causal() {
+    TEMPORAL_DATA_MODE=online train_temporal_grid \
+        --exp-name ta_tclip_causal_r256 \
+        --history-source real \
+        --temporal-architecture causal_clip_transformer_v4 \
+        --history-lags 1 \
+        --clip-length 8 \
+        --clip-layers 2 \
+        --clip-heads 4 \
+        --clip-ffn-ratio 2 \
+        --hidden-channels 128 \
+        --history-reset-probability 0.20 \
+        --counterfactual-identity-weight 0.0 \
+        --base-preservation-weight 0.0 \
+        --batch-size "${TEMPORAL_CLIP_BATCH_SIZE:-16}" \
+        --val-batch-size "${TEMPORAL_CLIP_VAL_BATCH_SIZE:-16}" \
+        --accumulate-grad-batches 1 \
+        --online-encoder-chunk-size "${TEMPORAL_CLIP_ENCODER_CHUNK_SIZE:-128}" \
+        --epochs 60 \
+        --warmup-epochs 3 \
+        --prefetch-factor 2 \
+        --no-persistent-workers \
+        "$@"
+}
+
+train_tfull6144() {
+    TEMPORAL_DATA_MODE=online train_temporal_grid \
+        --exp-name ta_tfull6144_bi_r256 \
+        --history-source real \
+        --temporal-architecture fullgrid6144_bidirectional_v5 \
+        --history-lags 1 \
+        --clip-length 8 \
+        --spatial-layers 1 \
+        --spatial-heads 4 \
+        --spatial-ffn-ratio 2 \
+        --clip-layers 1 \
+        --clip-heads 48 \
+        --clip-ffn-ratio 2 \
+        --clip-residual-dropout 0.10 \
+        --clip-layer-scale-init 0.001 \
+        --contact-loss-weight 0.10 \
+        --contact-jaccard-weight 0.25 \
+        --contact-pressure-threshold 0.10 \
+        --history-reset-probability 0.0 \
+        --reset-consistency-weight 0.0 \
+        --counterfactual-identity-weight 0.0 \
+        --base-preservation-weight 0.0 \
+        --batch-size "${TEMPORAL_FULLGRID_BATCH_SIZE:-16}" \
+        --val-batch-size "${TEMPORAL_FULLGRID_VAL_BATCH_SIZE:-16}" \
+        --accumulate-grad-batches 1 \
+        --online-encoder-chunk-size "${TEMPORAL_FULLGRID_ENCODER_CHUNK_SIZE:-128}" \
+        --epochs 60 \
+        --warmup-epochs 3 \
+        --prefetch-factor 2 \
+        --no-persistent-workers \
+        "$@"
+}
+
+train_tonlinehmr() {
+    TEMPORAL_DATA_MODE=online train_temporal_grid \
+        --exp-name ta_tonlinehmr_kv_r256 \
+        --history-source real \
+        --temporal-architecture onlinehmr_patch_kv_v6 \
+        --history-lags 1 \
+        --clip-length 8 \
+        --onlinehmr-hidden-dim 512 \
+        --onlinehmr-memory-frames 2 \
+        --clip-layers 4 \
+        --clip-heads 4 \
+        --clip-ffn-ratio 4 \
+        --clip-residual-dropout 0.10 \
+        --contact-loss-weight 0.10 \
+        --contact-jaccard-weight 0.25 \
+        --contact-pressure-threshold 0.10 \
+        --history-reset-probability 0.0 \
+        --reset-consistency-weight 0.0 \
+        --counterfactual-identity-weight 0.0 \
+        --base-preservation-weight 0.0 \
+        --batch-size "${TEMPORAL_ONLINEHMR_BATCH_SIZE:-16}" \
+        --val-batch-size "${TEMPORAL_ONLINEHMR_VAL_BATCH_SIZE:-16}" \
+        --accumulate-grad-batches 1 \
+        --online-encoder-chunk-size "${TEMPORAL_ONLINEHMR_ENCODER_CHUNK_SIZE:-128}" \
+        --epochs 60 \
+        --warmup-epochs 3 \
+        --prefetch-factor 2 \
+        --no-persistent-workers \
+        "$@"
+}
+
+eval_temporal_grid_8gpu() {
+    if (( $# < 2 )); then
+        echo "Usage: run.sh eval-tgrid-8gpu CHECKPOINT SPLIT [eval options]" >&2
+        return 2
+    fi
+    local checkpoint="$1" split="$2"
+    shift 2
+    if [[ ! -f "$checkpoint" ]]; then
+        echo "Temporal grid checkpoint does not exist: $checkpoint" >&2
+        return 2
+    fi
+    local manifest
+    manifest="$(temporal_manifest "$split")"
+    local -a data_args=(
+        --data-mode "$TEMPORAL_DATA_MODE"
+        --query-manifests "$manifest"
+        --bbox-manifests "$TEMPORAL_BBOX_MANIFEST"
+        --hdf5-manifest-index-dir "$TEMPORAL_HDF5_INDEX_ROOT"
+    )
+    if [[ "$TEMPORAL_DATA_MODE" == "online" ]]; then
+        require_environment DINO_WEIGHTS
+        data_args+=(
+            --dino-weights "$DINO_WEIGHTS"
+            --batch-size "${TEMPORAL_ONLINE_EVAL_BATCH_SIZE:-64}"
+            --num-workers "${TEMPORAL_ONLINE_EVAL_WORKERS:-4}"
+            --online-encoder-chunk-size "${TEMPORAL_ONLINE_ENCODER_CHUNK_SIZE:-128}"
+        )
+        if [[ -n "${DEPTH_DATA_ROOT:-}" ]]; then
+            data_args+=(--data-roots "$DEPTH_DATA_ROOT")
+        fi
+    else
+        local TEMPORAL_CACHE_FIELDS="z_rgb,palm_base_logits,palm_tactile_signal,has_tactile"
+        local TEMPORAL_CACHE_SHARD_SIZE="${TEMPORAL_GRID_CACHE_SHARD_SIZE:-8192}"
+        ensure_temporal_cache_split "$split"
+        local cache="$TEMPORAL_CACHE_RESOLVED_PATH"
+        data_args+=(--cache "$cache")
+    fi
+    local experiment_dir output_dir eval_gpus
+    experiment_dir="$(dirname "$(dirname "$checkpoint")")"
+    output_dir="${TEMPORAL_EVAL_OUTPUT_DIR:-$TEMPORAL_REPORT_ROOT/$(basename "$experiment_dir")/$(basename "$checkpoint" .ckpt)/$split}"
+    eval_gpus="${EVAL_GPUS:-0,1,2,3,4,5,6,7}"
+    local -a gpu_array
+    IFS=',' read -r -a gpu_array <<< "$eval_gpus"
+    local process_supervisor
+    process_supervisor="$(dirname "$SCRIPT_DIR")/hamer_tactile_ft/process_supervisor.py"
+    CUDA_VISIBLE_DEVICES="$eval_gpus" \
+    "$TACTILE_PYTHON" "$process_supervisor" \
+        --registry-dir "${PRIOR_PROCESS_REGISTRY:-$INPUT_PRIOR_ROOT/state/run_processes}" \
+        --grace-seconds "${PRIOR_PROCESS_GRACE_SECONDS:-60}" \
+        --kill-wait-seconds "${PRIOR_PROCESS_KILL_WAIT_SECONDS:-5}" \
+        -- "$TACTILE_PYTHON" -m torch.distributed.run \
+        --standalone \
+        --nproc_per_node "${#gpu_array[@]}" \
+        "$SCRIPT_DIR/eval_temporal_grid.py" \
+        --checkpoint "$checkpoint" \
+        "${data_args[@]}" \
+        --pair-index-root "$TEMPORAL_PAIR_ROOT" \
+        --split "$split" \
+        --output-dir "$output_dir" \
+        --copy-val-metrics-from "$experiment_dir/val_metrics.csv" \
+        "$@"
+}
+
+eval_temporal_clip_8gpu() {
+    if (( $# < 2 )); then
+        echo "Usage: run.sh eval-tclip-8gpu CHECKPOINT SPLIT [eval options]" >&2
+        return 2
+    fi
+    local checkpoint="$1" split="$2"
+    shift 2
+    if [[ ! -f "$checkpoint" ]]; then
+        echo "Temporal clip checkpoint does not exist: $checkpoint" >&2
+        return 2
+    fi
+    require_environment DINO_WEIGHTS
+    local manifest experiment_dir output_dir eval_gpus
+    manifest="$(temporal_manifest "$split")"
+    experiment_dir="$(dirname "$(dirname "$checkpoint")")"
+    output_dir="${TEMPORAL_EVAL_OUTPUT_DIR:-$TEMPORAL_REPORT_ROOT/$(basename "$experiment_dir")/$(basename "$checkpoint" .ckpt)/$split}"
+    eval_gpus="${EVAL_GPUS:-0,1,2,3,4,5,6,7}"
+    local -a gpu_array data_args
+    IFS=',' read -r -a gpu_array <<< "$eval_gpus"
+    data_args=(
+        --query-manifests "$manifest"
+        --bbox-manifests "$TEMPORAL_BBOX_MANIFEST"
+        --hdf5-manifest-index-dir "$TEMPORAL_HDF5_INDEX_ROOT"
+    )
+    if [[ -n "${DEPTH_DATA_ROOT:-}" ]]; then
+        data_args+=(--data-roots "$DEPTH_DATA_ROOT")
+    fi
+    local process_supervisor
+    process_supervisor="$(dirname "$SCRIPT_DIR")/hamer_tactile_ft/process_supervisor.py"
+    CUDA_VISIBLE_DEVICES="$eval_gpus" \
+    "$TACTILE_PYTHON" "$process_supervisor" \
+        --registry-dir "${PRIOR_PROCESS_REGISTRY:-$INPUT_PRIOR_ROOT/state/run_processes}" \
+        --grace-seconds "${PRIOR_PROCESS_GRACE_SECONDS:-60}" \
+        --kill-wait-seconds "${PRIOR_PROCESS_KILL_WAIT_SECONDS:-5}" \
+        -- "$TACTILE_PYTHON" -m torch.distributed.run \
+        --standalone \
+        --nproc_per_node "${#gpu_array[@]}" \
+        "$SCRIPT_DIR/eval_temporal_clip.py" \
+        --checkpoint "$checkpoint" \
+        --dino-weights "$DINO_WEIGHTS" \
+        "${data_args[@]}" \
+        --pair-index-root "$TEMPORAL_PAIR_ROOT" \
+        --split "$split" \
+        --output-dir "$output_dir" \
+        --batch-size "${TEMPORAL_CLIP_EVAL_BATCH_SIZE:-16}" \
+        --num-workers "${TEMPORAL_ONLINE_EVAL_WORKERS:-4}" \
+        --online-encoder-chunk-size "${TEMPORAL_CLIP_ENCODER_CHUNK_SIZE:-128}" \
+        --copy-val-metrics-from "$experiment_dir/val_metrics.csv" \
+        "$@"
+}
+
+eval_tgrid_experiment() {
+    local experiment_name="$1"
+    shift
+    local checkpoint="$TEMPORAL_EXPERIMENT_ROOT/$experiment_name/checkpoints/best_loss.ckpt"
+    local split
+    for split in val test_seen test_unseen; do
+        eval_temporal_grid_8gpu "$checkpoint" "$split" "$@"
+    done
+}
+
+eval_ttrunk_l12() {
+    TEMPORAL_DATA_MODE=online eval_tgrid_experiment ta_ttrunk_l12_r256 "$@"
+}
+
+eval_ttrunk_l124816() {
+    local experiment_name="ta_ttrunk_l124816_r256"
+    local checkpoint="$TEMPORAL_EXPERIMENT_ROOT/$experiment_name/checkpoints/best_loss.ckpt"
+    local split mask tag
+    # Full model receives formal val/seen/unseen evaluation. Cumulative masks
+    # are attribution runs on val and reuse the same checkpoint contract.
+    for mask in 1,2 1,2,4 1,2,4,8; do
+        tag="l${mask//,/}"
+        TEMPORAL_DATA_MODE=online \
+        TEMPORAL_EVAL_OUTPUT_DIR="$TEMPORAL_REPORT_ROOT/$experiment_name/best_loss-$tag/val" \
+            eval_temporal_grid_8gpu \
+            "$checkpoint" val --active-lags "$mask" "$@"
+    done
+    mask="1,2,4,8,16"
+    tag="l124816"
+    for split in val test_seen test_unseen; do
+        TEMPORAL_DATA_MODE=online \
+        TEMPORAL_EVAL_OUTPUT_DIR="$TEMPORAL_REPORT_ROOT/$experiment_name/best_loss-$tag/$split" \
+            eval_temporal_grid_8gpu \
+            "$checkpoint" "$split" --active-lags "$mask" "$@"
+    done
+}
+
+eval_tclip_causal() {
+    local experiment_name="ta_tclip_causal_r256"
+    local checkpoint="$TEMPORAL_EXPERIMENT_ROOT/$experiment_name/checkpoints/best_loss.ckpt"
+    local split
+    for split in val test_seen test_unseen; do
+        TEMPORAL_DATA_MODE=online \
+            eval_temporal_clip_8gpu "$checkpoint" "$split" "$@"
+    done
+}
+
+eval_tfull6144() {
+    local experiment_name="ta_tfull6144_bi_r256"
+    local checkpoint="$TEMPORAL_EXPERIMENT_ROOT/$experiment_name/checkpoints/best_loss.ckpt"
+    local split
+    for split in val test_seen test_unseen; do
+        TEMPORAL_DATA_MODE=online \
+        TEMPORAL_EVAL_OUTPUT_DIR="$TEMPORAL_REPORT_ROOT/$experiment_name/best_loss/$split" \
+            eval_temporal_clip_8gpu \
+            "$checkpoint" "$split" \
+            --sources rgb_reset,real,cross_sequence,frame_shuffle,lag_reverse,spatial_shuffle,past_only,future_only,repeat_current \
+            "$@"
+    done
+}
+
+eval_tonlinehmr() {
+    local experiment_name="ta_tonlinehmr_kv_r256"
+    local checkpoint="$TEMPORAL_EXPERIMENT_ROOT/$experiment_name/checkpoints/best_loss.ckpt"
+    local split
+    for split in val test_seen test_unseen; do
+        TEMPORAL_DATA_MODE=online \
+        TEMPORAL_EVAL_OUTPUT_DIR="$TEMPORAL_REPORT_ROOT/$experiment_name/best_loss/$split" \
+            eval_temporal_clip_8gpu \
+            "$checkpoint" "$split" \
+            --sources rgb_reset,real,cross_sequence,frame_shuffle,lag_reverse,spatial_shuffle,repeat_current,memory1 \
+            "$@"
+    done
 }
 
 eval_temporal_flow_8gpu() {
@@ -2439,6 +2911,75 @@ case "$MODE" in
         ;;
     audit-tflow-selector-mapping)
         audit_tflow_selector_mapping "$@"
+        ;;
+    prepare-temporal-grid)
+        prepare_temporal_grid "$@"
+        ;;
+    train-tgrid-real)
+        train_tgrid_real "$@"
+        ;;
+    train-tgrid-cross)
+        train_tgrid_cross "$@"
+        ;;
+    eval-tgrid-8gpu)
+        eval_temporal_grid_8gpu "$@"
+        ;;
+    eval-tclip-8gpu)
+        eval_temporal_clip_8gpu "$@"
+        ;;
+    eval-tgrid-real)
+        eval_tgrid_experiment ta_tgrid_real_online_r256 "$@"
+        ;;
+    eval-tgrid-cross)
+        eval_tgrid_experiment ta_tgrid_cross_online_r256 "$@"
+        ;;
+    train-tmem-local)
+        train_tmem_local "$@"
+        ;;
+    train-tmem-local-nocf)
+        train_tmem_local_nocf "$@"
+        ;;
+    eval-tmem-local)
+        eval_tgrid_experiment ta_tmem_local_online_r256 "$@"
+        ;;
+    eval-tmem-local-nocf)
+        eval_tgrid_experiment ta_tmem_local_nocf_online_r256 "$@"
+        ;;
+    train-ttrunk-l12)
+        train_ttrunk_l12 "$@"
+        ;;
+    train-ttrunk-l124816)
+        train_ttrunk_l124816 "$@"
+        ;;
+    train-tclip-causal)
+        train_tclip_causal "$@"
+        ;;
+    train-tfull6144)
+        train_tfull6144 "$@"
+        ;;
+    train-tonlinehmr)
+        train_tonlinehmr "$@"
+        ;;
+    eval-ttrunk-l12)
+        eval_ttrunk_l12 "$@"
+        ;;
+    eval-ttrunk-l124816)
+        eval_ttrunk_l124816 "$@"
+        ;;
+    eval-tclip-causal)
+        eval_tclip_causal "$@"
+        ;;
+    eval-tfull6144)
+        eval_tfull6144 "$@"
+        ;;
+    eval-tonlinehmr)
+        eval_tonlinehmr "$@"
+        ;;
+    tgrid-tiny-check)
+        "$TACTILE_PYTHON" "$SCRIPT_DIR/train_temporal_grid.py" \
+            --train-cache ignored --val-cache ignored \
+            --train-query-manifests ignored --val-query-manifests ignored \
+            --base-checkpoint ignored --exp-name ignored --tiny-check
         ;;
     audit-temporal-flow-cache)
         audit_temporal_flow_cache "$@"

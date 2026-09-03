@@ -797,6 +797,29 @@ class RuntimeBatchTimingCallback(Callback):
         maximum, index = torch.max(tensor, dim=0)
         return float(tensor.mean().item()), p95, float(maximum.item()), int(index.item())
 
+    @staticmethod
+    def _nominal_frame_count(batch: Mapping[str, Any]) -> int:
+        """Return a schema-independent frame count without synchronizing CUDA."""
+
+        tactile = batch.get("tactile_signal")
+        if torch.is_tensor(tactile):
+            if tactile.ndim < 1:
+                raise ValueError("tactile_signal must include a batch dimension")
+            return int(tactile.shape[0])
+        clip_tactile = batch.get("clip_tactile_signal")
+        if torch.is_tensor(clip_tactile):
+            if clip_tactile.ndim < 2:
+                raise ValueError(
+                    "clip_tactile_signal must include batch and time dimensions"
+                )
+            return int(clip_tactile.shape[0] * clip_tactile.shape[1])
+        available = ", ".join(sorted(str(key) for key in batch))
+        raise KeyError(
+            "Runtime timing could not infer frame count: expected "
+            "'tactile_signal' or 'clip_tactile_signal'; "
+            f"available keys=[{available}]"
+        )
+
     def _flush(self):
         if not self._rows or self._path is None:
             return
@@ -815,11 +838,16 @@ class RuntimeBatchTimingCallback(Callback):
 
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
         del pl_module
+        if not isinstance(batch, Mapping):
+            raise TypeError(
+                "Runtime timing expects a mapping batch, "
+                f"got {type(batch).__name__}"
+            )
         now = time.perf_counter()
         loader_gap_ms = (
             math.nan if self._last_batch_end is None else (now - self._last_batch_end) * 1000.0
         )
-        io_debug = batch.get("_runtime_io_debug", {}) if isinstance(batch, dict) else {}
+        io_debug = batch.get("_runtime_io_debug", {})
         row = {
             "time_unix": f"{time.time():.6f}",
             "epoch": int(trainer.current_epoch),
@@ -828,7 +856,7 @@ class RuntimeBatchTimingCallback(Callback):
             "rank": int(trainer.global_rank),
             "loader_gap_ms": loader_gap_ms,
             "step_wall_ms": math.nan,
-            "batch_size": int(batch["tactile_signal"].shape[0]),
+            "batch_size": self._nominal_frame_count(batch),
         }
         h5_paths = self._strings(batch.get("h5_path"))
         sequences = self._strings(batch.get("sequence_key"))

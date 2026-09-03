@@ -325,6 +325,7 @@ def _load_tactile_model_metadata(checkpoint_path):
             "input_resolution",
             "pool_output_channels",
             "decoder_hidden_dim",
+            "center_aux_hidden_dim",
             "decoder_dropout_scale",
             "local_anchor_count",
             "local_anchor_neighbors",
@@ -383,6 +384,7 @@ def load_models(
     decoder_dropout_scale = float(metadata.get("decoder_dropout_scale", 1.0))
     pool_output_channels = int(metadata.get("pool_output_channels", 32))
     decoder_hidden_dim = int(metadata.get("decoder_hidden_dim", 512))
+    center_aux_hidden_dim = int(metadata.get("center_aux_hidden_dim", 128))
     local_anchor_count = int(metadata.get("local_anchor_count", 512))
     local_anchor_neighbors = int(metadata.get("local_anchor_neighbors", 4))
     local_logit_delta_max = float(metadata.get("local_logit_delta_max", 6.0))
@@ -473,6 +475,7 @@ def load_models(
         input_resolution=input_resolution,
         pool_output_channels=pool_output_channels,
         decoder_hidden_dim=decoder_hidden_dim,
+        center_aux_hidden_dim=center_aux_hidden_dim,
         local_anchor_count=local_anchor_count,
         local_anchor_neighbors=local_anchor_neighbors,
         local_logit_delta_max=local_logit_delta_max,

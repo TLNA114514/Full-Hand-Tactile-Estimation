@@ -42,6 +42,9 @@ Modes:
              Evaluate current Stage 2.1 loss-best checkpoints and aggregate
   routing-v2
              Prepare, train, evaluate, and aggregate Stage 2.1
+  hamer-h0   Run the Stage 2.2 HaMeR checkpoint/crop/lattice integrity audit
+  hamer-h0-self-test
+             Run synthetic crop and patch-lattice tests without model weights
   all        Prepare the cache if needed, then run Stage 1
   self-test  Run deterministic canonical, basis, and learnability checks
 
@@ -101,6 +104,11 @@ Optional environment:
   ROUTING_V2_GPUS             Eight comma-separated GPUs (default: 0..7)
   ROUTING_V2_FEATURE_SOURCES  projected32,rezero256 comparison
   ROUTING_V2_SEEDS            Four controlled seeds (default: 521,2029,3407,4099)
+  HAMER_CHECKPOINT            Official HaMeR Lightning checkpoint
+  HAMER_MODEL_CONFIG          Optional matching model_config.yaml
+  HAMER_FEATURE_ROUTING_DIR   Stage 2.2 artifact root
+  HAMER_H0_DEVICE             H0 audit device (default: cuda:0)
+  HAMER_H0_SAMPLE_COUNT       Tiny real-sample audit size (default: 4)
 EOF
     exit 2
 fi
@@ -109,6 +117,7 @@ shift
 DEFAULT_CHECKPOINT="$ROOT_DIR/hamer_tactile_ft/checkpoints/touchanything_dense_v2_dinov3_rezero_fullgrid32_coreloc_sam3_crop12/best_loss.ckpt"
 DEFAULT_DINO="/home/ma-user/work/cfzhao/Full-Hand-Tactile-Estimation/_DATA/dinov3_vith16plus_pretrain_lvd1689m-7c1da9a5.pth"
 DEFAULT_RUNTIME_ROOT="/home/ma-user/work/cfzhao/input_prior_full"
+DEFAULT_HAMER_CHECKPOINT="$ROOT_DIR/hamer/_DATA/hamer_ckpts/checkpoints/hamer.ckpt"
 
 TACTILE_BASE_CHECKPOINT="${TACTILE_BASE_CHECKPOINT:-$DEFAULT_CHECKPOINT}"
 DINO_WEIGHTS="${DINO_WEIGHTS:-$DEFAULT_DINO}"
@@ -189,6 +198,12 @@ ROUTING_V2_EPOCHS="${ROUTING_V2_EPOCHS:-30}"
 ROUTING_V2_BATCH_SIZE="${ROUTING_V2_BATCH_SIZE:-512}"
 ROUTING_V2_EVAL_BATCH_SIZE="${ROUTING_V2_EVAL_BATCH_SIZE:-1024}"
 ROUTING_V2_PREP_BATCH_SIZE="${ROUTING_V2_PREP_BATCH_SIZE:-256}"
+HAMER_CHECKPOINT="${HAMER_CHECKPOINT:-$DEFAULT_HAMER_CHECKPOINT}"
+HAMER_MODEL_CONFIG="${HAMER_MODEL_CONFIG:-}"
+HAMER_FEATURE_ROUTING_DIR="${HAMER_FEATURE_ROUTING_DIR:-$ROOT_DIR/hamer_tactile_ft/reports/hamer_feature_routing}"
+HAMER_H0_DEVICE="${HAMER_H0_DEVICE:-cuda:0}"
+HAMER_H0_SAMPLE_COUNT="${HAMER_H0_SAMPLE_COUNT:-4}"
+HAMER_H0_BATCH_SIZE="${HAMER_H0_BATCH_SIZE:-1}"
 TACTILE_PYTHON="${TACTILE_PYTHON:-/home/ma-user/work/cfzhao/tactile/bin/python}"
 MPLCONFIGDIR="${MPLCONFIGDIR:-$DEFAULT_RUNTIME_ROOT/state/matplotlib}"
 
@@ -1316,6 +1331,38 @@ run_routing_v2_eval() {
         aggregate --input-root "$CANONICAL_ROUTING_V2_DIR"
 }
 
+run_hamer_h0() {
+    [[ -f "$HAMER_CHECKPOINT" ]] || {
+        echo "Missing HaMeR checkpoint: $HAMER_CHECKPOINT" >&2
+        echo "Set HAMER_CHECKPOINT to the official hamer.ckpt path." >&2
+        return 2
+    }
+    [[ -f "$TACTILE_BASE_CHECKPOINT" ]] || {
+        echo "Missing crop1.2 FullGrid checkpoint: $TACTILE_BASE_CHECKPOINT" >&2
+        return 2
+    }
+    [[ -f "$DINO_WEIGHTS" ]] || {
+        echo "Missing DINO weights: $DINO_WEIGHTS" >&2
+        return 2
+    }
+    local -a command=(
+        "$TACTILE_PYTHON"
+        "$ROOT_DIR/hamer_tactile_ft/audit_hamer_feature_routing.py"
+        integrity
+        --hamer-checkpoint "$HAMER_CHECKPOINT"
+        --base-checkpoint "$TACTILE_BASE_CHECKPOINT"
+        --dino-weights "$DINO_WEIGHTS"
+        --output-dir "$HAMER_FEATURE_ROUTING_DIR/h0_integrity"
+        --device "$HAMER_H0_DEVICE"
+        --sample-count "$HAMER_H0_SAMPLE_COUNT"
+        --batch-size "$HAMER_H0_BATCH_SIZE"
+    )
+    if [[ -n "$HAMER_MODEL_CONFIG" ]]; then
+        command+=(--hamer-config "$HAMER_MODEL_CONFIG")
+    fi
+    PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" "${command[@]}" "$@"
+}
+
 case "$MODE" in
     prepare)
         prepare_cache
@@ -1377,6 +1424,14 @@ case "$MODE" in
         run_routing_v2_train
         run_routing_v2_eval
         ;;
+    hamer-h0|stage2.2-h0)
+        run_hamer_h0 "$@"
+        ;;
+    hamer-h0-self-test|stage2.2-h0-self-test)
+        PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+        "$TACTILE_PYTHON" "$ROOT_DIR/hamer_tactile_ft/audit_hamer_feature_routing.py" \
+            self-test --output-dir "$HAMER_FEATURE_ROUTING_DIR/h0_integrity" "$@"
+        ;;
     all)
         prepare_cache
         run_stage0 "$@"
@@ -1399,6 +1454,9 @@ case "$MODE" in
             self-test
         PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
         "$TACTILE_PYTHON" "$ROOT_DIR/hamer_tactile_ft/audit_canonical_anchor_routing.py" \
+            self-test
+        PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+        "$TACTILE_PYTHON" "$ROOT_DIR/hamer_tactile_ft/audit_hamer_feature_routing.py" \
             self-test
         ;;
     *)

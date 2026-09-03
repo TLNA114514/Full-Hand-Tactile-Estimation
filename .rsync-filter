@@ -1,5 +1,14 @@
 # Shared source-sync exclusions. Runtime assets live on the machine that
 # creates them and must survive rsync --delete.
+#
+# These receiver-side protect rules make cache survival explicit. The matching
+# exclusions below still prevent machine-local cache contents from syncing.
+P hdf5_manifest_cache/***
+P index_cache/***
+P cache/***
+P feature_cache/***
+P hand_pose_sidecars/***
+P hand_pose_priors/sidecars/***
 - .git/
 - __pycache__/
 - *.pyc
@@ -18,12 +27,16 @@
 - logs/
 - lightning_logs/
 - hdf5_manifest_cache/
+- index_cache/
 - eval_reports*
 - data_integrity_audits/
 - input_prior_audits/
 - memorization/
 - outputs/
 - cache/
+- feature_cache/
+- hand_pose_sidecars/
+- hand_pose_priors/sidecars/
 - sidecars/
 - models/
 - envs/

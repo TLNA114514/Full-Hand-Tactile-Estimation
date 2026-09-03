@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List
+from zipfile import ZipFile
 
 import numpy as np
 
@@ -11,17 +13,23 @@ from .geometry import (
     SensorGeometry,
     gaussian_smooth_vertices,
     map_sensor_vector_to_vertices,
+    sha1_files,
 )
 from .io import load_json
 
 
 METHODS = {
+    "ema_preprocess_gaussian",
     "ot_raw_heatmap",
+    "raw_to_mano_direct",
     "ot_discrete_heatmap",
     "ot_centered_mano",
     "egotactile_heatmap",
     "preprocess_gaussian",
 }
+
+
+_PREPROCESS_GAUSSIAN_OPERATOR_CACHE = {}
 
 
 @dataclass
@@ -187,10 +195,316 @@ def _num_frames_from_arrays(*arrays) -> int:
     return min(counts) if counts else 0
 
 
-def build_ot_raw(raw_sensor: np.ndarray | None, sensor_geom: SensorGeometry, mesh: MeshGeometry) -> np.ndarray | None:
+def _npz_member_frame_count(path: Path, key: str) -> int:
+    """Read an embedded NPY shape without inflating its compressed payload."""
+
+    member = f"{key}.npy"
+    try:
+        with ZipFile(path, "r") as archive, archive.open(member, "r") as handle:
+            version = np.lib.format.read_magic(handle)
+            if version == (1, 0):
+                shape, _, _ = np.lib.format.read_array_header_1_0(handle)
+            else:
+                shape, _, _ = np.lib.format.read_array_header_2_0(handle)
+        return int(shape[0]) if shape else 0
+    except Exception:
+        return 0
+
+
+def build_raw_to_mano_direct(
+    raw_sensor: np.ndarray | None,
+    sensor_geom: SensorGeometry,
+    mesh: MeshGeometry,
+) -> np.ndarray | None:
+    """Scatter calibrated raw taxels onto their MANO vertices without smoothing."""
+
     if raw_sensor is None:
         return None
     return map_sensor_vector_to_vertices(raw_sensor, sensor_geom, mesh.vertices.shape[0])
+
+
+def _palm_vertices(repo_root: Path, mesh: MeshGeometry) -> np.ndarray:
+    palm_path = (
+        repo_root
+        / "opentouch/preprocess/scratch/auto_calibrated_palm_subdiv_faces.json"
+    )
+    face_indices = load_json(palm_path)["group_negative"]["face_indices"]
+    valid_faces = np.asarray(
+        [int(face_id) for face_id in face_indices if 0 <= int(face_id) < len(mesh.faces)],
+        dtype=np.int64,
+    )
+    if valid_faces.size == 0:
+        return np.zeros((0,), dtype=np.int64)
+    return np.unique(mesh.faces[valid_faces].reshape(-1)).astype(np.int64)
+
+
+def _geodesic_gaussian_operator(
+    dataset: str,
+    hand: str,
+    sensor_geom: SensorGeometry,
+    mesh: MeshGeometry,
+    repo_root: Path,
+    sigma: float = 0.005,
+):
+    key = ("geodesic", dataset, hand, id(sensor_geom), id(mesh), float(sigma))
+    cached = _PREPROCESS_GAUSSIAN_OPERATOR_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    keep = np.ones((len(sensor_geom.sensor_ids),), dtype=bool)
+    if dataset == "opentouch":
+        layout_path = (
+            repo_root / "opentouch/preprocess/scratch/handLayoutNewest_meshid.json"
+        )
+        layout = load_json(layout_path)
+        erased_sensor_ids = set()
+        for node in layout.get("erasedNodes", []):
+            separator = "-" if "-" in node else ","
+            row, col = [int(value) for value in node.split(separator)]
+            erased_sensor_ids.add(row * 16 + col)
+        keep = np.asarray(
+            [
+                int(sensor_id) not in erased_sensor_ids
+                for sensor_id in sensor_geom.sensor_ids.tolist()
+            ],
+            dtype=bool,
+        )
+
+    sensor_ids = sensor_geom.sensor_ids[keep].astype(np.int64)
+    costs = sensor_geom.sensor_to_vertex_cost[keep].astype(np.float32)
+    weights = np.exp(
+        -(costs * costs) / (2.0 * float(sigma) * float(sigma))
+    ).astype(np.float32)
+    cached = {
+        "sensor_ids": sensor_ids,
+        "weights": weights,
+        "palm_vertices": _palm_vertices(repo_root, mesh),
+    }
+    _PREPROCESS_GAUSSIAN_OPERATOR_CACHE[key] = cached
+    return cached
+
+
+def _egotactile_weighted_max_operator(
+    hand: str,
+    mesh: MeshGeometry,
+    repo_root: Path,
+):
+    key = ("egotactile_weighted_max", hand, id(mesh))
+    cached = _PREPROCESS_GAUSSIAN_OPERATOR_CACHE.get(key)
+    if cached is not None:
+        return cached
+    mapping_path = repo_root / f"preprocess/egotactile/egotactile_mapping_{hand}.json"
+    mapping = load_json(mapping_path)
+    entries = []
+    for item in mapping.get("pressure_sensors", {}).values():
+        vertices = np.asarray(item.get("mano_vid", []), dtype=np.int64)
+        weights = np.asarray(item.get("mano_weight", []), dtype=np.float32)
+        valid = (
+            (vertices >= 0)
+            & (vertices < mesh.vertices.shape[0])
+            & np.isfinite(weights)
+        )
+        vertices = vertices[valid]
+        weights = weights[valid]
+        if vertices.size:
+            entries.append((int(item["raw_id_0based"]), vertices, weights))
+    cached = tuple(entries)
+    _PREPROCESS_GAUSSIAN_OPERATOR_CACHE[key] = cached
+    return cached
+
+
+def _touchanything_grid_gaussian_operator(
+    hand: str,
+    mesh: MeshGeometry,
+    repo_root: Path,
+):
+    key = ("touchanything_grid", hand, id(mesh))
+    cached = _PREPROCESS_GAUSSIAN_OPERATOR_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    mapping_path = (
+        repo_root
+        / f"TouchAnything/scripts/tools/mano_visualization/ta_to_mano_mapping_{hand}_visual.json"
+    )
+    mesh_path = repo_root / "opentouch/preprocess/scratch/mano_right_neutral_subdiv.obj"
+    palm_path = (
+        repo_root
+        / "opentouch/preprocess/scratch/auto_calibrated_palm_subdiv_faces.json"
+    )
+    fingerprint = sha1_files((mapping_path, mesh_path, palm_path))
+    cache_dir = repo_root / "preprocess/artifacts/representation_eval/cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / f"ta_grid_gaussian_{hand}_{fingerprint}.npz"
+    lock_path = cache_path.with_suffix(cache_path.suffix + ".lock")
+
+    import fcntl
+
+    with lock_path.open("a+b") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        if not cache_path.is_file():
+            from preprocess.touchanything._gaussian import (
+                load_ta_mesh_and_compute_dist_cpu,
+            )
+
+            dependencies = load_ta_mesh_and_compute_dist_cpu(
+                str(repo_root), hand=hand, sigma=0.005
+            )
+            temporary = cache_path.with_name(
+                f".{cache_path.stem}.{os.getpid()}.tmp.npz"
+            )
+            try:
+                np.savez_compressed(
+                    temporary,
+                    rows=dependencies.valid_rows_cpu.numpy(),
+                    columns=dependencies.valid_cols_cpu.numpy(),
+                    weights=dependencies.weights_tensor_cpu.numpy(),
+                    palm_vertices=dependencies.palm_vertices_tensor_cpu.numpy(),
+                )
+                os.replace(temporary, cache_path)
+            finally:
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
+        with np.load(cache_path, allow_pickle=False) as archive:
+            cached = {
+                "rows": np.asarray(archive["rows"], dtype=np.int64),
+                "columns": np.asarray(archive["columns"], dtype=np.int64),
+                "weights": np.asarray(archive["weights"], dtype=np.float32),
+                "palm_vertices": np.asarray(
+                    archive["palm_vertices"], dtype=np.int64
+                ),
+            }
+    _PREPROCESS_GAUSSIAN_OPERATOR_CACHE[key] = cached
+    return cached
+
+
+def _smooth_dense_sequence(values: np.ndarray, preset: str) -> np.ndarray:
+    from preprocess.smooth_tactile import SMOOTH_PRESETS
+
+    values = np.clip(
+        np.nan_to_num(np.asarray(values, dtype=np.float32)), 0.0, 1.0
+    )
+    if preset not in SMOOTH_PRESETS:
+        raise ValueError(f"Unknown temporal smoothing preset {preset!r}")
+    previous, current, following = SMOOTH_PRESETS[preset]
+    total = float(previous + current + following)
+    if total <= 0.0:
+        raise ValueError(f"Temporal smoothing preset {preset!r} has zero weight")
+    previous, current, following = (
+        float(previous) / total,
+        float(current) / total,
+        float(following) / total,
+    )
+    smoothed = current * values
+    if len(values):
+        previous_values = np.concatenate((values[:1], values[:-1]), axis=0)
+        following_values = np.concatenate((values[1:], values[-1:]), axis=0)
+        smoothed += previous * previous_values + following * following_values
+    return np.clip(smoothed, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def _smooth_raw_sequence(
+    raw_sensors: list[np.ndarray | None],
+    preset: str,
+) -> np.ndarray:
+    valid = [np.asarray(value).reshape(-1) for value in raw_sensors if value is not None]
+    if not valid:
+        return np.zeros((len(raw_sensors), 0), dtype=np.float32)
+    raw_dim = int(valid[0].size)
+    values = np.zeros((len(raw_sensors), raw_dim), dtype=np.float32)
+    for frame_index, value in enumerate(raw_sensors):
+        if value is None:
+            continue
+        current = np.nan_to_num(
+            np.asarray(value, dtype=np.float32).reshape(-1),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        if current.size != raw_dim:
+            raise ValueError(
+                f"Inconsistent raw pressure width: {current.size} vs {raw_dim}"
+            )
+        values[frame_index] = np.clip(current, 0.0, 1.0)
+
+    return _smooth_dense_sequence(values, preset=preset)
+
+
+def build_temporally_smoothed_preprocess_gaussian_sequence(
+    raw_sensors: list[np.ndarray | None],
+    dataset: str,
+    hand: str,
+    sensor_geom: SensorGeometry,
+    mesh: MeshGeometry,
+    repo_root: Path,
+    preset: str = "ema",
+    raw_spatial_sequence: np.ndarray | None = None,
+) -> list[np.ndarray]:
+    """Apply the selected raw-space temporal filter before spatial MANO mapping."""
+
+    smoothed = _smooth_raw_sequence(raw_sensors, preset=preset)
+    vertex_count = int(mesh.vertices.shape[0])
+    targets = np.zeros((len(raw_sensors), vertex_count), dtype=np.float32)
+    if smoothed.shape[1] == 0:
+        return [target for target in targets]
+
+    if dataset == "egotactile":
+        for sensor_id, vertices, weights in _egotactile_weighted_max_operator(
+            hand, mesh, repo_root
+        ):
+            if not 0 <= sensor_id < smoothed.shape[1]:
+                continue
+            targets[:, vertices] = np.maximum(
+                targets[:, vertices],
+                smoothed[:, sensor_id, None] * weights[None, :],
+            )
+        return [target for target in targets]
+
+    if dataset == "touchanything":
+        if raw_spatial_sequence is None:
+            raise ValueError(
+                "TouchAnything EMA-before-Gaussian requires the original 21x21 grid"
+            )
+        grids = _smooth_dense_sequence(raw_spatial_sequence, preset=preset)
+        operator = _touchanything_grid_gaussian_operator(hand, mesh, repo_root)
+        active_values = grids[:, operator["rows"], operator["columns"]]
+        weights = operator["weights"]
+        palm_vertices = operator["palm_vertices"]
+        for frame_index, frame_values in enumerate(active_values):
+            active = np.flatnonzero(frame_values > 0.0)
+            if active.size == 0:
+                continue
+            dense = np.max(frame_values[active, None] * weights[active], axis=0)
+            targets[frame_index, palm_vertices] = dense[palm_vertices]
+        return [target for target in targets]
+
+    operator = _geodesic_gaussian_operator(
+        dataset, hand, sensor_geom, mesh, repo_root
+    )
+    valid = operator["sensor_ids"] < smoothed.shape[1]
+    sensor_ids = operator["sensor_ids"][valid]
+    weights = operator["weights"][valid]
+    palm_vertices = operator["palm_vertices"]
+    active_values = smoothed[:, sensor_ids]
+    for frame_index, frame_values in enumerate(active_values):
+        active = np.flatnonzero(frame_values > 0.0)
+        if active.size == 0:
+            continue
+        dense = np.max(frame_values[active, None] * weights[active], axis=0)
+        targets[frame_index, palm_vertices] = dense[palm_vertices]
+    return [target for target in targets]
+
+
+def build_ot_raw(
+    raw_sensor: np.ndarray | None,
+    sensor_geom: SensorGeometry,
+    mesh: MeshGeometry,
+) -> np.ndarray | None:
+    """Backward-compatible name for the historical OpenTouch direct baseline."""
+
+    return build_raw_to_mano_direct(raw_sensor, sensor_geom, mesh)
 
 
 def build_ot_discrete(raw_sensor: np.ndarray | None, sensor_geom: SensorGeometry, mesh: MeshGeometry, levels: int = 5) -> np.ndarray | None:
@@ -256,15 +570,62 @@ def _load_npz_source_representations(
         if dataset == "egotactile":
             raw_arr = data[f"{hand}_sensor_256_norm"][:] if f"{hand}_sensor_256_norm" in data else None
             valid_arr = data[f"{hand}_sensor_valid"][:] if f"{hand}_sensor_valid" in data else None
-            gaussian_arr = data[f"{hand}_pressure_continuous_subdiv"][:] if f"{hand}_pressure_continuous_subdiv" in data else None
+            pressure_ids = (
+                np.asarray(data[f"{hand}_pressure_raw_ids"][:], dtype=np.int64)
+                if f"{hand}_pressure_raw_ids" in data
+                else None
+            )
+            pressure_channel_mask = None
+            if pressure_ids is not None:
+                pressure_channel_mask = np.zeros((256,), dtype=bool)
+                pressure_ids = pressure_ids[
+                    (pressure_ids >= 0) & (pressure_ids < len(pressure_channel_mask))
+                ]
+                pressure_channel_mask[pressure_ids] = True
+            gaussian_arr = (
+                data[f"{hand}_pressure_continuous_subdiv"][:]
+                if "preprocess_gaussian" in methods
+                and f"{hand}_pressure_continuous_subdiv" in data
+                else None
+            )
             n = _num_frames_from_arrays(raw_arr, gaussian_arr, valid_arr)
+            if gaussian_arr is None and methods.intersection(
+                {"raw_to_mano_direct", "ema_preprocess_gaussian"}
+            ):
+                gaussian_count = _npz_member_frame_count(
+                    source_path, f"{hand}_pressure_continuous_subdiv"
+                )
+                if gaussian_count > 0:
+                    n = min(n, gaussian_count)
             _ensure_frame_index(sequence, n)
             raw_sensors = []
             for i in range(n):
                 valid = True if valid_arr is None else bool(np.asarray(valid_arr).reshape(-1)[i])
                 raw = _clip01(_as_float_array(raw_arr[i], shape=(256,))) if valid and raw_arr is not None else None
+                if raw is not None and pressure_channel_mask is not None:
+                    raw = raw.copy()
+                    raw[~pressure_channel_mask] = 0.0
                 raw_sensors.append(raw)
+            ema_targets = None
+            if "ema_preprocess_gaussian" in methods:
+                ema_targets = build_temporally_smoothed_preprocess_gaussian_sequence(
+                    raw_sensors,
+                    dataset,
+                    hand,
+                    sensor_geom,
+                    mesh,
+                    repo_root,
+                    preset="ema",
+                )
             for i, raw in enumerate(raw_sensors):
+                if "ema_preprocess_gaussian" in methods:
+                    out["ema_preprocess_gaussian"].append(
+                        FrameRepresentation(raw, ema_targets[i], "mano")
+                    )
+                if "raw_to_mano_direct" in methods:
+                    out["raw_to_mano_direct"].append(
+                        FrameRepresentation(raw, None, "mano_direct")
+                    )
                 if "egotactile_heatmap" in methods:
                     native, native_mask, sampled = egotactile_heatmap_native(raw, hand)
                     mano = map_sensor_vector_to_vertices(sampled, sensor_geom, mesh.vertices.shape[0]) if sampled is not None else None
@@ -275,11 +636,48 @@ def _load_npz_source_representations(
 
         elif dataset == "touchanything":
             raw_arr = data[f"{hand}_pressure_grid"][:] if f"{hand}_pressure_grid" in data else None
-            gaussian_arr = data[f"{hand}_pressure_continuous_subdiv"][:] if f"{hand}_pressure_continuous_subdiv" in data else None
+            gaussian_arr = (
+                data[f"{hand}_pressure_continuous_subdiv"][:]
+                if "preprocess_gaussian" in methods
+                and f"{hand}_pressure_continuous_subdiv" in data
+                else None
+            )
             n = _num_frames_from_arrays(raw_arr, gaussian_arr)
+            if gaussian_arr is None and methods.intersection(
+                {"raw_to_mano_direct", "ema_preprocess_gaussian"}
+            ):
+                gaussian_count = _npz_member_frame_count(
+                    source_path, f"{hand}_pressure_continuous_subdiv"
+                )
+                if gaussian_count > 0:
+                    n = min(n, gaussian_count)
             _ensure_frame_index(sequence, n)
+            raw_sensors = [
+                _ta_grid_to_sensor256(_array_frame(raw_arr, i), repo_root, hand)
+                for i in range(n)
+            ]
+            ema_targets = None
+            if "ema_preprocess_gaussian" in methods:
+                ema_targets = build_temporally_smoothed_preprocess_gaussian_sequence(
+                    raw_sensors,
+                    dataset,
+                    hand,
+                    sensor_geom,
+                    mesh,
+                    repo_root,
+                    preset="ema",
+                    raw_spatial_sequence=np.asarray(raw_arr[:n], dtype=np.float32),
+                )
             for i in range(n):
-                raw = _ta_grid_to_sensor256(_array_frame(raw_arr, i), repo_root, hand)
+                raw = raw_sensors[i]
+                if "ema_preprocess_gaussian" in methods:
+                    out["ema_preprocess_gaussian"].append(
+                        FrameRepresentation(raw, ema_targets[i], "mano")
+                    )
+                if "raw_to_mano_direct" in methods:
+                    out["raw_to_mano_direct"].append(
+                        FrameRepresentation(raw, None, "mano_direct")
+                    )
                 if "preprocess_gaussian" in methods:
                     target = _clip01(_as_float_array(_array_frame(gaussian_arr, i)))
                     out["preprocess_gaussian"].append(FrameRepresentation(raw, target, "mano"))
@@ -304,14 +702,42 @@ def _load_hdf5_source_representations(
             return {}
         demo = f["data"][demo_name]
         raw_arr = demo[f"{hand}_pressure"][:] if f"{hand}_pressure" in demo else None
-        gaussian_arr = demo[f"{hand}_pressure_continuous_subdiv"][:] if f"{hand}_pressure_continuous_subdiv" in demo else None
-        n = _num_frames_from_arrays(raw_arr, gaussian_arr)
+        gaussian_dataset = (
+            demo[f"{hand}_pressure_continuous_subdiv"]
+            if f"{hand}_pressure_continuous_subdiv" in demo
+            else None
+        )
+        gaussian_arr = (
+            gaussian_dataset[:]
+            if "preprocess_gaussian" in methods and gaussian_dataset is not None
+            else None
+        )
+        n = _num_frames_from_arrays(raw_arr, gaussian_dataset)
         _ensure_frame_index(sequence, n)
         raw_sensors = [normalize_opentouch_pressure_direct(_array_frame(raw_arr, i)) for i in range(n)]
+        ema_targets = None
+        if "ema_preprocess_gaussian" in methods:
+            ema_targets = build_temporally_smoothed_preprocess_gaussian_sequence(
+                raw_sensors,
+                sequence["dataset"],
+                hand,
+                sensor_geom,
+                mesh,
+                _repo_root_default(),
+                preset="ema",
+            )
         centered = None
         if "ot_centered_mano" in methods:
             centered = build_centered_sequence(raw_sensors, sensor_geom, mesh)
         for i, raw in enumerate(raw_sensors):
+            if "ema_preprocess_gaussian" in methods:
+                out["ema_preprocess_gaussian"].append(
+                    FrameRepresentation(raw, ema_targets[i], "mano")
+                )
+            if "raw_to_mano_direct" in methods:
+                out["raw_to_mano_direct"].append(
+                    FrameRepresentation(raw, None, "mano_direct")
+                )
             if "ot_raw_heatmap" in methods:
                 out["ot_raw_heatmap"].append(FrameRepresentation(raw, build_ot_raw(raw, sensor_geom, mesh), "mano"))
             if "ot_discrete_heatmap" in methods:
@@ -424,11 +850,53 @@ def load_sequence_representations(
     metas = [load_json(Path(frame["meta_path"])) for frame in sequence["frames"]]
     raw_sensors = [extract_raw_sensor(meta, dataset, hand) for meta in metas]
     out = {method: [] for method in methods}
+    ema_targets = None
+    if "ema_preprocess_gaussian" in methods:
+        raw_spatial_sequence = None
+        if dataset == "touchanything":
+            spatial_frames = [
+                _as_float_array(
+                    meta.get("hands", {})
+                    .get(hand, {})
+                    .get("normalized_pressure_grid")
+                )
+                for meta in metas
+            ]
+            template = next((value for value in spatial_frames if value is not None), None)
+            if template is None:
+                raise ValueError(
+                    "TouchAnything metadata contains no normalized pressure grids"
+                )
+            raw_spatial_sequence = np.stack(
+                [
+                    value if value is not None else np.zeros_like(template)
+                    for value in spatial_frames
+                ],
+                axis=0,
+            )
+        ema_targets = build_temporally_smoothed_preprocess_gaussian_sequence(
+            raw_sensors,
+            dataset,
+            hand,
+            sensor_geom,
+            mesh,
+            repo_root,
+            preset="ema",
+            raw_spatial_sequence=raw_spatial_sequence,
+        )
     centered = None
     if "ot_centered_mano" in methods and dataset == "opentouch":
         centered = build_centered_sequence(raw_sensors, sensor_geom, mesh)
     for idx, meta in enumerate(metas):
         raw = raw_sensors[idx]
+        if "ema_preprocess_gaussian" in methods:
+            out["ema_preprocess_gaussian"].append(
+                FrameRepresentation(raw, ema_targets[idx], "mano")
+            )
+        if "raw_to_mano_direct" in methods:
+            out["raw_to_mano_direct"].append(
+                FrameRepresentation(raw, None, "mano_direct")
+            )
         if "ot_raw_heatmap" in methods and dataset == "opentouch":
             out["ot_raw_heatmap"].append(FrameRepresentation(raw, build_ot_raw(raw, sensor_geom, mesh), "mano"))
         if "ot_discrete_heatmap" in methods and dataset == "opentouch":

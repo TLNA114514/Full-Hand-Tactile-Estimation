@@ -37,10 +37,17 @@ SAM3 FullGrid32 + CoreLoc presets:
   fullgrid-coreloc-touchanything
   fullgrid-coreloc-ta-crop10|crop12|crop14|crop16|crop18|crop20
   fullgrid-coreloc-ta-res320|res384
+  replay-ta-crop12-20260724     Strict reconstruction of the historical crop1.2 baseline
+  coreloc-w01-r256              Historical crop1.2 setup with only CoreLoc weight 0.001 -> 0.01
+  coreloc-w05-r256              Historical crop1.2 setup with only CoreLoc weight 0.001 -> 0.05
+  center-loss-r256              Historical crop1.2 + parameter-free center/presence losses
+  center-aux-r256               Historical crop1.2 + train-only center/presence heads
   fullgrid-coreloc-ta-capacity50|capacity72
   fg-c32-h512|fg-c64-h512|fg-c128-h512|fg-c256-h512
   fg-c32-h1024|fg-c64-h1024|fg-c128-h1024|fg-c256-h1024
                                   FullGrid channel/decoder-width ablation matrix
+  weight-flat1-r256               Crop1.2 control with uniform pointwise weight 1.0
+  weight-contact2-r256            Crop1.2 control with GT>=0.10 pointwise weight 2.0
   weight-plateau2-r256
   weight-linear3-r256
   local-residual-r256             Frozen crop1.2 base + bounded canonical local residual
@@ -68,10 +75,19 @@ if [[ -z "$MODE" || "$MODE" == "-h" || "$MODE" == "--help" ]]; then
 fi
 shift
 
+CANONICAL_MODEL_INITIALIZATION_ORDER=legacy_decoder_first
+CANONICAL_REPRO_COMMON=(
+    --model_initialization_order "$CANONICAL_MODEL_INITIALIZATION_ORDER"
+    --worker_seed_mode lightning_legacy
+    --hdf5_sample_order legacy_sample_dir_hand
+    --crop_pipeline legacy_square_center
+    --optimizer_backend_mode legacy_default
+)
 DINO_COMMON=(
     --visual_backbone dinov3_hplus
     --backbone_feature_layers 8,16,24,32
     --dino_weights "$DINO_WEIGHTS"
+    "${CANONICAL_REPRO_COMMON[@]}"
 )
 REZERO_COMMON=(
     "${DINO_COMMON[@]}"
@@ -163,6 +179,49 @@ set_ta_variant() {
     local exp_name="$1" bbox_scale="$2" resolution="${3:-256x192}"
     set_sam3 touchanything "$exp_name" "$bbox_scale"
     preset_args+=(--input_resolution "$resolution" --accumulate_grad_batches 1)
+}
+
+set_ta_coreloc_weight_audit() {
+    local exp_name="$1" location_weight="$2"
+    required_manifests=(
+        "$TA_BBOX_MANIFEST"
+        "$TA_TRAIN_QUERIES"
+        "$TA_VAL_QUERIES"
+    )
+    set_ta_variant "$exp_name" 1.2
+    preset_args+=(
+        --data_backend sequence_hdf5
+        --data_dir "$TA_HDF5_ROOT"
+        --query_manifests "$TA_TRAIN_QUERIES"
+        --val_query_manifests "$TA_VAL_QUERIES"
+        --pool_output_channels 32
+        --decoder_hidden_dim 512
+        --decoder_dropout_scale 1.0
+        --index_workers 256
+        --index_backend process
+        --index_chunksize 512
+        --index_process_worker_cap 64
+        --batch_size 128
+        --accumulate_grad_batches 1
+        --epochs 60
+        --num_workers 32
+        --val_num_workers 16
+        --no-persistent_workers
+        --prefetch_factor 2
+        --lr 5e-5
+        --optimizer_backend_mode legacy_default
+        --seed 521
+        --lr_warmup_epochs 3
+        --loss_ramp_epochs 5
+        --trainer_precision bf16-mixed
+        --gradient_clip_val 1.0
+        --train_augmentation
+        --pressure_weight_mode hump
+        --location_loss_weight "$location_weight"
+        --location_gt_volume_thr 1.0
+        --location_distribution_power 2.0
+        --location_min_gt_peak 0.05
+    )
 }
 
 set_three_domain() {
@@ -299,6 +358,85 @@ case "$MODE" in
         set_ta_variant touchanything_dense_v2_dinov3_rezero_fullgrid32_coreloc_sam3_crop10 1.0 ;;
     fullgrid-coreloc-ta-crop12|dino-rezero-fullgrid32-coreloc-sam3-touchanything-crop12)
         set_ta_variant touchanything_dense_v2_dinov3_rezero_fullgrid32_coreloc_sam3_crop12 1.2 ;;
+    replay-ta-crop12-20260724)
+        required_manifests=(
+            "$TA_BBOX_MANIFEST"
+            "$TA_TRAIN_QUERIES"
+            "$TA_VAL_QUERIES"
+        )
+        set_ta_variant ta_crop12_legacy_replay_20260724 1.2
+        preset_args+=(
+            --replay_profile ta_crop12_20260724
+            --model_initialization_order "$CANONICAL_MODEL_INITIALIZATION_ORDER"
+            --worker_seed_mode lightning_legacy
+            --hdf5_sample_order legacy_sample_dir_hand
+            --crop_pipeline legacy_square_center
+            --data_backend sequence_hdf5
+            --data_dir "$TA_HDF5_ROOT"
+            --query_manifests "$TA_TRAIN_QUERIES"
+            --val_query_manifests "$TA_VAL_QUERIES"
+            --pool_output_channels 32
+            --decoder_hidden_dim 512
+            --decoder_dropout_scale 1.0
+            --index_workers 256
+            --index_backend process
+            --index_chunksize 512
+            --index_process_worker_cap 64
+            --batch_size 128
+            --accumulate_grad_batches 1
+            --epochs 60
+            --num_workers 32
+            --val_num_workers 16
+            --no-persistent_workers
+            --prefetch_factor 2
+            --lr 5e-5
+            --optimizer_backend_mode legacy_default
+            --seed 521
+            --lr_warmup_epochs 3
+            --loss_ramp_epochs 5
+            --trainer_precision bf16-mixed
+            --gradient_clip_val 1.0
+            --train_augmentation
+            --pressure_weight_mode hump
+            --location_loss_weight 0.001
+            --location_gt_volume_thr 1.0
+            --location_distribution_power 2.0
+            --location_min_gt_peak 0.05
+            --no-auto_resume
+        ) ;;
+    coreloc-w01-r256)
+        set_ta_coreloc_weight_audit ta_coreloc_w01_r256 0.01 ;;
+    coreloc-w05-r256)
+        set_ta_coreloc_weight_audit ta_coreloc_w05_r256 0.05 ;;
+    center-loss-r256)
+        set_ta_coreloc_weight_audit ta_center_loss_r256 0.001
+        preset_args+=(
+            --center_loss_weight 0.05
+            --center_presence_loss_weight 0.02
+            --center_threshold_scale 0.35
+            --center_threshold_min 0.05
+            --center_threshold_max 0.20
+            --center_target_power 2.0
+            --center_presence_volume_thr 1.0
+            --center_presence_peak_thr 0.10
+            --center_presence_logit_scale 4.0
+        ) ;;
+    center-aux-r256)
+        set_ta_coreloc_weight_audit ta_center_aux_r256 0.001
+        preset_args+=(
+            --tactile_head_type dense_v2_dino_center_aux
+            --center_aux_hidden_dim 128
+            --center_aux_loss_weight 0.05
+            --center_aux_presence_loss_weight 0.02
+            --center_loss_weight 0.0
+            --center_presence_loss_weight 0.0
+            --center_threshold_scale 0.35
+            --center_threshold_min 0.05
+            --center_threshold_max 0.20
+            --center_target_power 2.0
+            --center_presence_volume_thr 1.0
+            --center_presence_peak_thr 0.10
+        ) ;;
     fullgrid-coreloc-ta-crop14|dino-rezero-fullgrid32-coreloc-sam3-touchanything-crop14)
         set_ta_variant touchanything_dense_v2_dinov3_rezero_fullgrid32_coreloc_sam3_crop14 1.4 ;;
     fullgrid-coreloc-ta-crop16|dino-rezero-fullgrid32-coreloc-sam3-touchanything-crop16)
@@ -318,7 +456,7 @@ case "$MODE" in
         set_ta_variant touchanything_dense_v2_dinov3_rezero_fullgrid32_coreloc_sam3_crop12_capacity72 1.2
         preset_args+=(--pool_output_channels 72) ;;
     fg-c32-h512)
-        set_width_variant touchanything_dense_v2_dinov3_rezero_fullgrid32_coreloc_sam3_crop12 32 512 ;;
+        set_width_variant ta_fg_c32_h512 32 512 ;;
     fg-c64-h512)
         set_width_variant ta_fg_c64_h512 64 512 ;;
     fg-c128-h512)
@@ -333,6 +471,19 @@ case "$MODE" in
         set_width_variant ta_fg_c128_h1024 128 1024 ;;
     fg-c256-h1024)
         set_width_variant ta_fg_c256_h1024 256 1024 ;;
+    weight-flat1-r256)
+        set_ta_coreloc_weight_audit ta_wflat1_r256 0.001
+        preset_args+=(
+            --pressure_weight_mode flat
+            --contact_pressure_thr 0.10
+        ) ;;
+    weight-contact2-r256|weight-contactstep2-r256)
+        set_ta_coreloc_weight_audit ta_wcontact2_r256 0.001
+        preset_args+=(
+            --pressure_weight_mode contact_step
+            --contact_pressure_thr 0.10
+            --active_pressure_weight 1.0
+        ) ;;
     weight-plateau2-r256)
         set_ta_variant ta_wplateau2_r256 1.2
         preset_args+=(--pressure_weight_mode plateau --batch_size 128) ;;

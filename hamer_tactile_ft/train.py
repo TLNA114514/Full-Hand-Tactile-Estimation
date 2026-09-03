@@ -14,6 +14,7 @@ from pathlib import Path
 
 from process_lifecycle import (
     configure_supervised_process,
+    initialize_worker_historical_lightning_seed,
     initialize_worker_parent_death_signal,
 )
 
@@ -53,7 +54,11 @@ from dataset import (
     ddp_global_rank,
     release_unused_python_heap,
 )
-from hamer_tactile import DinoTactileModel, parse_input_resolution
+from hamer_tactile import (
+    CANONICAL_MODEL_INITIALIZATION_ORDER,
+    DinoTactileModel,
+    parse_input_resolution,
+)
 from hamer_config_assets import resolve_hamer_model_config_path
 from losses import TactileLossConfig
 from tactile_metrics import (
@@ -75,6 +80,176 @@ from selector_calibration import (
 
 CORE_LOCATION_DISTRIBUTION_POWER = 2.0
 CORE_LOCATION_MIN_GT_PEAK = 0.05
+HISTORICAL_REPLAY_PROFILE = "ta_crop12_20260724"
+HISTORICAL_REPLAY_DINO_SHA256 = (
+    "7c1da9a54b3bdb333f5ebc42e404b7f19b1b5bed504877623c9dc87397f41488"
+)
+HISTORICAL_REPLAY_BBOX_SHA256 = (
+    "8159870bf7e1eddbf0e5e58c866306f9b3989f799013e88a8bba32f4c493b69c"
+)
+HISTORICAL_REPLAY_QUERY_SHA256 = {
+    "train": "dc7da794108c0d9efb24b13bc229636c046ec9abd9e7339e9c2b5b64d582bcff",
+    "val": "73d3423f405abd8caaed775deefaa108948dc4316375d9a7f9af266c578690b5",
+}
+HISTORICAL_REPLAY_SAMPLE_COUNTS = {"train": 2640078, "val": 275451}
+
+
+def _historical_replay_mismatches(args, num_gpus):
+    expected = {
+        "tactile_head_type": "dense_v2_dino_rezero",
+        "backbone_feature_layers": (8, 16, 24, 32),
+        "dino_residual_max_scale": 0.10,
+        "dino_residual_rms_budget": 0.50,
+        "pool_layout": "fullgrid32",
+        "input_resolution": (256, 192),
+        "pool_output_channels": 32,
+        "decoder_hidden_dim": 512,
+        "center_aux_hidden_dim": 128,
+        "decoder_dropout_scale": 1.0,
+        "model_initialization_order": CANONICAL_MODEL_INITIALIZATION_ORDER,
+        "allow_noncanonical_model_initialization": False,
+        "worker_seed_mode": "lightning_legacy",
+        "hdf5_sample_order": "legacy_sample_dir_hand",
+        "crop_pipeline": "legacy_square_center",
+        "bbox_rescale_factor": 1.2,
+        "data_backend": "sequence_hdf5",
+        "datasets": "touchanything",
+        "expected_datasets": ["TouchAnything"],
+        "val_expected_datasets": ["TouchAnything"],
+        "index_workers": 256,
+        "index_backend": "process",
+        "index_chunksize": 512,
+        "index_process_worker_cap": 64,
+        "lazy_index_records": True,
+        "batch_size": 128,
+        "accumulate_grad_batches": 1,
+        "epochs": 60,
+        "max_steps": -1,
+        "num_workers": 32,
+        "val_num_workers": 16,
+        "persistent_workers": False,
+        "prefetch_factor": 2,
+        "lr": 5e-5,
+        "optimizer_weight_decay": 1e-4,
+        "optimizer_backend_mode": "legacy_default",
+        "lr_scheduler": "cosine",
+        "lr_decay_milestones": "0.5,0.75",
+        "lr_decay_gamma": 0.1,
+        "seed": 521,
+        "lr_warmup_epochs": 3,
+        "loss_ramp_epochs": 5,
+        "trainer_precision": "bf16-mixed",
+        "gradient_clip_val": 1.0,
+        "tactile_loss_scale": 10.0,
+        "train_augmentation": True,
+        "auto_resume": False,
+        "skip_validation": False,
+        "skip_checkpointing": False,
+        "save_contact_best": True,
+        "ddp_find_unused_parameters": False,
+        "sync_train_logs": False,
+        "check_val_every_n_epoch": 1,
+        "active_pressure_thr": 0.05,
+        "active_pressure_peak": 0.10,
+        "active_pressure_high": 0.30,
+        "active_pressure_weight": 1.0,
+        "active_pressure_gamma": 1.0,
+        "pressure_weight_mode": "hump",
+        "active_pressure_tail_thr": 0.70,
+        "active_pressure_tail_max": 3.0,
+        "background_pressure_thr": 0.02,
+        "background_pred_margin": 0.02,
+        "background_loss_weight": 1.0,
+        "logit_bce_weight": 0.1,
+        "frame_low_volume_thr": 30.0,
+        "frame_high_volume_thr": 150.0,
+        "opentouch_high_pressure_thr": 0.9,
+        "opentouch_high_pressure_weight": 0.3,
+        "location_loss_weight": 0.001,
+        "location_gt_volume_thr": 1.0,
+        "location_distribution_power": 2.0,
+        "location_min_gt_peak": 0.05,
+        "center_loss_weight": 0.0,
+        "center_presence_loss_weight": 0.0,
+        "center_aux_loss_weight": 0.0,
+        "center_aux_presence_loss_weight": 0.0,
+        "center_threshold_scale": 0.35,
+        "center_threshold_min": 0.05,
+        "center_threshold_max": 0.20,
+        "center_target_power": 2.0,
+        "center_presence_volume_thr": 1.0,
+        "center_presence_peak_thr": 0.10,
+        "center_presence_logit_scale": 4.0,
+        "contact_loss_type": "none",
+        "contact_loss_weight": 0.0,
+        "contact_pressure_thr": 0.1,
+        "contact_temperature": 0.025,
+    }
+    actual = {
+        **{key: getattr(args, key) for key in expected},
+        "backbone_feature_layers": tuple(
+            int(value) for value in _split_csv(args.backbone_feature_layers)
+        ),
+    }
+    mismatches = {
+        key: {"expected": value, "actual": actual[key]}
+        for key, value in expected.items()
+        if actual[key] != value
+    }
+    if int(num_gpus) != 8:
+        mismatches["num_gpus"] = {"expected": 8, "actual": int(num_gpus)}
+    if args.init_tactile_checkpoint:
+        mismatches["init_tactile_checkpoint"] = {
+            "expected": "",
+            "actual": args.init_tactile_checkpoint,
+        }
+    if args.resume_from_checkpoint:
+        mismatches["resume_from_checkpoint"] = {
+            "expected": "",
+            "actual": args.resume_from_checkpoint,
+        }
+    if not args.query_manifests or not args.val_query_manifests:
+        mismatches["query_manifests"] = {
+            "expected": "explicit train and val manifests",
+            "actual": [args.query_manifests, args.val_query_manifests],
+        }
+    return mismatches
+
+
+def _validate_historical_replay_dataset(dataset, split):
+    metadata = dataset.index_cache_metadata()
+    expected_count = HISTORICAL_REPLAY_SAMPLE_COUNTS[split]
+    mismatches = {}
+    if len(dataset) != expected_count:
+        mismatches["indexed_sample_count"] = {
+            "expected": expected_count,
+            "actual": len(dataset),
+        }
+    query_hashes = set(metadata.get("query_manifest_sha256", {}).values())
+    expected_query_hash = HISTORICAL_REPLAY_QUERY_SHA256[split]
+    if query_hashes != {expected_query_hash}:
+        mismatches["query_manifest_sha256"] = {
+            "expected": expected_query_hash,
+            "actual": sorted(query_hashes),
+        }
+    bbox_hashes = set(metadata.get("bbox_manifest_sha256", {}).values())
+    if bbox_hashes != {HISTORICAL_REPLAY_BBOX_SHA256}:
+        mismatches["bbox_manifest_sha256"] = {
+            "expected": HISTORICAL_REPLAY_BBOX_SHA256,
+            "actual": sorted(bbox_hashes),
+        }
+    ordered_hash = str(metadata.get("hdf5_ordered_sample_sha256", ""))
+    if len(ordered_hash) != 64:
+        mismatches["hdf5_ordered_sample_sha256"] = {
+            "expected": "64-character SHA256",
+            "actual": ordered_hash,
+        }
+    if mismatches:
+        raise RuntimeError(
+            f"Historical replay {split} dataset contract mismatch: "
+            f"{json.dumps(mismatches, sort_keys=True)}"
+        )
+    return metadata
 
 def linear_scaled_learning_rate(base_lr, num_gpus):
     if int(num_gpus) < 1:
@@ -276,6 +451,8 @@ class TactileTrainingModule(DinoTactileModel):
         input_resolution=(256, 192),
         pool_output_channels=32,
         decoder_hidden_dim=512,
+        center_aux_hidden_dim=128,
+        model_initialization_order=CANONICAL_MODEL_INITIALIZATION_ORDER,
         local_anchor_count=512,
         local_anchor_neighbors=4,
         local_logit_delta_max=6.0,
@@ -304,6 +481,7 @@ class TactileTrainingModule(DinoTactileModel):
         ),
         init_tactile_checkpoint="",
         optimizer_weight_decay=1e-4,
+        optimizer_backend_mode="legacy_default",
         lr_scheduler="cosine",
         lr_decay_milestones="0.5,0.75",
         lr_decay_gamma=0.1,
@@ -325,6 +503,8 @@ class TactileTrainingModule(DinoTactileModel):
             input_resolution=input_resolution,
             pool_output_channels=pool_output_channels,
             decoder_hidden_dim=decoder_hidden_dim,
+            center_aux_hidden_dim=center_aux_hidden_dim,
+            model_initialization_order=model_initialization_order,
             local_anchor_count=local_anchor_count,
             local_anchor_neighbors=local_anchor_neighbors,
             local_logit_delta_max=local_logit_delta_max,
@@ -359,6 +539,14 @@ class TactileTrainingModule(DinoTactileModel):
         )
         self.learning_rate = learning_rate
         self.optimizer_weight_decay = float(optimizer_weight_decay)
+        self.optimizer_backend_mode = str(optimizer_backend_mode)
+        if self.optimizer_backend_mode not in {
+            "current_auto",
+            "legacy_default",
+        }:
+            raise ValueError(
+                "optimizer_backend_mode must be current_auto or legacy_default"
+            )
         self.lr_scheduler_name = str(lr_scheduler)
         self.lr_decay_milestones = str(lr_decay_milestones)
         self.lr_decay_milestones_resolved = []
@@ -438,6 +626,19 @@ class TactileTrainingModule(DinoTactileModel):
             "pool_layout": str(self.pool_layout),
             "pool_output_channels": int(self.pool_output_channels),
             "decoder_hidden_dim": int(self.decoder_hidden_dim),
+            "center_aux_hidden_dim": int(self.center_aux_hidden_dim),
+            "model_initialization_order": str(self.model_initialization_order),
+            "worker_seed_mode": str(
+                getattr(self, "worker_seed_mode", "lightning_legacy")
+            ),
+            "hdf5_sample_order": str(
+                getattr(self, "hdf5_sample_order", "legacy_sample_dir_hand")
+            ),
+            "crop_pipeline": str(
+                getattr(self, "crop_pipeline", "legacy_square_center")
+            ),
+            "replay_profile": str(getattr(self, "replay_profile", "none")),
+            "optimizer_backend_mode": str(self.optimizer_backend_mode),
             "local_anchor_count": int(self.local_anchor_count),
             "local_anchor_neighbors": int(self.local_anchor_neighbors),
             "local_logit_delta_max": float(self.local_logit_delta_max),
@@ -541,6 +742,36 @@ class TactileTrainingModule(DinoTactileModel):
         checkpoint["tactile_head_type"] = str(self.tactile_head_type)
         checkpoint["input_resolution"] = list(self.input_resolution)
         checkpoint["decoder_hidden_dim"] = int(self.decoder_hidden_dim)
+        checkpoint["center_aux_hidden_dim"] = int(
+            self.center_aux_hidden_dim
+        )
+        checkpoint["model_initialization_order"] = str(
+            self.model_initialization_order
+        )
+        checkpoint["worker_seed_mode"] = str(
+            getattr(self, "worker_seed_mode", "lightning_legacy")
+        )
+        checkpoint["hdf5_sample_order"] = str(
+            getattr(self, "hdf5_sample_order", "legacy_sample_dir_hand")
+        )
+        checkpoint["hdf5_ordered_sample_sha256"] = str(
+            getattr(self, "hdf5_ordered_sample_sha256", "")
+        )
+        checkpoint["val_hdf5_ordered_sample_sha256"] = str(
+            getattr(self, "val_hdf5_ordered_sample_sha256", "")
+        )
+        checkpoint["crop_pipeline"] = str(
+            getattr(self, "crop_pipeline", "legacy_square_center")
+        )
+        checkpoint["replay_profile"] = str(
+            getattr(self, "replay_profile", "none")
+        )
+        checkpoint["initial_tactile_head_sha256"] = str(
+            getattr(self, "initial_tactile_head_sha256", "")
+        )
+        checkpoint["optimizer_backend_mode"] = str(
+            self.optimizer_backend_mode
+        )
         checkpoint["surface_basis_tensor_sha256"] = str(
             getattr(self, "surface_basis_tensor_sha256", "") or ""
         )
@@ -609,6 +840,37 @@ class TactileTrainingModule(DinoTactileModel):
             current_contract = self._resume_contract()
             checkpoint_contract = dict(checkpoint_contract)
             checkpoint_contract.setdefault("decoder_hidden_dim", 512)
+            checkpoint_contract.setdefault("center_aux_hidden_dim", 128)
+            checkpoint_contract.setdefault(
+                "model_initialization_order",
+                CANONICAL_MODEL_INITIALIZATION_ORDER,
+            )
+            checkpoint_contract.setdefault("worker_seed_mode", "lightning_legacy")
+            checkpoint_contract.setdefault(
+                "hdf5_sample_order", "legacy_sample_dir_hand"
+            )
+            checkpoint_contract.setdefault("crop_pipeline", "legacy_square_center")
+            checkpoint_contract.setdefault("replay_profile", "none")
+            checkpoint_contract.setdefault(
+                "optimizer_backend_mode", "legacy_default"
+            )
+            checkpoint_loss_config = checkpoint_contract.get("loss_config")
+            if isinstance(checkpoint_loss_config, dict):
+                center_loss_defaults = {
+                    "center_loss_weight": 0.0,
+                    "center_presence_loss_weight": 0.0,
+                    "center_aux_loss_weight": 0.0,
+                    "center_aux_presence_loss_weight": 0.0,
+                    "center_threshold_scale": 0.35,
+                    "center_threshold_min": 0.05,
+                    "center_threshold_max": 0.20,
+                    "center_target_power": 2.0,
+                    "center_presence_volume_thr": 1.0,
+                    "center_presence_peak_thr": 0.10,
+                    "center_presence_logit_scale": 4.0,
+                }
+                for key, value in center_loss_defaults.items():
+                    checkpoint_loss_config.setdefault(key, value)
             if (
                 self.tactile_head_type == "dense_v2_dino_support_selector"
                 and "support_selector_correction_min_precision"
@@ -1415,7 +1677,12 @@ class TactileTrainingModule(DinoTactileModel):
         if not bool(torch.isfinite(loss.detach()).all().item()):
             nonfinite_outputs = [
                 name
-                for name in ("pred_logits", "pred_tactile")
+                for name in (
+                    "pred_logits",
+                    "pred_tactile",
+                    "center_aux_logits",
+                    "center_aux_presence_logits",
+                )
                 if name in output
                 and not bool(torch.isfinite(output[name].detach()).all().item())
             ]
@@ -1460,6 +1727,35 @@ class TactileTrainingModule(DinoTactileModel):
             ),
             "train/loss_location_weighted_epoch_global": output["losses"].get(
                 "loss_location_weighted", loss.detach().new_zeros(())
+            ),
+            "train/loss_center_raw_epoch_global": output["losses"].get(
+                "loss_center_raw", loss.detach().new_zeros(())
+            ),
+            "train/loss_center_weighted_epoch_global": output["losses"].get(
+                "loss_center_weighted", loss.detach().new_zeros(())
+            ),
+            "train/loss_center_presence_raw_epoch_global": output["losses"].get(
+                "loss_center_presence_raw", loss.detach().new_zeros(())
+            ),
+            "train/loss_center_presence_weighted_epoch_global": output["losses"].get(
+                "loss_center_presence_weighted", loss.detach().new_zeros(())
+            ),
+            "train/loss_center_aux_raw_epoch_global": output["losses"].get(
+                "loss_center_aux_raw", loss.detach().new_zeros(())
+            ),
+            "train/loss_center_aux_weighted_epoch_global": output["losses"].get(
+                "loss_center_aux_weighted", loss.detach().new_zeros(())
+            ),
+            "train/loss_center_aux_presence_raw_epoch_global": output[
+                "losses"
+            ].get(
+                "loss_center_aux_presence_raw", loss.detach().new_zeros(())
+            ),
+            "train/loss_center_aux_presence_weighted_epoch_global": output[
+                "losses"
+            ].get(
+                "loss_center_aux_presence_weighted",
+                loss.detach().new_zeros(()),
             ),
             "train/loss_contact_raw_epoch_global": output["losses"].get(
                 "loss_contact_raw", loss.detach().new_zeros(())
@@ -1606,7 +1902,13 @@ class TactileTrainingModule(DinoTactileModel):
         return metrics
 
     def validation_step(self, batch, batch_idx):
-        output = self.forward_step(batch, train=False)
+        output = self.forward_step(
+            batch,
+            train=False,
+            compute_auxiliary=(
+                self.tactile_head_type == "dense_v2_dino_center_aux"
+            ),
+        )
         loss = self.compute_loss(batch, output, train=False)
         if not bool(torch.isfinite(loss.detach()).all().item()):
             raise FloatingPointError(
@@ -2327,14 +2629,67 @@ class TactileTrainingModule(DinoTactileModel):
             "loss_background": "loss/background",
             "loss_location_raw": "loss/location_raw",
             "loss_location_weighted": "loss/location_weighted",
+            "loss_center_raw": "loss/center_raw",
+            "loss_center_weighted": "loss/center_weighted",
+            "loss_center_presence_raw": "loss/center_presence_raw",
+            "loss_center_presence_weighted": "loss/center_presence_weighted",
+            "loss_center_total": "loss/center_total",
+            "loss_center_aux_raw": "loss/center_aux_raw",
+            "loss_center_aux_weighted": "loss/center_aux_weighted",
+            "loss_center_aux_presence_raw": "loss/center_aux_presence_raw",
+            "loss_center_aux_presence_weighted": (
+                "loss/center_aux_presence_weighted"
+            ),
+            "loss_center_aux_total": "loss/center_aux_total",
+            "loss_center_aux_full_ramp": "loss/center_aux_full_ramp",
             "loss_contact_raw": "loss/contact_raw",
             "loss_contact_weighted": "loss/contact_weighted",
             "diagnostics_location_eligible_fraction": "diagnostics/location_eligible_fraction",
+            "diagnostics_center_eligible_fraction": "diagnostics/center_eligible_fraction",
+            "diagnostics_center_threshold_mean": "diagnostics/center_threshold_mean",
+            "diagnostics_center_target_support_fraction": (
+                "diagnostics/center_target_support_fraction"
+            ),
+            "diagnostics_center_presence_positive_fraction": (
+                "diagnostics/center_presence_positive_fraction"
+            ),
+            "diagnostics_center_presence_accuracy": (
+                "diagnostics/center_presence_accuracy"
+            ),
+            "diagnostics_center_distribution_viou": (
+                "diagnostics/center_distribution_viou"
+            ),
+            "diagnostics_center_presence_predicted_fraction": (
+                "diagnostics/center_presence_predicted_fraction"
+            ),
+            "diagnostics_center_aux_eligible_fraction": (
+                "diagnostics/center_aux_eligible_fraction"
+            ),
+            "diagnostics_center_aux_threshold_mean": (
+                "diagnostics/center_aux_threshold_mean"
+            ),
+            "diagnostics_center_aux_target_support_fraction": (
+                "diagnostics/center_aux_target_support_fraction"
+            ),
+            "diagnostics_center_aux_distribution_viou": (
+                "diagnostics/center_aux_distribution_viou"
+            ),
+            "diagnostics_center_aux_presence_positive_fraction": (
+                "diagnostics/center_aux_presence_positive_fraction"
+            ),
+            "diagnostics_center_aux_presence_accuracy": (
+                "diagnostics/center_aux_presence_accuracy"
+            ),
+            "diagnostics_center_aux_presence_predicted_fraction": (
+                "diagnostics/center_aux_presence_predicted_fraction"
+            ),
+            "diagnostics_center_aux_ramp": "schedule/center_aux_ramp",
             "diagnostics_pressure_weight_mean": "pressure_weight_mean",
             "diagnostics_pressure_weight_max": "pressure_weight_max",
             "diagnostics_pressure_weight_fraction_gt2": "pressure_weight_fraction_gt2",
             "diagnostics_weighted_to_direct_loss_ratio": "weighted_to_direct_loss_ratio",
             "loss_tactile": "loss/total",
+            "loss_tactile_with_aux": "loss/total_with_aux",
             "loss_ramp": "schedule/loss_ramp",
             "loss_full_ramp_reference": "loss_full_ramp_reference",
             "loss_selector_balanced_bce": "loss/selector_balanced_bce",
@@ -2374,7 +2729,9 @@ class TactileTrainingModule(DinoTactileModel):
             "lr": self.learning_rate,
         }
         optimizer_backend = "default"
-        if torch.cuda.is_available() and gradient_clip_val <= 0.0:
+        if self.optimizer_backend_mode == "legacy_default":
+            pass
+        elif torch.cuda.is_available() and gradient_clip_val <= 0.0:
             optimizer_kwargs["fused"] = True
             optimizer_backend = "fused"
         elif torch.cuda.is_available():
@@ -2528,6 +2885,7 @@ def load_compatible_state_dict(model, checkpoint_path, load_backbone=False):
     if checkpoint_head_type not in {
         "dense_v2",
         "dense_v2_dino_rezero",
+        "dense_v2_dino_center_aux",
         "dense_v2_dino_local_residual",
         "dense_v2_dino_support_selector",
         "dense_v2_dino_surface_basis",
@@ -2546,6 +2904,18 @@ def load_compatible_state_dict(model, checkpoint_path, load_backbone=False):
             f"Input resolution mismatch: checkpoint={checkpoint_resolution}, "
             f"model={getattr(model, 'input_resolution', None)}"
         )
+    if checkpoint_head_type == "dense_v2_dino_center_aux":
+        checkpoint_aux_hidden = int(
+            checkpoint.get("center_aux_hidden_dim", 128)
+        )
+        model_aux_hidden = int(
+            getattr(model, "center_aux_hidden_dim", 128)
+        )
+        if checkpoint_aux_hidden != model_aux_hidden:
+            raise ValueError(
+                "Center auxiliary hidden width mismatch: "
+                f"checkpoint={checkpoint_aux_hidden}, model={model_aux_hidden}"
+            )
     expected_hash = str(checkpoint.get("backbone_sha256", "") or "")
     actual_hash = str(getattr(model, "backbone_weights_sha256", "") or "")
     if expected_hash and actual_hash and expected_hash != actual_hash:
@@ -2819,6 +3189,12 @@ def parse_args():
         help="AdamW weight decay for non-bias/non-normalization parameters.",
     )
     parser.add_argument(
+        "--optimizer_backend_mode",
+        choices=("current_auto", "legacy_default"),
+        default="legacy_default",
+        help="AdamW implementation selection; legacy_default matches the July baseline.",
+    )
+    parser.add_argument(
         "--lr_scheduler",
         choices=("cosine", "constant", "multistep"),
         default="cosine",
@@ -2883,6 +3259,18 @@ def parse_args():
             "Shared mmap cache for normalized HDF5 query-manifest rows. This is "
             "separate from the legacy directory index cache."
         ),
+    )
+    parser.add_argument(
+        "--hdf5_sample_order",
+        choices=("manifest", "legacy_sample_dir_hand"),
+        default="legacy_sample_dir_hand",
+        help="Normalized HDF5 record order; legacy mode reconstructs sample_dir/hand sorting.",
+    )
+    parser.add_argument(
+        "--worker_seed_mode",
+        choices=("torch_default", "lightning_legacy"),
+        default="lightning_legacy",
+        help="DataLoader worker RNG initialization path.",
     )
     parser.add_argument("--index_workers", type=int, default=1, help="Workers for initial meta.json index scanning")
     parser.add_argument("--index_backend", type=str, default="process", choices=["process", "thread"], help="Parallel backend for initial index scanning")
@@ -3008,6 +3396,7 @@ def parse_args():
         choices=(
             "dense_v2",
             "dense_v2_dino_rezero",
+            "dense_v2_dino_center_aux",
             "dense_v2_dino_local_residual",
             "dense_v2_dino_support_selector",
             "dense_v2_dino_surface_basis",
@@ -3042,10 +3431,34 @@ def parse_args():
     )
     parser.add_argument("--pool_output_channels", type=int, default=32)
     parser.add_argument(
+        "--model_initialization_order",
+        choices=("projection_first", "legacy_decoder_first"),
+        default=CANONICAL_MODEL_INITIALIZATION_ORDER,
+        help=(
+            "RNG assignment order for DenseV2 projection and decoder modules. "
+            f"The project canonical value is {CANONICAL_MODEL_INITIALIZATION_ORDER}."
+        ),
+    )
+    parser.add_argument(
+        "--allow_noncanonical_model_initialization",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Permit an explicitly noncanonical initialization order for a "
+            "named historical replay. New experiments must leave this disabled."
+        ),
+    )
+    parser.add_argument(
         "--decoder_hidden_dim",
         type=int,
         default=512,
         help="Width of the dense decoder bottleneck (matrix presets use 512 or 1024).",
+    )
+    parser.add_argument(
+        "--center_aux_hidden_dim",
+        type=int,
+        default=128,
+        help="Training-only center heatmap bottleneck width.",
     )
     parser.add_argument("--local_anchor_count", type=int, default=512)
     parser.add_argument("--local_anchor_neighbors", type=int, default=4)
@@ -3182,6 +3595,18 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--crop_pipeline",
+        choices=("direct_rectangle", "legacy_square_center"),
+        default="legacy_square_center",
+        help="Image crop implementation; legacy mode recreates square256 then center crop.",
+    )
+    parser.add_argument(
+        "--replay_profile",
+        choices=("none", "ta_crop12_20260724"),
+        default="none",
+        help="Fail-closed historical training contract.",
+    )
+    parser.add_argument(
         "--visual_backbone",
         choices=("dinov3_hplus",),
         default="dinov3_hplus",
@@ -3218,7 +3643,7 @@ def parse_args():
     parser.add_argument("--active_pressure_gamma", type=float, default=1.0)
     parser.add_argument(
         "--pressure_weight_mode",
-        choices=("hump", "plateau", "capped_linear"),
+        choices=("hump", "flat", "contact_step", "plateau", "capped_linear"),
         default="hump",
     )
     parser.add_argument("--active_pressure_tail_thr", type=float, default=0.70)
@@ -3234,6 +3659,19 @@ def parse_args():
     parser.add_argument("--location_gt_volume_thr", type=float, default=1.0)
     parser.add_argument("--location_distribution_power", type=float, default=1.0)
     parser.add_argument("--location_min_gt_peak", type=float, default=0.0)
+    parser.add_argument("--center_loss_weight", type=float, default=0.0)
+    parser.add_argument("--center_presence_loss_weight", type=float, default=0.0)
+    parser.add_argument("--center_aux_loss_weight", type=float, default=0.0)
+    parser.add_argument(
+        "--center_aux_presence_loss_weight", type=float, default=0.0
+    )
+    parser.add_argument("--center_threshold_scale", type=float, default=0.35)
+    parser.add_argument("--center_threshold_min", type=float, default=0.05)
+    parser.add_argument("--center_threshold_max", type=float, default=0.20)
+    parser.add_argument("--center_target_power", type=float, default=2.0)
+    parser.add_argument("--center_presence_volume_thr", type=float, default=1.0)
+    parser.add_argument("--center_presence_peak_thr", type=float, default=0.10)
+    parser.add_argument("--center_presence_logit_scale", type=float, default=4.0)
     parser.add_argument(
         "--contact_loss_type",
         choices=("none", "soft_jaccard", "lovasz"),
@@ -3267,6 +3705,19 @@ def tactile_loss_config_from_args(args):
         location_gt_volume_thr=args.location_gt_volume_thr,
         location_distribution_power=args.location_distribution_power,
         location_min_gt_peak=args.location_min_gt_peak,
+        center_loss_weight=args.center_loss_weight,
+        center_presence_loss_weight=args.center_presence_loss_weight,
+        center_aux_loss_weight=args.center_aux_loss_weight,
+        center_aux_presence_loss_weight=(
+            args.center_aux_presence_loss_weight
+        ),
+        center_threshold_scale=args.center_threshold_scale,
+        center_threshold_min=args.center_threshold_min,
+        center_threshold_max=args.center_threshold_max,
+        center_target_power=args.center_target_power,
+        center_presence_volume_thr=args.center_presence_volume_thr,
+        center_presence_peak_thr=args.center_presence_peak_thr,
+        center_presence_logit_scale=args.center_presence_logit_scale,
         contact_loss_type=args.contact_loss_type,
         contact_loss_weight=args.contact_loss_weight,
         contact_pressure_thr=args.contact_pressure_thr,
@@ -3282,6 +3733,24 @@ def file_sha256(path, chunk_size=8 * 1024 * 1024):
             if not chunk:
                 break
             digest.update(chunk)
+    return digest.hexdigest()
+
+
+def module_state_sha256(module):
+    digest = hashlib.sha256()
+    for name, value in module.state_dict().items():
+        tensor = value.detach().cpu().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(tensor.dtype).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(json.dumps(list(tensor.shape)).encode("ascii"))
+        digest.update(b"\0")
+        # PyTorch 2.1 cannot reinterpret a zero-dimensional scalar directly
+        # as bytes (for example a scalar ReZero gate). Flattening preserves
+        # the exact storage bytes and handles scalar and non-scalar entries.
+        digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
+        digest.update(b"\n")
     return digest.hexdigest()
 
 
@@ -3325,6 +3794,13 @@ def model_summary(model):
         f"decoder_input_dim: {getattr(model, 'decoder_input_dim', None)}",
         f"pool_output_channels: {getattr(model, 'pool_output_channels', None)}",
         f"decoder_hidden_dim: {getattr(model, 'decoder_hidden_dim', None)}",
+        f"model_initialization_order: {getattr(model, 'model_initialization_order', None)}",
+        f"worker_seed_mode: {getattr(model, 'worker_seed_mode', None)}",
+        f"hdf5_sample_order: {getattr(model, 'hdf5_sample_order', None)}",
+        f"crop_pipeline: {getattr(model, 'crop_pipeline', None)}",
+        f"replay_profile: {getattr(model, 'replay_profile', None)}",
+        f"initial_tactile_head_sha256: {getattr(model, 'initial_tactile_head_sha256', None)}",
+        f"optimizer_backend_mode: {getattr(model, 'optimizer_backend_mode', None)}",
         f"decoder_dropout_scale: {getattr(model, 'decoder_dropout_scale', None)}",
         f"local_anchor_count: {getattr(model, 'local_anchor_count', None)}",
         f"local_anchor_neighbors: {getattr(model, 'local_anchor_neighbors', None)}",
@@ -3418,10 +3894,15 @@ def write_run_provenance(args, data_dirs, tactile_loss_config, model, ckpt_dir, 
         "optimizer_config": {
             "name": "AdamW",
             "backend": (
-                "foreach"
-                if num_gpus > 0 and float(args.gradient_clip_val) > 0.0
-                else "fused_if_cuda"
+                "default"
+                if args.optimizer_backend_mode == "legacy_default"
+                else (
+                    "foreach"
+                    if num_gpus > 0 and float(args.gradient_clip_val) > 0.0
+                    else "fused_if_cuda"
+                )
             ),
+            "backend_mode": str(args.optimizer_backend_mode),
             "weight_decay": float(args.optimizer_weight_decay),
             "no_decay_weight_decay": 0.0,
             "gradient_clip_val": float(args.gradient_clip_val),
@@ -3465,6 +3946,41 @@ def write_run_provenance(args, data_dirs, tactile_loss_config, model, ckpt_dir, 
         "decoder_input_dim": int(getattr(model, "decoder_input_dim", 6144)),
         "pool_output_channels": int(getattr(model, "pool_output_channels", 32)),
         "decoder_hidden_dim": int(getattr(model, "decoder_hidden_dim", 512)),
+        "center_aux_hidden_dim": int(
+            getattr(model, "center_aux_hidden_dim", 128)
+        ),
+        "model_initialization_order": str(
+            getattr(
+                model,
+                "model_initialization_order",
+                CANONICAL_MODEL_INITIALIZATION_ORDER,
+            )
+        ),
+        "worker_seed_mode": str(
+            getattr(model, "worker_seed_mode", "lightning_legacy")
+        ),
+        "hdf5_sample_order": str(
+            getattr(model, "hdf5_sample_order", "legacy_sample_dir_hand")
+        ),
+        "hdf5_ordered_sample_sha256": str(
+            getattr(model, "hdf5_ordered_sample_sha256", "")
+        ),
+        "val_hdf5_ordered_sample_sha256": str(
+            getattr(model, "val_hdf5_ordered_sample_sha256", "")
+        ),
+        "hdf5_sample_set_sha256": str(
+            getattr(model, "hdf5_sample_set_sha256", "")
+        ),
+        "crop_pipeline": str(
+            getattr(model, "crop_pipeline", "legacy_square_center")
+        ),
+        "replay_profile": str(getattr(model, "replay_profile", "none")),
+        "initial_tactile_head_sha256": str(
+            getattr(model, "initial_tactile_head_sha256", "")
+        ),
+        "optimizer_backend_mode": str(
+            getattr(model, "optimizer_backend_mode", "legacy_default")
+        ),
         "decoder_dropout_scale": float(getattr(model, "decoder_dropout_scale", 1.0)),
         "local_anchor_count": int(getattr(model, "local_anchor_count", 512)),
         "local_anchor_neighbors": int(getattr(model, "local_anchor_neighbors", 4)),
@@ -3590,6 +4106,29 @@ def write_run_provenance(args, data_dirs, tactile_loss_config, model, ckpt_dir, 
         "location_gt_volume_thr": float(tactile_loss_config.location_gt_volume_thr),
         "location_distribution_power": float(tactile_loss_config.location_distribution_power),
         "location_min_gt_peak": float(tactile_loss_config.location_min_gt_peak),
+        "center_loss_weight": float(tactile_loss_config.center_loss_weight),
+        "center_presence_loss_weight": float(
+            tactile_loss_config.center_presence_loss_weight
+        ),
+        "center_aux_loss_weight": float(
+            tactile_loss_config.center_aux_loss_weight
+        ),
+        "center_aux_presence_loss_weight": float(
+            tactile_loss_config.center_aux_presence_loss_weight
+        ),
+        "center_threshold_scale": float(tactile_loss_config.center_threshold_scale),
+        "center_threshold_min": float(tactile_loss_config.center_threshold_min),
+        "center_threshold_max": float(tactile_loss_config.center_threshold_max),
+        "center_target_power": float(tactile_loss_config.center_target_power),
+        "center_presence_volume_thr": float(
+            tactile_loss_config.center_presence_volume_thr
+        ),
+        "center_presence_peak_thr": float(
+            tactile_loss_config.center_presence_peak_thr
+        ),
+        "center_presence_logit_scale": float(
+            tactile_loss_config.center_presence_logit_scale
+        ),
         "contact_loss_type": str(tactile_loss_config.contact_loss_type),
         "contact_loss_weight": float(tactile_loss_config.contact_loss_weight),
         "contact_pressure_thr": float(tactile_loss_config.contact_pressure_thr),
@@ -3628,15 +4167,25 @@ def make_dataloader(
     persistent_workers,
     prefetch_factor,
     sampler=None,
+    worker_seed_mode="lightning_legacy",
 ):
     num_workers = int(num_workers)
+    worker_seed_mode = str(worker_seed_mode)
+    if worker_seed_mode == "torch_default":
+        worker_init_fn = initialize_worker_parent_death_signal
+    elif worker_seed_mode == "lightning_legacy":
+        worker_init_fn = initialize_worker_historical_lightning_seed
+    else:
+        raise ValueError(
+            "worker_seed_mode must be torch_default or lightning_legacy"
+        )
     kwargs = {
         "batch_size": batch_size,
         "shuffle": bool(shuffle and sampler is None),
         "sampler": sampler,
         "num_workers": num_workers,
         "pin_memory": True,
-        "worker_init_fn": initialize_worker_parent_death_signal,
+        "worker_init_fn": worker_init_fn,
     }
     if num_workers > 0:
         kwargs["persistent_workers"] = bool(persistent_workers)
@@ -3718,6 +4267,41 @@ def _compact_checkpoint_payload(module, epoch, global_step, reason, monitor=None
         "decoder_input_dim": int(getattr(module, "decoder_input_dim", 6144)),
         "pool_output_channels": int(getattr(module, "pool_output_channels", 32)),
         "decoder_hidden_dim": int(getattr(module, "decoder_hidden_dim", 512)),
+        "center_aux_hidden_dim": int(
+            getattr(module, "center_aux_hidden_dim", 128)
+        ),
+        "model_initialization_order": str(
+            getattr(
+                module,
+                "model_initialization_order",
+                CANONICAL_MODEL_INITIALIZATION_ORDER,
+            )
+        ),
+        "worker_seed_mode": str(
+            getattr(module, "worker_seed_mode", "lightning_legacy")
+        ),
+        "hdf5_sample_order": str(
+            getattr(module, "hdf5_sample_order", "legacy_sample_dir_hand")
+        ),
+        "hdf5_ordered_sample_sha256": str(
+            getattr(module, "hdf5_ordered_sample_sha256", "")
+        ),
+        "val_hdf5_ordered_sample_sha256": str(
+            getattr(module, "val_hdf5_ordered_sample_sha256", "")
+        ),
+        "hdf5_sample_set_sha256": str(
+            getattr(module, "hdf5_sample_set_sha256", "")
+        ),
+        "crop_pipeline": str(
+            getattr(module, "crop_pipeline", "legacy_square_center")
+        ),
+        "replay_profile": str(getattr(module, "replay_profile", "none")),
+        "initial_tactile_head_sha256": str(
+            getattr(module, "initial_tactile_head_sha256", "")
+        ),
+        "optimizer_backend_mode": str(
+            getattr(module, "optimizer_backend_mode", "legacy_default")
+        ),
         "decoder_dropout_scale": float(getattr(module, "decoder_dropout_scale", 1.0)),
         "local_anchor_count": int(getattr(module, "local_anchor_count", 512)),
         "local_anchor_neighbors": int(getattr(module, "local_anchor_neighbors", 4)),
@@ -3854,6 +4438,39 @@ def _compact_checkpoint_payload(module, epoch, global_step, reason, monitor=None
             module.tactile_loss_config.location_distribution_power
         ),
         "location_min_gt_peak": float(module.tactile_loss_config.location_min_gt_peak),
+        "center_loss_weight": float(
+            module.tactile_loss_config.center_loss_weight
+        ),
+        "center_presence_loss_weight": float(
+            module.tactile_loss_config.center_presence_loss_weight
+        ),
+        "center_aux_loss_weight": float(
+            module.tactile_loss_config.center_aux_loss_weight
+        ),
+        "center_aux_presence_loss_weight": float(
+            module.tactile_loss_config.center_aux_presence_loss_weight
+        ),
+        "center_threshold_scale": float(
+            module.tactile_loss_config.center_threshold_scale
+        ),
+        "center_threshold_min": float(
+            module.tactile_loss_config.center_threshold_min
+        ),
+        "center_threshold_max": float(
+            module.tactile_loss_config.center_threshold_max
+        ),
+        "center_target_power": float(
+            module.tactile_loss_config.center_target_power
+        ),
+        "center_presence_volume_thr": float(
+            module.tactile_loss_config.center_presence_volume_thr
+        ),
+        "center_presence_peak_thr": float(
+            module.tactile_loss_config.center_presence_peak_thr
+        ),
+        "center_presence_logit_scale": float(
+            module.tactile_loss_config.center_presence_logit_scale
+        ),
         "contact_loss_type": str(module.tactile_loss_config.contact_loss_type),
         "contact_loss_weight": float(module.tactile_loss_config.contact_loss_weight),
         "contact_pressure_thr": float(module.tactile_loss_config.contact_pressure_thr),
@@ -3881,6 +4498,41 @@ def _compact_checkpoint_payload(module, epoch, global_step, reason, monitor=None
             "decoder_input_dim": int(getattr(module, "decoder_input_dim", 6144)),
             "pool_output_channels": int(getattr(module, "pool_output_channels", 32)),
             "decoder_hidden_dim": int(getattr(module, "decoder_hidden_dim", 512)),
+            "center_aux_hidden_dim": int(
+                getattr(module, "center_aux_hidden_dim", 128)
+            ),
+            "model_initialization_order": str(
+                getattr(
+                    module,
+                    "model_initialization_order",
+                    CANONICAL_MODEL_INITIALIZATION_ORDER,
+                )
+            ),
+            "worker_seed_mode": str(
+                getattr(module, "worker_seed_mode", "lightning_legacy")
+            ),
+            "hdf5_sample_order": str(
+                getattr(module, "hdf5_sample_order", "legacy_sample_dir_hand")
+            ),
+            "hdf5_ordered_sample_sha256": str(
+                getattr(module, "hdf5_ordered_sample_sha256", "")
+            ),
+            "val_hdf5_ordered_sample_sha256": str(
+                getattr(module, "val_hdf5_ordered_sample_sha256", "")
+            ),
+            "hdf5_sample_set_sha256": str(
+                getattr(module, "hdf5_sample_set_sha256", "")
+            ),
+            "crop_pipeline": str(
+                getattr(module, "crop_pipeline", "legacy_square_center")
+            ),
+            "replay_profile": str(getattr(module, "replay_profile", "none")),
+            "initial_tactile_head_sha256": str(
+                getattr(module, "initial_tactile_head_sha256", "")
+            ),
+            "optimizer_backend_mode": str(
+                getattr(module, "optimizer_backend_mode", "legacy_default")
+            ),
             "decoder_dropout_scale": float(getattr(module, "decoder_dropout_scale", 1.0)),
             "local_anchor_count": int(getattr(module, "local_anchor_count", 512)),
             "local_anchor_neighbors": int(getattr(module, "local_anchor_neighbors", 4)),
@@ -4016,6 +4668,39 @@ def _compact_checkpoint_payload(module, epoch, global_step, reason, monitor=None
                 module.tactile_loss_config.location_distribution_power
             ),
             "location_min_gt_peak": float(module.tactile_loss_config.location_min_gt_peak),
+            "center_loss_weight": float(
+                module.tactile_loss_config.center_loss_weight
+            ),
+            "center_presence_loss_weight": float(
+                module.tactile_loss_config.center_presence_loss_weight
+            ),
+            "center_aux_loss_weight": float(
+                module.tactile_loss_config.center_aux_loss_weight
+            ),
+            "center_aux_presence_loss_weight": float(
+                module.tactile_loss_config.center_aux_presence_loss_weight
+            ),
+            "center_threshold_scale": float(
+                module.tactile_loss_config.center_threshold_scale
+            ),
+            "center_threshold_min": float(
+                module.tactile_loss_config.center_threshold_min
+            ),
+            "center_threshold_max": float(
+                module.tactile_loss_config.center_threshold_max
+            ),
+            "center_target_power": float(
+                module.tactile_loss_config.center_target_power
+            ),
+            "center_presence_volume_thr": float(
+                module.tactile_loss_config.center_presence_volume_thr
+            ),
+            "center_presence_peak_thr": float(
+                module.tactile_loss_config.center_presence_peak_thr
+            ),
+            "center_presence_logit_scale": float(
+                module.tactile_loss_config.center_presence_logit_scale
+            ),
             "contact_loss_type": str(module.tactile_loss_config.contact_loss_type),
             "contact_loss_weight": float(module.tactile_loss_config.contact_loss_weight),
             "contact_pressure_thr": float(module.tactile_loss_config.contact_pressure_thr),
@@ -4423,6 +5108,18 @@ class MaterializedLastCheckpointCallback(Callback):
 def main():
     args = parse_args()
     pl.seed_everything(args.seed, workers=True)
+    if (
+        args.model_initialization_order
+        != CANONICAL_MODEL_INITIALIZATION_ORDER
+        and not args.allow_noncanonical_model_initialization
+    ):
+        raise RuntimeError(
+            "Noncanonical tactile model initialization is fail-closed: "
+            f"requested={args.model_initialization_order}, "
+            f"canonical={CANONICAL_MODEL_INITIALIZATION_ORDER}. "
+            "Only an intentional historical replay may add "
+            "--allow_noncanonical_model_initialization."
+        )
     if float(args.optimizer_weight_decay) < 0.0:
         raise ValueError("--optimizer_weight_decay must be nonnegative")
     if float(args.lr_decay_gamma) <= 0.0:
@@ -4444,6 +5141,37 @@ def main():
         raise ValueError("--pool_output_channels must be positive")
     if int(args.decoder_hidden_dim) < 1:
         raise ValueError("--decoder_hidden_dim must be positive")
+    if int(args.center_aux_hidden_dim) < 1:
+        raise ValueError("--center_aux_hidden_dim must be positive")
+    center_aux_enabled = (
+        args.tactile_head_type == "dense_v2_dino_center_aux"
+    )
+    center_aux_weighted = (
+        float(args.center_aux_loss_weight) > 0.0
+        or float(args.center_aux_presence_loss_weight) > 0.0
+    )
+    if center_aux_enabled and not center_aux_weighted:
+        raise ValueError(
+            "The center-auxiliary head requires at least one positive "
+            "auxiliary loss weight"
+        )
+    if not center_aux_enabled and center_aux_weighted:
+        raise ValueError(
+            "Center auxiliary loss weights require "
+            "--tactile_head_type dense_v2_dino_center_aux"
+        )
+    if center_aux_enabled and (
+        float(args.center_loss_weight) > 0.0
+        or float(args.center_presence_loss_weight) > 0.0
+    ):
+        raise ValueError(
+            "The clean auxiliary-head experiment cannot also enable the "
+            "direct pressure-logit center losses"
+        )
+    if center_aux_enabled and args.pool_layout != "fullgrid32":
+        raise ValueError(
+            "The center-auxiliary experiment requires --pool_layout fullgrid32"
+        )
     if int(args.local_anchor_count) < 1:
         raise ValueError("--local_anchor_count must be positive")
     if not 1 <= int(args.local_anchor_neighbors) <= int(args.local_anchor_count):
@@ -4607,6 +5335,38 @@ def main():
         raise ValueError("--gpus must contain at least one GPU id")
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_ids)
     num_gpus = len(gpu_ids)
+    if args.replay_profile == HISTORICAL_REPLAY_PROFILE:
+        replay_mismatches = _historical_replay_mismatches(args, num_gpus)
+        actual_dino_sha = file_sha256(args.dino_weights)
+        if actual_dino_sha != HISTORICAL_REPLAY_DINO_SHA256:
+            replay_mismatches["dino_weights_sha256"] = {
+                "expected": HISTORICAL_REPLAY_DINO_SHA256,
+                "actual": actual_dino_sha,
+            }
+        runtime_versions = {
+            "torch": str(torch.__version__).split("+")[0],
+            "pytorch_lightning": str(pl.__version__),
+        }
+        expected_versions = {
+            "torch": "2.1.0",
+            "pytorch_lightning": "2.1.4",
+        }
+        for package, expected_version in expected_versions.items():
+            if runtime_versions[package] != expected_version:
+                replay_mismatches[f"runtime_version.{package}"] = {
+                    "expected": expected_version,
+                    "actual": runtime_versions[package],
+                }
+        if replay_mismatches:
+            raise RuntimeError(
+                "Historical replay profile is fail-closed; configuration mismatch: "
+                f"{json.dumps(replay_mismatches, sort_keys=True)}"
+            )
+        print(
+            "Historical replay profile active: decoder-first initialization, "
+            "Lightning worker RNG, legacy HDF5 ordering, and square-center crop.",
+            flush=True,
+        )
     
     lr_scaled = linear_scaled_learning_rate(args.lr, num_gpus)
     print(
@@ -4651,6 +5411,7 @@ def main():
         index_cache_timeout=args.index_cache_timeout,
         tactile_only=True,
         input_resolution=args.input_resolution,
+        crop_pipeline=args.crop_pipeline,
         bbox_rescale_factor=args.bbox_rescale_factor,
         bbox_source_policy=args.bbox_source_policy,
         bbox_manifests=args.bbox_manifests,
@@ -4660,6 +5421,7 @@ def main():
         query_manifests=args.query_manifests,
         hdf5_handle_cache_size=args.hdf5_handle_cache_size,
         hdf5_manifest_cache_dir=args.hdf5_manifest_cache_dir,
+        hdf5_sample_order=args.hdf5_sample_order,
     )
     index_metadata = train_dataset.index_cache_metadata()
 
@@ -4690,10 +5452,21 @@ def main():
             query_manifests=args.val_query_manifests,
             hdf5_handle_cache_size=args.hdf5_handle_cache_size,
             hdf5_manifest_cache_dir=args.hdf5_manifest_cache_dir,
+            hdf5_sample_order=args.hdf5_sample_order,
+            crop_pipeline=args.crop_pipeline,
         )
     val_index_metadata = (
         val_dataset.index_cache_metadata() if val_dataset is not None else {}
     )
+    if args.replay_profile == HISTORICAL_REPLAY_PROFILE:
+        index_metadata = _validate_historical_replay_dataset(
+            train_dataset, "train"
+        )
+        if val_dataset is None:
+            raise RuntimeError("Historical replay requires validation")
+        val_index_metadata = _validate_historical_replay_dataset(
+            val_dataset, "val"
+        )
 
     print("Initializing standalone DINO tactile model...")
     tactile_loss_config = tactile_loss_config_from_args(args)
@@ -4721,6 +5494,8 @@ def main():
         input_resolution=args.input_resolution,
         pool_output_channels=args.pool_output_channels,
         decoder_hidden_dim=args.decoder_hidden_dim,
+        center_aux_hidden_dim=args.center_aux_hidden_dim,
+        model_initialization_order=args.model_initialization_order,
         local_anchor_count=args.local_anchor_count,
         local_anchor_neighbors=args.local_anchor_neighbors,
         local_logit_delta_max=args.local_logit_delta_max,
@@ -4757,12 +5532,19 @@ def main():
         ),
         init_tactile_checkpoint=args.init_tactile_checkpoint,
         optimizer_weight_decay=args.optimizer_weight_decay,
+        optimizer_backend_mode=args.optimizer_backend_mode,
         lr_scheduler=args.lr_scheduler,
         lr_decay_milestones=args.lr_decay_milestones,
         lr_decay_gamma=args.lr_decay_gamma,
     )
     model.visual_backbone_model_name = model.backbone.MODEL_NAME
     model.backbone_weights_path = args.dino_weights
+    model.initial_tactile_head_sha256 = module_state_sha256(model.tactile_head)
+    print(
+        "Initial tactile-head SHA256: "
+        f"{model.initial_tactile_head_sha256}",
+        flush=True,
+    )
     print(f"Computing backbone SHA256: {model.backbone_weights_path}")
     model.backbone_weights_sha256 = file_sha256(model.backbone_weights_path)
     if args.init_tactile_checkpoint:
@@ -4792,6 +5574,19 @@ def main():
     model.hdf5_manifest_cache_key = str(
         index_metadata.get("hdf5_manifest_cache_key", "")
     )
+    model.hdf5_sample_order = str(args.hdf5_sample_order)
+    model.hdf5_ordered_sample_sha256 = str(
+        index_metadata.get("hdf5_ordered_sample_sha256", "")
+    )
+    model.val_hdf5_ordered_sample_sha256 = str(
+        val_index_metadata.get("hdf5_ordered_sample_sha256", "")
+    )
+    model.hdf5_sample_set_sha256 = str(
+        index_metadata.get("hdf5_sample_set_sha256", "")
+    )
+    model.worker_seed_mode = str(args.worker_seed_mode)
+    model.crop_pipeline = str(args.crop_pipeline)
+    model.replay_profile = str(args.replay_profile)
     model.bbox_manifest_sha256 = dict(index_metadata.get("bbox_manifest_sha256", {}))
     model.lazy_index_records = bool(index_metadata.get("lazy_index_records", False))
     model.dataset_filter = tuple(index_metadata.get("dataset_filter", ()))
@@ -4847,6 +5642,7 @@ def main():
         num_workers=args.num_workers,
         persistent_workers=args.persistent_workers,
         prefetch_factor=args.prefetch_factor,
+        worker_seed_mode=args.worker_seed_mode,
     )
     val_loader = None
     if val_dataset is not None and len(val_dataset) > 0:
@@ -4859,6 +5655,7 @@ def main():
             # epoch and make DDP interrupt cleanup unnecessarily expensive.
             persistent_workers=False,
             prefetch_factor=args.prefetch_factor,
+            worker_seed_mode=args.worker_seed_mode,
         )
     else:
         print("Validation dataset is empty; training will run without validation metrics/checkpoint monitoring.")

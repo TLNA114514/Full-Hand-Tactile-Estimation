@@ -1,0 +1,446 @@
+{
+  "low_in_frame": [
+    {
+      "bbox_xyxy": [
+        403.0,
+        14.0,
+        639.0,
+        443.0
+      ],
+      "camera_translation": [
+        -2.1916840076446533,
+        0.04764031618833542,
+        -130.86328125
+      ],
+      "focal_length": 12500.0,
+      "image": "low_in_frame/train_row-01944907.jpg",
+      "in_frame_fraction": 0.0,
+      "is_right": true,
+      "positive_depth_fraction": 0.0,
+      "sample_uid": "TouchAnything/train/Outdoor/deflate_and_inflate_ball/20260409_151744_511/00006743/right",
+      "source_row": 1944907,
+      "split": "train",
+      "status": 1
+    },
+    {
+      "bbox_xyxy": [
+        101.0,
+        460.0,
+        161.0,
+        479.0
+      ],
+      "camera_translation": [
+        -0.30197709798812866,
+        0.5218596458435059,
+        25.074440002441406
+      ],
+      "focal_length": 12500.0,
+      "image": "low_in_frame/val_row-00233838.jpg",
+      "in_frame_fraction": 0.09637451171875,
+      "is_right": false,
+      "positive_depth_fraction": 1.0,
+      "sample_uid": "TouchAnything/val/Retail/buy_drink/20260411_155822_509/00002246/left",
+      "source_row": 233838,
+      "split": "val",
+      "status": 1
+    },
+    {
+      "bbox_xyxy": [
+        627.0,
+        392.0,
+        639.0,
+        427.0
+      ],
+      "camera_translation": [
+        3.3448309898376465,
+        1.7503666877746582,
+        132.02682495117188
+      ],
+      "focal_length": 12500.0,
+      "image": "low_in_frame/test_seen_row-00170178.jpg",
+      "in_frame_fraction": 0.0,
+      "is_right": true,
+      "positive_depth_fraction": 1.0,
+      "sample_uid": "TouchAnything/test_seen/Home/spread_bed_sheet/20260412_093049_859/00003355/right",
+      "source_row": 170178,
+      "split": "test_seen",
+      "status": 1
+    },
+    {
+      "bbox_xyxy": [
+        631.0,
+        403.0,
+        639.0,
+        479.0
+      ],
+      "camera_translation": [
+        0.8639798760414124,
+        0.49332910776138306,
+        35.68242645263672
+      ],
+      "focal_length": 12500.0,
+      "image": "low_in_frame/test_unseen_row-00025794.jpg",
+      "in_frame_fraction": 0.006427764892578125,
+      "is_right": true,
+      "positive_depth_fraction": 1.0,
+      "sample_uid": "TouchAnything/test_unseen/Home/open_close_window/20260328_105200_484/00000292/right",
+      "source_row": 25794,
+      "split": "test_unseen",
+      "status": 1
+    }
+  ],
+  "random": [
+    {
+      "bbox_xyxy": [
+        142.0,
+        409.0,
+        227.0,
+        479.0
+      ],
+      "camera_translation": [
+        -0.08537440001964569,
+        0.4123237729072571,
+        20.702259063720703
+      ],
+      "focal_length": 12500.0,
+      "image": "random/train_row-00444993.jpg",
+      "in_frame_fraction": 0.88427734375,
+      "is_right": false,
+      "positive_depth_fraction": 1.0,
+      "sample_uid": "TouchAnything/train/Home/open_battery_box_and_take_out/20260320_150338_277/00000341/left",
+      "source_row": 444993,
+      "split": "train",
+      "status": 1
+    },
+    {
+      "bbox_xyxy": [
+        198.0,
+        332.0,
+        401.0,
+        479.0
+      ],
+      "camera_translation": [
+        0.042706385254859924,
+        0.22098200023174286,
+        12.553092956542969
+      ],
+      "focal_length": 12500.0,
+      "image": "random/train_row-02342311.jpg",
+      "in_frame_fraction": 0.9873046875,
+      "is_right": false,
+      "positive_depth_fraction": 1.0,
+      "sample_uid": "TouchAnything/train/Retail/pick_up_drink/20260325_162829_006/00000375/left",
+      "source_row": 2342311,
+      "split": "train",
+      "status": 1
+    },
+    {
+      "bbox_xyxy": [
+        255.0,
+        75.0,
+        319.0,
+        171.0
+      ],
+      "camera_translation": [
+        0.19552485644817352,
+        0.04035310074687004,
+        10.636034965515137
+      ],
+      "focal_length": 6250.0,
+      "image": "random/train_row-00758640.jpg",
+      "in_frame_fraction": 0.88818359375,
+      "is_right": true,
+      "positive_depth_fraction": 1.0,
+      "sample_uid": "TouchAnything/train/Home/pick_up_earphones/20260314_163100_525/00000089/right",
+      "source_row": 758640,
+      "split": "train",
+      "status": 1
+    },
+    {
+      "bbox_xyxy": [
+        299.0,
+        168.0,
+        471.0,
+        348.0
+      ],
+      "camera_translation": [
+        0.08331958204507828,
+        0.0887286365032196,
+        20.90580940246582
+      ],
+      "focal_length": 12500.0,
+      "image": "random/train_row-01261404.jpg",
+      "in_frame_fraction": 1.0,
+      "is_right": true,
+      "positive_depth_fraction": 1.0,
+      "sample_uid": "TouchAnything/train/Home/pull_bag/20260409_190823_451/00001920/right",
+      "source_row": 1261404,
+      "split": "train",
+      "status": 1
+    },
+    {
+      "bbox_xyxy": [
+        17.0,
+        366.0,
+        97.0,
+        479.0
+      ],
+      "camera_translation": [
+        -0.3445599675178528,
+        0.364450067281723,
+        21.57195472717285
+      ],
+      "focal_length": 12500.0,
+      "image": "random/val_row-00141167.jpg",
+      "in_frame_fraction": 1.0,
+      "is_right": false,
+      "positive_depth_fraction": 1.0,
+      "sample_uid": "TouchAnything/val/Home/put_pillow_into_bag/20260412_103519_130/00002474/left",
+      "source_row": 141167,
+      "split": "val",
+      "status": 1
+    },
+    {
+      "bbox_xyxy": [
+        147.0,
+        96.0,
+        359.0,
+        273.0
+      ],
+      "camera_translation": [
+        -0.04288192838430405,
+        -0.028038181364536285,
+        16.831098556518555
+      ],
+      "focal_length": 12500.0,
+      "image": "random/val_row-00017593.jpg",
+      "in_frame_fraction": 1.0,
+      "is_right": false,
+      "positive_depth_fraction": 1.0,
+      "sample_uid": "TouchAnything/val/Home/brew_and_pour_tea/20260321_203050_633/00000056/left",
+      "source_row": 17593,
+      "split": "val",
+      "status": 1
+    },
+    {
+      "bbox_xyxy": [
+        533.0,
+        275.0,
+        637.0,
+        479.0
+      ],
+      "camera_translation": [
+        0.3264923393726349,
+        0.19126899540424347,
+        18.967683792114258
+      ],
+      "focal_length": 12500.0,
+      "image": "random/val_row-00220744.jpg",
+      "in_frame_fraction": 1.0,
+      "is_right": true,
+      "positive_depth_fraction": 1.0,
+      "sample_uid": "TouchAnything/val/Retail/buy_drink/20260325_140354_186/00001697/right",
+      "source_row": 220744,
+      "split": "val",
+      "status": 1
+    },
+    {
+      "bbox_xyxy": [
+        420.0,
+        402.0,
+        497.0,
+        479.0
+      ],
+      "camera_translation": [
+        0.11272424459457397,
+        0.25713372230529785,
+        17.461530685424805
+      ],
+      "focal_length": 12500.0,
+      "image": "random/val_row-00198189.jpg",
+      "in_frame_fraction": 1.0,
+      "is_right": true,
+      "positive_depth_fraction": 1.0,
+      "sample_uid": "TouchAnything/val/Outdoor/bounce_ping_pong_ball/20260320_170741_627/00001040/right",
+      "source_row": 198189,
+      "split": "val",
+      "status": 1
+    },
+    {
+      "bbox_xyxy": [
+        131.0,
+        109.0,
+        185.0,
+        239.0
+      ],
+      "camera_translation": [
+        0.0980629026889801,
+        0.1732855886220932,
+        7.88449239730835
+      ],
+      "focal_length": 6250.0,
+      "image": "random/test_seen_row-00199908.jpg",
+      "in_frame_fraction": 0.87646484375,
+      "is_right": false,
+      "positive_depth_fraction": 1.0,
+      "sample_uid": "TouchAnything/test_seen/Office/slide_mouse/20260314_161431_296/00000014/left",
+      "source_row": 199908,
+      "split": "test_seen",
+      "status": 1
+    },
+    {
+      "bbox_xyxy": [
+        163.0,
+        265.0,
+        281.0,
+        433.0
+      ],
+      "camera_translation": [
+        -0.05205126106739044,
+        0.18021132051944733,
+        16.907733917236328
+      ],
+      "focal_length": 12500.0,
+      "image": "random/test_seen_row-00023393.jpg",
+      "in_frame_fraction": 1.0,
+      "is_right": false,
+      "positive_depth_fraction": 1.0,
+      "sample_uid": "TouchAnything/test_seen/Home/cook/20260411_202506_996/00002977/left",
+      "source_row": 23393,
+      "split": "test_seen",
+      "status": 1
+    },
+    {
+      "bbox_xyxy": [
+        339.0,
+        278.0,
+        499.0,
+        448.0
+      ],
+      "camera_translation": [
+        -0.004791438579559326,
+        0.13793183863162994,
+        18.815298080444336
+      ],
+      "focal_length": 12500.0,
+      "image": "random/test_seen_row-00098385.jpg",
+      "in_frame_fraction": 1.0,
+      "is_right": true,
+      "positive_depth_fraction": 1.0,
+      "sample_uid": "TouchAnything/test_seen/Home/pick_up_earphones_2/20260316_221715_559/00000027/right",
+      "source_row": 98385,
+      "split": "test_seen",
+      "status": 1
+    },
+    {
+      "bbox_xyxy": [
+        397.0,
+        232.0,
+        581.0,
+        479.0
+      ],
+      "camera_translation": [
+        0.07516640424728394,
+        0.11459171772003174,
+        10.42169189453125
+      ],
+      "focal_length": 12500.0,
+      "image": "random/test_seen_row-00010858.jpg",
+      "in_frame_fraction": 1.0,
+      "is_right": true,
+      "positive_depth_fraction": 1.0,
+      "sample_uid": "TouchAnything/test_seen/Home/arrange_pillow/20260412_101558_978/00003855/right",
+      "source_row": 10858,
+      "split": "test_seen",
+      "status": 1
+    },
+    {
+      "bbox_xyxy": [
+        77.0,
+        117.0,
+        140.0,
+        223.0
+      ],
+      "camera_translation": [
+        -0.005092792212963104,
+        0.1361706405878067,
+        11.551054000854492
+      ],
+      "focal_length": 6250.0,
+      "image": "random/test_unseen_row-00023781.jpg",
+      "in_frame_fraction": 1.0,
+      "is_right": false,
+      "positive_depth_fraction": 1.0,
+      "sample_uid": "TouchAnything/test_unseen/Home/move_toolbox/20260314_103545_680/00000012/left",
+      "source_row": 23781,
+      "split": "test_unseen",
+      "status": 1
+    },
+    {
+      "bbox_xyxy": [
+        146.0,
+        175.0,
+        251.0,
+        280.0
+      ],
+      "camera_translation": [
+        -0.04205377399921417,
+        0.020830512046813965,
+        14.630912780761719
+      ],
+      "focal_length": 12500.0,
+      "image": "random/test_unseen_row-00085216.jpg",
+      "in_frame_fraction": 1.0,
+      "is_right": false,
+      "positive_depth_fraction": 1.0,
+      "sample_uid": "TouchAnything/test_unseen/Outdoor/put_back_ping_pong_paddle/20260321_105922_283/00000061/left",
+      "source_row": 85216,
+      "split": "test_unseen",
+      "status": 1
+    },
+    {
+      "bbox_xyxy": [
+        443.0,
+        288.0,
+        584.0,
+        479.0
+      ],
+      "camera_translation": [
+        0.24440595507621765,
+        0.2850707173347473,
+        20.381906509399414
+      ],
+      "focal_length": 12500.0,
+      "image": "random/test_unseen_row-00035228.jpg",
+      "in_frame_fraction": 1.0,
+      "is_right": true,
+      "positive_depth_fraction": 1.0,
+      "sample_uid": "TouchAnything/test_unseen/Home/open_close_window/20260328_105507_614/00001134/right",
+      "source_row": 35228,
+      "split": "test_unseen",
+      "status": 1
+    },
+    {
+      "bbox_xyxy": [
+        283.0,
+        243.0,
+        406.0,
+        359.0
+      ],
+      "camera_translation": [
+        -0.041613832116127014,
+        0.08246864378452301,
+        15.887792587280273
+      ],
+      "focal_length": 12500.0,
+      "image": "random/test_unseen_row-00093957.jpg",
+      "in_frame_fraction": 1.0,
+      "is_right": true,
+      "positive_depth_fraction": 1.0,
+      "sample_uid": "TouchAnything/test_unseen/Retail/open_package_bag/20260321_211327_697/00000236/right",
+      "source_row": 93957,
+      "split": "test_unseen",
+      "status": 1
+    }
+  ]
+}

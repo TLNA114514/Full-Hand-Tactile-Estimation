@@ -380,18 +380,29 @@ def _npz_array_readable(data, key: str) -> bool:
         return False
 
 
-def _npz_hand_has_direct_data(data, dataset: str, hand: str) -> bool:
+def _npz_hand_has_direct_data(
+    data,
+    dataset: str,
+    hand: str,
+    *,
+    require_gaussian: bool = True,
+    validate_gaussian: bool = True,
+) -> bool:
     if dataset == "egotactile":
         raw_key = f"{hand}_sensor_256_norm"
         gaussian_key = f"{hand}_pressure_continuous_subdiv"
         raw_frames = _npz_frame_count(data, raw_key)
-        gaussian_frames = _npz_frame_count(data, gaussian_key)
         if raw_frames <= 0:
             return False
-        if gaussian_frames <= 0:
+        if not _npz_array_readable(data, raw_key):
             return False
-        if not _npz_array_readable(data, raw_key) or not _npz_array_readable(data, gaussian_key):
-            return False
+        if require_gaussian:
+            if gaussian_key not in data:
+                return False
+            if validate_gaussian:
+                gaussian_frames = _npz_frame_count(data, gaussian_key)
+                if gaussian_frames <= 0 or not _npz_array_readable(data, gaussian_key):
+                    return False
         valid_key = f"{hand}_sensor_valid"
         if valid_key in data:
             try:
@@ -406,25 +417,46 @@ def _npz_hand_has_direct_data(data, dataset: str, hand: str) -> bool:
         raw_key = f"{hand}_pressure_grid"
         gaussian_key = f"{hand}_pressure_continuous_subdiv"
         raw_frames = _npz_frame_count(data, raw_key)
+        if raw_frames <= 0 or not _npz_array_readable(data, raw_key):
+            return False
+        if not require_gaussian:
+            return True
+        if gaussian_key not in data:
+            return False
+        if not validate_gaussian:
+            return True
         gaussian_frames = _npz_frame_count(data, gaussian_key)
-        return (
-            raw_frames > 0
-            and gaussian_frames > 0
-            and _npz_array_readable(data, raw_key)
-            and _npz_array_readable(data, gaussian_key)
-        )
+        return gaussian_frames > 0 and _npz_array_readable(data, gaussian_key)
 
     return True
 
 
-def _npz_source_rows(dataset: str, npz_files: Sequence[str], root: str | Path, name_prefix: str) -> list[dict]:
+def _npz_source_rows(
+    dataset: str,
+    npz_files: Sequence[str],
+    root: str | Path,
+    name_prefix: str,
+    *,
+    require_gaussian: bool = True,
+    validate_gaussian: bool = True,
+) -> list[dict]:
     rows = []
     root_path = Path(root)
     for npz_path in npz_files:
         path = Path(npz_path)
         try:
             with np.load(path, allow_pickle=False) as data:
-                hands = [hand for hand in ("left", "right") if _npz_hand_has_direct_data(data, dataset, hand)]
+                hands = [
+                    hand
+                    for hand in ("left", "right")
+                    if _npz_hand_has_direct_data(
+                        data,
+                        dataset,
+                        hand,
+                        require_gaussian=require_gaussian,
+                        validate_gaussian=validate_gaussian,
+                    )
+                ]
         except Exception:
             continue
         if not hands:
@@ -504,6 +536,8 @@ def discover_pressure_sources(
     egotactile_scan_depth: int = 4,
     touchanything_scan_split_depth: int = 2,
     egotactile_scan_split_depth: int = 3,
+    require_gaussian: bool = True,
+    validate_gaussian: bool = True,
 ) -> list[dict]:
     requested = {d.lower() for d in datasets}
     unknown = requested - DATASET_NAMES
@@ -525,7 +559,16 @@ def discover_pressure_sources(
             max_depth=touchanything_scan_depth,
             split_depth=touchanything_scan_split_depth,
         )
-        rows.extend(_npz_source_rows("touchanything", files, dataset_roots["touchanything"], "TouchAnything/all"))
+        rows.extend(
+            _npz_source_rows(
+                "touchanything",
+                files,
+                dataset_roots["touchanything"],
+                "TouchAnything/all",
+                require_gaussian=require_gaussian,
+                validate_gaussian=validate_gaussian,
+            )
+        )
 
     if "egotactile" in requested and dataset_roots.get("egotactile"):
         files = find_named_files(
@@ -536,7 +579,16 @@ def discover_pressure_sources(
             max_depth=egotactile_scan_depth,
             split_depth=egotactile_scan_split_depth,
         )
-        rows.extend(_npz_source_rows("egotactile", files, dataset_roots["egotactile"], "EgoTactile/all"))
+        rows.extend(
+            _npz_source_rows(
+                "egotactile",
+                files,
+                dataset_roots["egotactile"],
+                "EgoTactile/all",
+                require_gaussian=require_gaussian,
+                validate_gaussian=validate_gaussian,
+            )
+        )
 
     rows.sort(key=lambda x: x["sequence_id"])
     return rows

@@ -66,3 +66,39 @@ def configure_supervised_process():
 def initialize_worker_parent_death_signal(_worker_id=None):
     """DataLoader/ProcessPool initializer; must remain top-level and picklable."""
     return set_parent_death_signal(signal.SIGKILL, expected_parent_pid=os.getppid())
+
+
+def _distributed_global_rank_from_environment():
+    for name in ("RANK", "SLURM_PROCID", "OMPI_COMM_WORLD_RANK", "PMI_RANK"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return int(value)
+    local_rank = os.environ.get("LOCAL_RANK", "").strip()
+    if local_rank:
+        node_rank = int(
+            os.environ.get("NODE_RANK", os.environ.get("GROUP_RANK", "0"))
+        )
+        local_world_size = os.environ.get("LOCAL_WORLD_SIZE", "").strip()
+        if node_rank and not local_world_size:
+            raise RuntimeError(
+                "Cannot reconstruct global rank from LOCAL_RANK on a multi-node "
+                "worker without LOCAL_WORLD_SIZE"
+            )
+        return node_rank * int(local_world_size or "1") + int(local_rank)
+    return 0
+
+
+def initialize_worker_historical_lightning_seed(worker_id):
+    """Restore the Lightning 2.1 worker RNG path and retain parent-death safety."""
+
+    set_parent_death_signal(signal.SIGKILL, expected_parent_pid=os.getppid())
+    try:
+        from lightning_fabric.utilities.seed import pl_worker_init_function
+    except ImportError:
+        from pytorch_lightning.utilities.seed import pl_worker_init_function
+    # This must run after prctl: the historical Lightning callback owns the
+    # final Python, NumPy, and Torch worker RNG state.
+    return pl_worker_init_function(
+        int(worker_id),
+        rank=_distributed_global_rank_from_environment(),
+    )

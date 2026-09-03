@@ -136,6 +136,7 @@ class OpenTouchTactileDataset(DatasetIndexingMixin, Dataset):
                  index_backend: str = "process",
                  sample_records=None, tactile_only: bool = False,
                  input_resolution=None,
+                 crop_pipeline: str = "direct_rectangle",
                  bbox_rescale_factor: float = 2.0,
                  bbox_source_policy: str = "any",
                  bbox_manifests=None,
@@ -148,6 +149,7 @@ class OpenTouchTactileDataset(DatasetIndexingMixin, Dataset):
                  query_manifests=None,
                  hdf5_handle_cache_size: int = 4,
                  hdf5_manifest_cache_dir: str = None,
+                 hdf5_sample_order: str = "manifest",
                  depth_sidecar_root: str = None,
                  depth_control: str = "none",
                  depth_output_hw=(32, 24),
@@ -158,6 +160,10 @@ class OpenTouchTactileDataset(DatasetIndexingMixin, Dataset):
         self.split = split
         self.train = train
         self.augmentation_enabled = bool(augmentation_enabled)
+        # Temporal clip wrappers may assign the same ephemeral seed to every
+        # frame in one clip. The marginal crop augmentation remains unchanged,
+        # while scale/translation no longer jump independently across time.
+        self._augmentation_group_seed_by_index = {}
         self.tactile_only = bool(tactile_only)
         self.index_workers = max(1, int(index_workers))
         self.index_chunksize = max(1, int(index_chunksize))
@@ -227,6 +233,18 @@ class OpenTouchTactileDataset(DatasetIndexingMixin, Dataset):
             if len(input_resolution) != 2:
                 raise ValueError("input_resolution must contain height and width")
             self.input_resolution = tuple(int(value) for value in input_resolution)
+        self.crop_pipeline = str(crop_pipeline).strip().lower()
+        if self.crop_pipeline not in ("direct_rectangle", "legacy_square_center"):
+            raise ValueError(
+                "crop_pipeline must be direct_rectangle or legacy_square_center"
+            )
+        if (
+            self.crop_pipeline == "legacy_square_center"
+            and self.input_resolution != (256, 192)
+        ):
+            raise ValueError(
+                "legacy_square_center is defined only for input_resolution=256x192"
+            )
         self.img_size = self.input_resolution[0]
         self.mean = 255. * np.array(cfg.MODEL.IMAGE_MEAN)
         self.std = 255. * np.array(cfg.MODEL.IMAGE_STD)
@@ -275,6 +293,14 @@ class OpenTouchTactileDataset(DatasetIndexingMixin, Dataset):
                 f"got {data_backend!r}"
             )
         self.query_manifest_specs = self._normalize_query_manifest_specs(query_manifests)
+        self.hdf5_sample_order = str(hdf5_sample_order).strip().lower()
+        if self.hdf5_sample_order not in (
+            "manifest",
+            "legacy_sample_dir_hand",
+        ):
+            raise ValueError(
+                "hdf5_sample_order must be manifest or legacy_sample_dir_hand"
+            )
         if not self.query_manifest_specs and requested_backend in ("auto", "sequence_hdf5"):
             self.query_manifest_specs = self._discover_query_manifest_specs()
         if requested_backend == "auto":
@@ -346,6 +372,8 @@ class OpenTouchTactileDataset(DatasetIndexingMixin, Dataset):
             for spec in self.query_manifest_specs
         }
         self.hdf5_schema_versions = set()
+        self.hdf5_ordered_sample_sha256 = ""
+        self.hdf5_sample_set_sha256 = ""
 
         self.tactile_dim = count_obj_vertices(SUBDIV_OBJ_PATH)
         print(f"[{split}] Loading subdiv palm mask for evaluation and loss masking...")
@@ -369,6 +397,8 @@ class OpenTouchTactileDataset(DatasetIndexingMixin, Dataset):
                     )
                     for index, sample in enumerate(self.samples)
                 ]
+                self.samples = self._order_hdf5_samples(self.samples)
+                self._record_hdf5_sample_fingerprints(self.samples)
             elif self.bbox_source_policy != "any" and not all(
                 sample.get("bbox_source_policy") == self.bbox_source_policy
                 for sample in self.samples
@@ -1089,9 +1119,15 @@ class OpenTouchTactileDataset(DatasetIndexingMixin, Dataset):
         # Add basic augmentation during training
         if self.train and self.augmentation_enabled:
             augm_config = self.cfg.DATASETS.CONFIG
-            scale_aug = np.clip(np.random.randn(), -1.0, 1.0) * augm_config.SCALE_FACTOR + 1.0
-            tx = np.clip(np.random.randn(), -1.0, 1.0) * augm_config.TRANS_FACTOR * bbox_size
-            ty = np.clip(np.random.randn(), -1.0, 1.0) * augm_config.TRANS_FACTOR * bbox_size
+            group_seed = self._augmentation_group_seed_by_index.get(idx)
+            random_source = (
+                np.random.RandomState(int(group_seed))
+                if group_seed is not None
+                else np.random
+            )
+            scale_aug = np.clip(random_source.randn(), -1.0, 1.0) * augm_config.SCALE_FACTOR + 1.0
+            tx = np.clip(random_source.randn(), -1.0, 1.0) * augm_config.TRANS_FACTOR * bbox_size
+            ty = np.clip(random_source.randn(), -1.0, 1.0) * augm_config.TRANS_FACTOR * bbox_size
             
             bbox_size = bbox_size * scale_aug
             center_x += tx
@@ -1100,10 +1136,15 @@ class OpenTouchTactileDataset(DatasetIndexingMixin, Dataset):
         # Crop and resize image using affine transform
         output_height, output_width = self.input_resolution
         res = output_height
+        warp_width = (
+            output_height
+            if self.crop_pipeline == "legacy_square_center"
+            else output_width
+        )
         t = np.zeros((2, 3), dtype=np.float32)
         t[0, 0] = float(res) / bbox_size
         t[1, 1] = float(res) / bbox_size
-        t[0, 2] = -res * float(center_x) / bbox_size + output_width * 0.5
+        t[0, 2] = -res * float(center_x) / bbox_size + warp_width * 0.5
         t[1, 2] = res * (-float(center_y) / bbox_size + 0.5)
         
         # Convert BGR to RGB
@@ -1111,7 +1152,7 @@ class OpenTouchTactileDataset(DatasetIndexingMixin, Dataset):
         img_patch = cv2.warpAffine(
             img_rgb,
             t,
-            (output_width, output_height),
+            (warp_width, output_height),
             flags=cv2.INTER_LINEAR,
         )
         
@@ -1128,6 +1169,26 @@ class OpenTouchTactileDataset(DatasetIndexingMixin, Dataset):
         # Standard mean/std normalization
         img_patch = (img_patch - self.cfg.MODEL.IMAGE_MEAN) / self.cfg.MODEL.IMAGE_STD
         img_patch = img_patch.transpose(2, 0, 1)
+        if self.crop_pipeline == "legacy_square_center":
+            crop_left = (warp_width - output_width) // 2
+            img_patch = img_patch[:, :, crop_left : crop_left + output_width]
+
+        crop_affine = np.eye(3, dtype=np.float32)
+        crop_affine[:2] = t
+        if self.crop_pipeline == "legacy_square_center":
+            center_crop = np.eye(3, dtype=np.float32)
+            center_crop[0, 2] = -float(crop_left)
+            crop_affine = center_crop @ crop_affine
+        if is_right == 0:
+            canonical_flip = np.asarray(
+                (
+                    (-1.0, 0.0, float(output_width - 1)),
+                    (0.0, 1.0, 0.0),
+                    (0.0, 0.0, 1.0),
+                ),
+                dtype=np.float32,
+            )
+            crop_affine = canonical_flip @ crop_affine
         
         item = {
             'dataset': dataset_name,
@@ -1147,6 +1208,7 @@ class OpenTouchTactileDataset(DatasetIndexingMixin, Dataset):
             'image_width': torch.tensor(int(img_bgr.shape[1])),
             'image_height': torch.tensor(int(img_bgr.shape[0])),
             'img': torch.from_numpy(img_patch).float(),
+            'crop_affine': torch.from_numpy(crop_affine).float(),
             'tactile_signal': torch.from_numpy(tactile_signal).float(),
             'has_tactile': torch.tensor(has_tactile).float(),
             'palm_mask': torch.from_numpy(self.palm_mask).float(),
@@ -1206,7 +1268,6 @@ class OpenTouchTactileDataset(DatasetIndexingMixin, Dataset):
                     "depth sidecar warp produced non-finite values",
                 )
             item['depth_prior'] = torch.from_numpy(depth_prior).float()
-            item['crop_affine'] = torch.from_numpy(t.copy()).float()
         if timing is not None:
             timing.setdefault("depth_handle_ms", 0.0)
             timing.setdefault("depth_handle_hit", 0.0)

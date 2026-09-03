@@ -155,6 +155,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--humantouch-semantic-verification-mode",
+        choices=("inherit", "off", "report", "filter"),
+        default="off",
+        help=(
+            "HumanTouch head videos contain two instrumented gloves, so semantic "
+            "verifier replay is disabled by default."
+        ),
+    )
+    parser.add_argument(
         "--reload-predictor-per-job",
         action="store_true",
         help="Reload SAM for every sequence instead of reusing one predictor per worker.",
@@ -367,6 +376,8 @@ def resolved_semantic_verification_mode(args: argparse.Namespace, row: dict) -> 
         configured = args.egotactile_semantic_verification_mode
     elif dataset == "acedata":
         configured = args.acedata_semantic_verification_mode
+    elif dataset == "humantouch":
+        configured = args.humantouch_semantic_verification_mode
     else:
         raise ValueError(f"Unsupported pilot dataset for semantic policy: {dataset!r}")
     return args.bare_verification_mode if configured == "inherit" else configured

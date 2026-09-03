@@ -435,6 +435,7 @@ def build_temporal_pair_index(
     max_bbox_center_jump: float = 0.5,
     max_bbox_area_ratio: float = 2.0,
     seed: int = 521,
+    label_free_controls: bool = False,
     force: bool = False,
 ) -> Path:
     output_path = Path(output_path).expanduser().resolve(strict=False)
@@ -449,6 +450,9 @@ def build_temporal_pair_index(
         "max_bbox_center_jump": float(max_bbox_center_jump),
         "max_bbox_area_ratio": float(max_bbox_area_ratio),
         "seed": int(seed),
+        "control_pressure_source": (
+            "none_label_free" if label_free_controls else "manifest_max_pressure"
+        ),
     }
     contract_sha = sha256_json(contract)
     if not force and output_path.is_file() and metadata_path.is_file():
@@ -511,7 +515,11 @@ def build_temporal_pair_index(
                     "h5": str(row.get("h5_path") or row.get("h5_relpath") or ""),
                     "sequence": group[2],
                     "side": side,
-                    "pressure_bin": _pressure_bin(row.get("max_pressure")),
+                    "pressure_bin": (
+                        0
+                        if label_free_controls
+                        else _pressure_bin(row.get("max_pressure"))
+                    ),
                     "crop_affine": tactile_crop_affine(
                         cached["bbox_xyxy"],
                         input_resolution=cache.input_resolution,
@@ -944,10 +952,23 @@ class TemporalPairDataset(torch.utils.data.Dataset):
         *,
         include_control: bool = False,
         include_dino_grid: bool = False,
+        include_crop_transform: bool = True,
+        include_control_current_grid: bool = True,
         history_lags: Sequence[int] = (1,),
         max_open_shards: int = 4,
+        control_pressure_bins: Sequence[int] | None = None,
+        control_crop_transform_from_current: bool = False,
     ):
         self.include_dino_grid = bool(include_dino_grid)
+        self.include_crop_transform = bool(
+            include_dino_grid and include_crop_transform
+        )
+        self.include_control_current_grid = bool(
+            include_dino_grid and include_control_current_grid
+        )
+        self.control_crop_transform_from_current = bool(
+            control_crop_transform_from_current
+        )
         self.cache = PartitionedPalmCache(
             cache_root,
             max_open_shards=max_open_shards,
@@ -982,7 +1003,7 @@ class TemporalPairDataset(torch.utils.data.Dataset):
         self.history_indices = self.history_metadata["history_indices"]
         self.crop_affines = (
             _pair_crop_affine_lookup(len(self.cache), self.arrays)
-            if self.include_dino_grid
+            if self.include_crop_transform
             else None
         )
         self.control_history_indices = None
@@ -993,10 +1014,23 @@ class TemporalPairDataset(torch.utils.data.Dataset):
                 raise RuntimeError(
                     "History controls require the current temporal pair index"
                 )
+            if control_pressure_bins is None:
+                pressure_bins = np.asarray(self.arrays["pressure_bin"], dtype=np.int64)
+                self.control_bin_source = "target_max_pressure"
+            else:
+                pressure_bins = np.asarray(control_pressure_bins, dtype=np.int64)
+                if pressure_bins.shape != (length,):
+                    raise ValueError(
+                        "control_pressure_bins must contain one value per temporal pair"
+                    )
+                if np.any(pressure_bins < 0):
+                    raise ValueError("control_pressure_bins cannot contain negative values")
+                self.control_bin_source = "external_label_free"
+            self.control_pressure_bins = pressure_bins
             control_pairs = strict_history_control_pair_indices(
                 self.arrays["sequence_key"],
                 self.arrays["side"],
-                self.arrays["pressure_bin"],
+                pressure_bins,
                 self.history_indices >= 0,
                 seed=_pair_control_seed(self.pair_index_path),
             )
@@ -1071,16 +1105,17 @@ class TemporalPairDataset(torch.utils.data.Dataset):
                 {
                     "current_grid": tensor(current["z_rgb"]),
                     "history_grids": torch.stack(history_grids),
-                    "history_crop_transform": tensor(
-                        _history_crop_transforms(
-                            self.crop_affines,
-                            current_index,
-                            self.history_indices[index],
-                        ),
-                        torch.float32,
-                    ),
                 }
             )
+            if self.include_crop_transform:
+                result["history_crop_transform"] = tensor(
+                    _history_crop_transforms(
+                        self.crop_affines,
+                        current_index,
+                        self.history_indices[index],
+                    ),
+                    torch.float32,
+                )
         if self.include_control:
             if self.control_history_indices is None:
                 control_indices = (int(self.arrays["control_previous_index"][index]),)
@@ -1103,21 +1138,24 @@ class TemporalPairDataset(torch.utils.data.Dataset):
             control_pair = int(self.control_pair_indices[index])
             if self.include_dino_grid:
                 control_current_index = int(self.arrays["current_index"][control_pair])
-                control_current = self.cache.values(control_current_index)
-                result.update(
-                    {
-                        "control_current_grid": tensor(control_current["z_rgb"]),
-                        "control_history_grids": torch.stack(control_grids),
-                        "control_history_crop_transform": tensor(
-                            _history_crop_transforms(
-                                self.crop_affines,
-                                control_current_index,
-                                control_indices,
-                            ),
-                            torch.float32,
+                result["control_history_grids"] = torch.stack(control_grids)
+                if self.include_control_current_grid:
+                    control_current = self.cache.values(control_current_index)
+                    result["control_current_grid"] = tensor(control_current["z_rgb"])
+                if self.include_crop_transform:
+                    transform_current_index = (
+                        current_index
+                        if self.control_crop_transform_from_current
+                        else control_current_index
+                    )
+                    result["control_history_crop_transform"] = tensor(
+                        _history_crop_transforms(
+                            self.crop_affines,
+                            transform_current_index,
+                            control_indices,
                         ),
-                    }
-                )
+                        torch.float32,
+                    )
             for name in (
                 "history_time_gap",
                 "history_min_bbox_iou",
@@ -1151,8 +1189,14 @@ class TemporalPairDataset(torch.utils.data.Dataset):
             contralateral_grids = (
                 result["history_grids"].clone() if self.include_dino_grid else None
             )
-            contralateral_transforms = np.repeat(
-                np.eye(3, dtype=np.float32)[None], len(contralateral_indices), axis=0
+            contralateral_transforms = (
+                np.repeat(
+                    np.eye(3, dtype=np.float32)[None],
+                    len(contralateral_indices),
+                    axis=0,
+                )
+                if self.include_crop_transform
+                else None
             )
             for column, history_index in enumerate(contralateral_indices):
                 if int(history_index) < 0:
@@ -1164,16 +1208,18 @@ class TemporalPairDataset(torch.utils.data.Dataset):
                 contralateral_available[column] = 1.0
                 if self.include_dino_grid:
                     contralateral_grids[column] = tensor(opposite["z_rgb"])
-                    contralateral_transforms[column] = _history_crop_transforms(
-                        self.crop_affines, current_index, (int(history_index),)
-                    )[0]
+                    if self.include_crop_transform:
+                        contralateral_transforms[column] = _history_crop_transforms(
+                            self.crop_affines, current_index, (int(history_index),)
+                        )[0]
             result["contralateral_history_logits"] = contralateral_history
             result["contralateral_history_available"] = contralateral_available
             if self.include_dino_grid:
                 result["contralateral_history_grids"] = contralateral_grids
-                result["contralateral_history_crop_transform"] = tensor(
-                    contralateral_transforms, torch.float32
-                )
+                if self.include_crop_transform:
+                    result["contralateral_history_crop_transform"] = tensor(
+                        contralateral_transforms, torch.float32
+                    )
         return result
 
 
@@ -1187,11 +1233,23 @@ class TemporalReplayDataset(torch.utils.data.Dataset):
         *,
         include_control: bool = True,
         include_dino_grid: bool = False,
+        include_crop_transform: bool = True,
+        include_control_current_grid: bool = True,
         history_lags: Sequence[int] = (1,),
         max_open_shards: int = 4,
         control_pressure_bins: Sequence[int] | None = None,
+        control_crop_transform_from_current: bool = False,
     ):
         self.include_dino_grid = bool(include_dino_grid)
+        self.include_crop_transform = bool(
+            include_dino_grid and include_crop_transform
+        )
+        self.include_control_current_grid = bool(
+            include_dino_grid and include_control_current_grid
+        )
+        self.control_crop_transform_from_current = bool(
+            control_crop_transform_from_current
+        )
         self.cache = PartitionedPalmCache(
             cache_root,
             max_open_shards=max_open_shards,
@@ -1235,7 +1293,7 @@ class TemporalReplayDataset(torch.utils.data.Dataset):
         self.history_indices = self.history_metadata["history_indices"]
         self.crop_affines = (
             _pair_crop_affine_lookup(len(self.cache), self.arrays)
-            if self.include_dino_grid
+            if self.include_crop_transform
             else None
         )
         self.control_history_indices = None
@@ -1292,18 +1350,23 @@ class TemporalReplayDataset(torch.utils.data.Dataset):
             else np.full(len(self.history_lags), -1, dtype=np.int64)
         )
         history_logits = []
+        history_targets = []
         history_available = []
         history_grids = []
         for history_index in history_indices:
             available = int(history_index) >= 0
             history = self.cache.values(int(history_index)) if available else current
             history_logits.append(self._tensor(history["palm_base_logits"]))
+            history_targets.append(
+                self._tensor(history["palm_tactile_signal"], torch.float32)
+            )
             history_available.append(float(available))
             if self.include_dino_grid:
                 history_grids.append(self._tensor(history["z_rgb"]))
         result = {
             "current_logits": self._tensor(current["palm_base_logits"]),
             "history_logits": torch.stack(history_logits),
+            "history_tactile_signal": torch.stack(history_targets),
             "history_available": torch.tensor(
                 history_available, dtype=torch.float32
             ),
@@ -1374,14 +1437,15 @@ class TemporalReplayDataset(torch.utils.data.Dataset):
                 {
                     "current_grid": self._tensor(current["z_rgb"]),
                     "history_grids": torch.stack(history_grids),
-                    "history_crop_transform": self._tensor(
-                        _history_crop_transforms(
-                            self.crop_affines, current_index, history_indices
-                        ),
-                        torch.float32,
-                    ),
                 }
             )
+            if self.include_crop_transform:
+                result["history_crop_transform"] = self._tensor(
+                    _history_crop_transforms(
+                        self.crop_affines, current_index, history_indices
+                    ),
+                    torch.float32,
+                )
         if self.include_control:
             if eligible and self.control_history_indices is not None:
                 control_indices = self.control_history_indices[pair_position]
@@ -1419,21 +1483,26 @@ class TemporalReplayDataset(torch.utils.data.Dataset):
                     if control_pair >= 0
                     else current_index
                 )
-                control_current = self.cache.values(control_current_index)
-                result.update(
-                    {
-                        "control_current_grid": self._tensor(control_current["z_rgb"]),
-                        "control_history_grids": torch.stack(control_grids),
-                        "control_history_crop_transform": self._tensor(
-                            _history_crop_transforms(
-                                self.crop_affines,
-                                control_current_index,
-                                control_indices,
-                            ),
-                            torch.float32,
+                result["control_history_grids"] = torch.stack(control_grids)
+                if self.include_control_current_grid:
+                    control_current = self.cache.values(control_current_index)
+                    result["control_current_grid"] = self._tensor(
+                        control_current["z_rgb"]
+                    )
+                if self.include_crop_transform:
+                    transform_current_index = (
+                        current_index
+                        if self.control_crop_transform_from_current
+                        else control_current_index
+                    )
+                    result["control_history_crop_transform"] = self._tensor(
+                        _history_crop_transforms(
+                            self.crop_affines,
+                            transform_current_index,
+                            control_indices,
                         ),
-                    }
-                )
+                        torch.float32,
+                    )
             for name in (
                 "history_time_gap",
                 "history_min_bbox_iou",
@@ -1479,8 +1548,14 @@ class TemporalReplayDataset(torch.utils.data.Dataset):
             contralateral_grids = (
                 result["history_grids"].clone() if self.include_dino_grid else None
             )
-            contralateral_transforms = np.repeat(
-                np.eye(3, dtype=np.float32)[None], len(contralateral_indices), axis=0
+            contralateral_transforms = (
+                np.repeat(
+                    np.eye(3, dtype=np.float32)[None],
+                    len(contralateral_indices),
+                    axis=0,
+                )
+                if self.include_crop_transform
+                else None
             )
             for column, history_index in enumerate(contralateral_indices):
                 if int(history_index) < 0:
@@ -1492,16 +1567,18 @@ class TemporalReplayDataset(torch.utils.data.Dataset):
                 contralateral_available[column] = 1.0
                 if self.include_dino_grid:
                     contralateral_grids[column] = self._tensor(opposite["z_rgb"])
-                    contralateral_transforms[column] = _history_crop_transforms(
-                        self.crop_affines, current_index, (int(history_index),)
-                    )[0]
+                    if self.include_crop_transform:
+                        contralateral_transforms[column] = _history_crop_transforms(
+                            self.crop_affines, current_index, (int(history_index),)
+                        )[0]
             result["contralateral_history_logits"] = contralateral_history
             result["contralateral_history_available"] = contralateral_available
             if self.include_dino_grid:
                 result["contralateral_history_grids"] = contralateral_grids
-                result["contralateral_history_crop_transform"] = self._tensor(
-                    contralateral_transforms, torch.float32
-                )
+                if self.include_crop_transform:
+                    result["contralateral_history_crop_transform"] = self._tensor(
+                        contralateral_transforms, torch.float32
+                    )
         return result
 
 

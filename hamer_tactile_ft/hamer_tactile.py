@@ -9,9 +9,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 if __package__:
-    from .losses import TactileLossConfig, compute_tactile_loss
+    from .losses import (
+        TactileLossConfig,
+        compute_center_auxiliary_loss,
+        compute_tactile_loss,
+    )
 else:
-    from losses import TactileLossConfig, compute_tactile_loss
+    from losses import (
+        TactileLossConfig,
+        compute_center_auxiliary_loss,
+        compute_tactile_loss,
+    )
 
 
 def count_obj_vertices(obj_path: Path) -> int:
@@ -35,11 +43,19 @@ SUPPORTED_INPUT_RESOLUTIONS = ((256, 192), (320, 240), (384, 288))
 SUPPORTED_TACTILE_HEAD_TYPES = (
     "dense_v2",
     "dense_v2_dino_rezero",
+    "dense_v2_dino_center_aux",
     "dense_v2_dino_local_residual",
     "dense_v2_dino_support_selector",
     "dense_v2_dino_surface_basis",
 )
 SUPPORTED_POOL_LAYOUTS = ("legacy5", "fullgrid32")
+SUPPORTED_MODEL_INITIALIZATION_ORDERS = (
+    "projection_first",
+    "legacy_decoder_first",
+)
+# Project-wide canonical RNG assignment for every newly constructed tactile
+# base. This is the order used by the July 2026 crop1.2 reference model.
+CANONICAL_MODEL_INITIALIZATION_ORDER = "legacy_decoder_first"
 SUPPORTED_SURFACE_COEFFICIENT_ARCHITECTURES = ("linear", "nonlinear")
 
 
@@ -469,6 +485,7 @@ class DenseV2TactileHead(nn.Module):
         grid_size: Sequence[int] = (16, 12),
         pool_output_channels: int = 32,
         decoder_hidden_dim: int = 512,
+        model_initialization_order: str = CANONICAL_MODEL_INITIALIZATION_ORDER,
     ):
         super().__init__()
         dropout_scale = float(decoder_dropout_scale)
@@ -477,12 +494,21 @@ class DenseV2TactileHead(nn.Module):
         self.pool_layout = str(pool_layout)
         self.grid_size = tuple(int(value) for value in grid_size)
         self.decoder_hidden_dim = int(decoder_hidden_dim)
-        self.base_projection = nn.Sequential(
-            nn.Conv2d(int(input_channels), int(channels), kernel_size=1),
-            nn.GELU(),
-        )
-        self.decoder, self.decoder_input_dim, self.pool_valid_tokens = (
-            _build_dense_decoder(
+        self.model_initialization_order = str(model_initialization_order)
+        if self.model_initialization_order not in SUPPORTED_MODEL_INITIALIZATION_ORDERS:
+            raise ValueError(
+                "model_initialization_order must be one of "
+                f"{SUPPORTED_MODEL_INITIALIZATION_ORDERS}"
+            )
+
+        def build_projection():
+            return nn.Sequential(
+                nn.Conv2d(int(input_channels), int(channels), kernel_size=1),
+                nn.GELU(),
+            )
+
+        def build_decoder():
+            return _build_dense_decoder(
                 tactile_dim=tactile_dim,
                 channels=channels,
                 pool_layout=self.pool_layout,
@@ -491,7 +517,20 @@ class DenseV2TactileHead(nn.Module):
                 decoder_hidden_dim=self.decoder_hidden_dim,
                 dropout_scale=dropout_scale,
             )
-        )
+
+        # The July 2026 crop1.2 baseline consumed RNG for the decoder before
+        # base_projection. Keep both assignments available for old experiment
+        # replay without changing any state-dict key.
+        if self.model_initialization_order == "legacy_decoder_first":
+            self.decoder, self.decoder_input_dim, self.pool_valid_tokens = (
+                build_decoder()
+            )
+            self.base_projection = build_projection()
+        else:
+            self.base_projection = build_projection()
+            self.decoder, self.decoder_input_dim, self.pool_valid_tokens = (
+                build_decoder()
+            )
         self.refinement_layer_indices = ()
 
     def feature_diagnostics(self) -> Dict[str, torch.Tensor]:
@@ -521,6 +560,7 @@ class DenseV2DinoReZeroTactileHead(DenseV2TactileHead):
         grid_size: Sequence[int] = (16, 12),
         pool_output_channels: int = 32,
         decoder_hidden_dim: int = 512,
+        model_initialization_order: str = CANONICAL_MODEL_INITIALIZATION_ORDER,
     ):
         layer_indices = tuple(int(layer) for layer in layer_indices)
         if len(layer_indices) < 2 or tuple(sorted(set(layer_indices))) != layer_indices:
@@ -540,6 +580,7 @@ class DenseV2DinoReZeroTactileHead(DenseV2TactileHead):
             grid_size=grid_size,
             pool_output_channels=pool_output_channels,
             decoder_hidden_dim=decoder_hidden_dim,
+            model_initialization_order=model_initialization_order,
         )
         self.layer_indices = layer_indices
         self.refinement_layer_indices = tuple(reversed(layer_indices[:-1]))
@@ -680,6 +721,72 @@ class DenseV2DinoReZeroTactileHead(DenseV2TactileHead):
         return self.decoder(self._fuse(feature_levels))
 
 
+class DenseV2DinoCenterAuxTactileHead(DenseV2DinoReZeroTactileHead):
+    """Train-only center supervision over the unchanged DenseV2 bottleneck.
+
+    The pressure path is constructed first and remains byte-for-byte compatible
+    with ``DenseV2DinoReZeroTactileHead`` under the same RNG state. Auxiliary
+    logits never feed back into the pressure logits and can be discarded for
+    deployment.
+    """
+
+    def __init__(
+        self,
+        tactile_dim: int,
+        layer_indices: Sequence[int],
+        *,
+        center_aux_hidden_dim: int = 128,
+        residual_max_scale: float = 0.10,
+        residual_rms_budget: float = 0.50,
+        input_channels: int = 1280,
+        channels: int = 256,
+        pool_layout: str = "fullgrid32",
+        decoder_dropout_scale: float = 1.0,
+        grid_size: Sequence[int] = (16, 12),
+        pool_output_channels: int = 32,
+        decoder_hidden_dim: int = 512,
+        model_initialization_order: str = CANONICAL_MODEL_INITIALIZATION_ORDER,
+    ):
+        super().__init__(
+            tactile_dim=tactile_dim,
+            layer_indices=layer_indices,
+            residual_max_scale=residual_max_scale,
+            residual_rms_budget=residual_rms_budget,
+            input_channels=input_channels,
+            channels=channels,
+            pool_layout=pool_layout,
+            decoder_dropout_scale=decoder_dropout_scale,
+            grid_size=grid_size,
+            pool_output_channels=pool_output_channels,
+            decoder_hidden_dim=decoder_hidden_dim,
+            model_initialization_order=model_initialization_order,
+        )
+        self.center_aux_hidden_dim = int(center_aux_hidden_dim)
+        if self.center_aux_hidden_dim < 1:
+            raise ValueError("center_aux_hidden_dim must be positive")
+        self.center_aux_heatmap = nn.Sequential(
+            nn.Linear(self.decoder_hidden_dim, self.center_aux_hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.center_aux_hidden_dim, int(tactile_dim)),
+        )
+        self.center_aux_presence = nn.Linear(self.decoder_hidden_dim, 1)
+
+    def forward_with_center_aux(
+        self,
+        feature_levels: Sequence[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        value = self._fuse(feature_levels)
+        for layer in self.decoder[:-1]:
+            value = layer(value)
+        pressure_logits = self.decoder[-1](value)
+        center_logits = self.center_aux_heatmap(value)
+        presence_logits = self.center_aux_presence(value).squeeze(-1)
+        return pressure_logits, center_logits, presence_logits
+
+    def forward(self, feature_levels: Sequence[torch.Tensor]) -> torch.Tensor:
+        return self.decoder(self._fuse(feature_levels))
+
+
 class DenseV2DinoSurfaceBasisTactileHead(DenseV2DinoReZeroTactileHead):
     """Direct FullGrid coefficient decoder over a fixed canonical surface basis."""
 
@@ -704,6 +811,7 @@ class DenseV2DinoSurfaceBasisTactileHead(DenseV2DinoReZeroTactileHead):
         grid_size: Sequence[int] = (16, 12),
         pool_output_channels: int = 32,
         decoder_hidden_dim: int = 512,
+        model_initialization_order: str = CANONICAL_MODEL_INITIALIZATION_ORDER,
     ):
         if str(pool_layout) != "fullgrid32":
             raise ValueError("The surface-basis head requires pool_layout=fullgrid32")
@@ -741,6 +849,7 @@ class DenseV2DinoSurfaceBasisTactileHead(DenseV2DinoReZeroTactileHead):
             grid_size=grid_size,
             pool_output_channels=pool_output_channels,
             decoder_hidden_dim=decoder_hidden_dim,
+            model_initialization_order=model_initialization_order,
         )
         # Keep the audited FullGrid32 projection but remove the old shared
         # 512-D dense decoder completely.
@@ -1015,6 +1124,7 @@ class DenseV2DinoLocalResidualTactileHead(DenseV2DinoReZeroTactileHead):
         grid_size: Sequence[int] = (16, 12),
         pool_output_channels: int = 32,
         decoder_hidden_dim: int = 512,
+        model_initialization_order: str = CANONICAL_MODEL_INITIALIZATION_ORDER,
         local_anchor_count: int = 512,
         local_anchor_neighbors: int = 4,
         local_logit_delta_max: float = 6.0,
@@ -1035,6 +1145,7 @@ class DenseV2DinoLocalResidualTactileHead(DenseV2DinoReZeroTactileHead):
             grid_size=grid_size,
             pool_output_channels=pool_output_channels,
             decoder_hidden_dim=decoder_hidden_dim,
+            model_initialization_order=model_initialization_order,
         )
         self.local_residual = CanonicalLocalResidualCarrier(
             input_dim=self.decoder_input_dim,
@@ -1579,6 +1690,7 @@ class DenseV2DinoSupportSelectorTactileHead(DenseV2DinoReZeroTactileHead):
         grid_size: Sequence[int] = (16, 12),
         pool_output_channels: int = 32,
         decoder_hidden_dim: int = 512,
+        model_initialization_order: str = CANONICAL_MODEL_INITIALIZATION_ORDER,
         selector_thresholds: Sequence[float] = (0.10,),
         selector_anchor_count: int = 512,
         selector_anchor_neighbors: int = 4,
@@ -1604,6 +1716,7 @@ class DenseV2DinoSupportSelectorTactileHead(DenseV2DinoReZeroTactileHead):
             grid_size=grid_size,
             pool_output_channels=pool_output_channels,
             decoder_hidden_dim=decoder_hidden_dim,
+            model_initialization_order=model_initialization_order,
         )
         self.selector_architecture = str(selector_architecture).strip().lower()
         self.selector_feature_source = str(selector_feature_source).strip().lower()
@@ -1825,6 +1938,8 @@ class DinoTactileModel(pl.LightningModule):
         input_resolution: Sequence[int] = (256, 192),
         pool_output_channels: int = 32,
         decoder_hidden_dim: int = 512,
+        center_aux_hidden_dim: int = 128,
+        model_initialization_order: str = CANONICAL_MODEL_INITIALIZATION_ORDER,
         local_anchor_count: int = 512,
         local_anchor_neighbors: int = 4,
         local_logit_delta_max: float = 6.0,
@@ -1900,8 +2015,17 @@ class DinoTactileModel(pl.LightningModule):
         self.pool_grid_size = self.feature_grid_size
         self.pool_output_channels = int(pool_output_channels)
         self.decoder_hidden_dim = int(decoder_hidden_dim)
+        self.center_aux_hidden_dim = int(center_aux_hidden_dim)
+        self.model_initialization_order = str(model_initialization_order)
+        if self.model_initialization_order not in SUPPORTED_MODEL_INITIALIZATION_ORDERS:
+            raise ValueError(
+                "model_initialization_order must be one of "
+                f"{SUPPORTED_MODEL_INITIALIZATION_ORDERS}"
+            )
         if self.decoder_hidden_dim < 1:
             raise ValueError("decoder_hidden_dim must be positive")
+        if self.center_aux_hidden_dim < 1:
+            raise ValueError("center_aux_hidden_dim must be positive")
         self.decoder_dropout_scale = float(decoder_dropout_scale)
         self.local_anchor_count = int(local_anchor_count)
         self.local_anchor_neighbors = int(local_anchor_neighbors)
@@ -2001,6 +2125,7 @@ class DinoTactileModel(pl.LightningModule):
             "grid_size": self.feature_grid_size,
             "pool_output_channels": self.pool_output_channels,
             "decoder_hidden_dim": self.decoder_hidden_dim,
+            "model_initialization_order": self.model_initialization_order,
         }
         if self.tactile_head_type == "dense_v2":
             self.tactile_head = DenseV2TactileHead(**common_head_args)
@@ -2008,6 +2133,14 @@ class DinoTactileModel(pl.LightningModule):
             self.tactile_head = DenseV2DinoReZeroTactileHead(
                 **common_head_args,
                 layer_indices=self.backbone_feature_layers,
+                residual_max_scale=self.dino_residual_max_scale,
+                residual_rms_budget=self.dino_residual_rms_budget,
+            )
+        elif self.tactile_head_type == "dense_v2_dino_center_aux":
+            self.tactile_head = DenseV2DinoCenterAuxTactileHead(
+                **common_head_args,
+                layer_indices=self.backbone_feature_layers,
+                center_aux_hidden_dim=self.center_aux_hidden_dim,
                 residual_max_scale=self.dino_residual_max_scale,
                 residual_rms_budget=self.dino_residual_rms_budget,
             )
@@ -2103,7 +2236,13 @@ class DinoTactileModel(pl.LightningModule):
     def _extract_tactile_features(self, image: torch.Tensor):
         return self.backbone(image, self.backbone_feature_layers)
 
-    def forward_step(self, batch: Dict, train: bool = False) -> Dict:
+    def forward_step(
+        self,
+        batch: Dict,
+        train: bool = False,
+        *,
+        compute_auxiliary: Optional[bool] = None,
+    ) -> Dict:
         image = batch["img"]
         if tuple(image.shape[-2:]) != self.input_resolution:
             raise ValueError(
@@ -2112,7 +2251,24 @@ class DinoTactileModel(pl.LightningModule):
             )
         with torch.no_grad():
             conditioning_features = self._extract_tactile_features(image)
-        if hasattr(self.tactile_head, "forward_with_selector"):
+        center_aux_logits = None
+        center_aux_presence_logits = None
+        if compute_auxiliary is None:
+            compute_auxiliary = bool(train)
+        if (
+            compute_auxiliary
+            and hasattr(self.tactile_head, "forward_with_center_aux")
+        ):
+            (
+                pred_logits,
+                center_aux_logits,
+                center_aux_presence_logits,
+            ) = self.tactile_head.forward_with_center_aux(
+                conditioning_features
+            )
+            base_logits = None
+            local_delta = None
+        elif hasattr(self.tactile_head, "forward_with_selector"):
             pred_logits, selector_logits = (
                 self.tactile_head.forward_with_selector(conditioning_features)
             )
@@ -2131,6 +2287,15 @@ class DinoTactileModel(pl.LightningModule):
             "pred_logits": pred_logits,
             "pred_tactile": torch.sigmoid(pred_logits),
         }
+        if center_aux_logits is not None:
+            output.update(
+                {
+                    "center_aux_logits": center_aux_logits,
+                    "center_aux_presence_logits": (
+                        center_aux_presence_logits
+                    ),
+                }
+            )
         if hasattr(self.tactile_head, "forward_with_selector"):
             output.update({
                 "support_selector_logits": selector_logits,
@@ -2247,8 +2412,30 @@ class DinoTactileModel(pl.LightningModule):
             current_epoch=getattr(self, "current_epoch", 0),
             sample_weight=batch.get("sample_weight"),
         )
-        total_loss = self.tactile_loss_scale * tactile_loss
+        center_aux_loss = tactile_loss.new_zeros(())
+        center_aux_losses = {}
+        if "center_aux_logits" in output:
+            center_aux_loss, center_aux_losses = (
+                compute_center_auxiliary_loss(
+                    center_logits=output["center_aux_logits"],
+                    presence_logits=output[
+                        "center_aux_presence_logits"
+                    ],
+                    target=batch["tactile_signal"],
+                    palm_mask=batch["palm_mask"],
+                    valid_mask=batch["has_tactile"],
+                    config=self.tactile_loss_config,
+                    current_epoch=getattr(self, "current_epoch", 0),
+                    sample_weight=batch.get("sample_weight"),
+                )
+            )
+        tactile_loss_with_aux = tactile_loss + center_aux_loss
+        total_loss = self.tactile_loss_scale * tactile_loss_with_aux
         output["losses"].update(tactile_losses)
+        output["losses"].update(center_aux_losses)
+        output["losses"]["loss_tactile_with_aux"] = (
+            tactile_loss_with_aux.detach()
+        )
         output["losses"]["loss_total"] = total_loss.detach()
         output["losses"]["loss_current_ramp"] = total_loss.detach()
         output["losses"]["loss_direct_raw"] = tactile_losses[

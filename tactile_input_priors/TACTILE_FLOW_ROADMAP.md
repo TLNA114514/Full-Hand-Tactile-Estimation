@@ -1,16 +1,15 @@
 # Tactile Flow Roadmap
 
-Last updated: 2026-08-27
+Last updated: 2026-08-30
 
 This document is the maintained source of truth for the temporal tactile branch.
 Update the status table, evidence, and changelog whenever an experiment changes
 the order below. Do not infer the current plan from old chat logs.
 
-**Branch status: paused after Step 6.** All implementations, checkpoints, and
-reports are retained for future use. The active research priority has returned
-to single-frame image-to-canonical pressure localization. Tactile Flow should
-only be reopened after that spatial mapping is materially stronger, or when a
-new temporal signal can pass the causal gates recorded below.
+**Branch status: archived after Step 6.** All implementations, checkpoints, and
+reports are retained as evidence for the new feature-grid temporal route. New
+temporal work is maintained in `TEMPORAL_MAIN_TRUNK_ROADMAP.md`; do not add new
+main-trunk experiments to this output-level correction roadmap.
 
 ## Fixed Baseline
 

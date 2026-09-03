@@ -155,6 +155,35 @@ def ta_sensor_vertices(repo_root: Path, hand: str, mesh: MeshGeometry) -> Dict[i
     return out
 
 
+def egotactile_sensor_vertices(
+    repo_root: Path,
+    hand: str,
+    mesh: MeshGeometry,
+) -> tuple[Dict[int, np.ndarray], Dict[int, np.ndarray]]:
+    mapping_path = repo_root / f"preprocess/egotactile/egotactile_mapping_{hand}.json"
+    mapping = load_json(mapping_path)
+    vertices_by_sensor: Dict[int, np.ndarray] = {}
+    centers_by_sensor: Dict[int, np.ndarray] = {}
+    for item in mapping.get("pressure_sensors", {}).values():
+        sensor_id = int(item["raw_id_0based"])
+        mapped = np.asarray(
+            [
+                int(vertex_id)
+                for vertex_id in item.get("mano_vid", [])
+                if 0 <= int(vertex_id) < mesh.vertices.shape[0]
+            ],
+            dtype=np.int32,
+        )
+        if mapped.size == 0:
+            continue
+        vertices_by_sensor[sensor_id] = mapped
+        center = np.asarray(item.get("center_xyz", []), dtype=np.float32)
+        centers_by_sensor[sensor_id] = (
+            center if center.shape == (3,) else mesh.vertices[mapped].mean(axis=0)
+        )
+    return vertices_by_sensor, centers_by_sensor
+
+
 def _sensor_geometry_from_cache(cache_path: Path) -> SensorGeometry:
     with np.load(cache_path, allow_pickle=True) as data:
         return SensorGeometry(
@@ -210,12 +239,21 @@ def build_sensor_geometry(
     if dataset_key == "opentouch":
         mapping_files = [repo_root / "opentouch/preprocess/scratch/handLayoutNewest_meshid.json"]
         sensor_map = opentouch_sensor_vertices(repo_root, hand, mesh)
+        explicit_centers = {}
+    elif dataset_key == "egotactile":
+        mapping_files = [
+            repo_root / f"preprocess/egotactile/egotactile_mapping_{hand}.json"
+        ]
+        sensor_map, explicit_centers = egotactile_sensor_vertices(
+            repo_root, hand, mesh
+        )
     else:
         mapping_files = [
             repo_root / f"TouchAnything/configs/pressure_position_mapping_{hand}.json",
             repo_root / f"TouchAnything/scripts/tools/mano_visualization/ta_to_mano_mapping_{hand}_visual.json",
         ]
         sensor_map = ta_sensor_vertices(repo_root, hand, mesh)
+        explicit_centers = {}
     mesh_file = repo_root / "opentouch/preprocess/scratch/mano_right_neutral_subdiv.obj"
     key = sha1_files([mesh_file, *mapping_files])
     cache_path = cache_dir / f"sensor_geom_{dataset_key}_{hand}_{key}.npz"
@@ -231,7 +269,13 @@ def build_sensor_geometry(
 
     sensor_ids = np.asarray(sorted(sensor_map), dtype=np.int32)
     sensor_vertices = [np.asarray(sensor_map[int(sid)], dtype=np.int32) for sid in sensor_ids]
-    centers = np.stack([mesh.vertices[v].mean(axis=0) for v in sensor_vertices], axis=0).astype(np.float32)
+    centers = np.stack(
+        [
+            explicit_centers.get(int(sensor_id), mesh.vertices[vertices].mean(axis=0))
+            for sensor_id, vertices in zip(sensor_ids.tolist(), sensor_vertices)
+        ],
+        axis=0,
+    ).astype(np.float32)
     target_vertices = np.unique(np.concatenate(sensor_vertices)) if sensor_vertices else np.zeros(0, dtype=np.int32)
     if target_vertices.size == 0:
         target_vertices = mesh.valid_vertices

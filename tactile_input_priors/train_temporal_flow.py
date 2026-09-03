@@ -73,7 +73,8 @@ class DistributedPairBlockSampler(Sampler[int]):
         self.seed = int(seed)
         self.epoch = 0
         current = np.asarray(dataset.arrays["current_index"], dtype=np.int64)
-        partition_count = len(dataset.cache.parts)
+        cache = getattr(dataset, "cache", None)
+        partition_count = len(getattr(cache, "parts", ()))
         self.partition_aligned = partition_count == self.replicas
         if self.partition_aligned:
             counts = np.bincount(current % self.replicas, minlength=self.replicas)

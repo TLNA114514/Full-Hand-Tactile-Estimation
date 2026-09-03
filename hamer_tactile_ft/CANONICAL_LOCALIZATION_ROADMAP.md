@@ -1,6 +1,6 @@
 # Sensor-Independent Canonical Tactile Localization Roadmap
 
-Last updated: 2026-08-29
+Last updated: 2026-08-31
 
 This document tracks the work needed to place pressure on the correct
 canonical MANO vertices after the single-frame FullGrid baseline has already
@@ -140,6 +140,14 @@ baseline would confound representation and supervision effects.
     is more local than 256 anchors, but that geometric improvement does not
     become a metric improvement. V1 also permits learned query, null, and bias
     paths to produce a residual without frame-specific image evidence.
+20. Stage 2.1 also rejects DINO-only evidence routing. Across four seeds,
+    Projected32 changes Seen/Unseen Contact-IoU by `-.0045/-.0076`, while
+    ReZero256 changes it by `-.0041/-.0072`. Real-versus-spatial-shuffle
+    Contact/CoreLoc gaps are generally below `.001`, small, and inconsistent.
+    Removing static residual paths and restoring 256-channel features therefore
+    does not recover a reliable image-to-canonical assignment. The next
+    controlled route may add geometry-supervised image features, but it must
+    still prove frame-specific value against causal controls.
 
 ## Working Hypothesis
 
@@ -184,7 +192,8 @@ This hypothesis has four separable parts:
 | 0.7 Mapping attribution | Complete | Separate basis expressivity, basis coupling, and global token routing on official splits | Basis capacity passes; learned global mapping fails |
 | 1 Continuous field decoder | Rejected in global form | Replace the shared 512-D vertex decoder with the selected standalone canonical basis | K4096 nonlinear global coefficient MLP loses to FullGrid, especially on unseen tasks |
 | 2 Canonical routing V1 | Complete; rejected for attribution | Route projected FullGrid evidence into canonical anchors | `canonical_anchor_routing`; pressure loss improves slightly, correspondence controls fail |
-| 2.1 Evidence-only routing | Implemented, pending run | Remove static residual bypasses and compare projected32 with pre-projection ReZero256 | `run_canonical_localization.sh routing-v2` |
+| 2.1 Evidence-only routing | Complete; rejected | Remove static residual bypasses and compare projected32 with pre-projection ReZero256 | Four seeds fail base and correspondence controls |
+| 2.2 HaMeR feature routing | H0 implemented; pending run | Test pose-informed, pose-output-free geometry keys with DINO contact values | [`HAMER_FEATURE_ROUTING_ROADMAP.md`](HAMER_FEATURE_ROUTING_ROADMAP.md) |
 | 3 Mass/location split | Pending | Predict total mass separately from normalized canonical distribution | Use after continuous representation is validated |
 | 4 Extra priors | Paused | Add depth, VLM, or temporal evidence after routing exists | Real prior must beat shuffled/mismatched control |
 | 5 Weak supervision | Fallback | Add correspondences only if RGB supervision is underdetermined | Synthetic/weak labels before full pose dependency |
@@ -807,6 +816,27 @@ projection discarded correspondence. If both fail and shuffle remains
 irrelevant, stop decoder-only pose-free routing and move to weak
 correspondence/part supervision before adding depth, VLM, or pose.
 
+Stage 2.1 result:
+
+- All eight runs across Projected32/ReZero256 and seeds
+  `521/2029/3407/4099` are complete.
+- Projected32 changes Seen/Unseen Contact-IoU by `-.0045/-.0076` on average.
+- ReZero256 changes Seen/Unseen Contact-IoU by `-.0041/-.0072` on average.
+- Spatial shuffle usually changes Contact/CoreLoc by less than `.001`, with no
+  stable direction across source, split, and metric.
+- Slight pressure-loss/RMSE gains again accompany lower contact and weaker
+  high-pressure prediction. They are calibration effects, not localization
+  evidence.
+
+The DINO-only rescue is therefore closed. Do not spend another round on more
+heads, layers, anchors, or DINO-only routing variants. Stage 2.2 instead tests
+whether frozen HaMeR image features provide geometry-aware routing keys while
+DINO retains responsibility for contact and object evidence. It excludes all
+MANO, joint, camera, and predicted-mesh outputs and uses mass-preserving local
+redistribution to prevent a broad pressure shift. The complete order, cache
+contract, controls, and stopping rules are maintained in
+[`HAMER_FEATURE_ROUTING_ROADMAP.md`](HAMER_FEATURE_ROUTING_ROADMAP.md).
+
 The implementation follows these constraints:
 
 1. Keep DINO frozen and preserve the Stage-1 continuous output field.
@@ -858,7 +888,14 @@ real prior must produce a selective benefit unavailable to its control.
 
 ## Fallback Supervision Ladder
 
-If matched-mass ambiguity is high and all controlled RGB routing models fail:
+Run the controlled HaMeR feature route in
+[`HAMER_FEATURE_ROUTING_ROADMAP.md`](HAMER_FEATURE_ROUTING_ROADMAP.md) after
+DINO-only Stage 2.1 and before explicit correspondence or pose. This route is
+not fully pose-free in its training history, but its tactile interface remains
+pose-output-free.
+
+If matched-mass ambiguity is high and both DINO-only and HaMeR-feature routing
+fail their causal controls:
 
 1. Add hand/object segmentation and synthetic render correspondence as weak
    image-to-canonical supervision.
@@ -943,3 +980,15 @@ For each completed stage:
   evidence-only routing, exact global-repeat identity, per-frame selectivity
   diagnostics, aligned ReZero256 cache reuse, and an eight-GPU two-source by
   four-seed matrix with separate resumable training and evaluation.
+- **2026-08-31:** Completed and rejected Stage 2.1. Projected32 and ReZero256
+  both reduce Contact-IoU on Seen/Unseen, and real-versus-shuffle gaps remain
+  small and inconsistent across four seeds. Added Stage 2.2 and the dedicated
+  [`HAMER_FEATURE_ROUTING_ROADMAP.md`](HAMER_FEATURE_ROUTING_ROADMAP.md): frozen
+  HaMeR spatial features supply implicit geometry keys, DINO supplies contact
+  values, explicit pose outputs remain excluded, and promotion requires
+  mass-preserving local gains over shuffle/wrong-frame/global controls.
+- **2026-08-31:** Implemented the Stage 2.2 H0 integrity gate: strict
+  backbone-only HaMeR loading, direct rectangular crop extraction, normalized
+  intermediate layers, deterministic real-sample checks, crop equivalence,
+  and an explicit HaMeR-to-DINO patch-lattice contract. H1 remains blocked
+  until the remote H0 artifact passes.
